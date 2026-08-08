@@ -122,7 +122,7 @@ cd frontend
 npm install
 
 # Start the React development server (trusted HTTPS on port 3000)
-npm start
+npm.cmd start
 ```
 *Frontend UI runs on `https://localhost:3000`. Windows may prompt you to trust the `Developer CA for Microsoft Office Add-ins` certificate.*
 
