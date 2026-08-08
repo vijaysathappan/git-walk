@@ -1,14 +1,37 @@
-# ExcelSQLiteLiveSync
+<div align="center">
+  <img src="assets/gitwalk_banner.png" alt="GitWalk Banner" width="100%" />
+</div>
 
-> Real-time bi-directional synchronization between Microsoft Excel Desktop and a centralized SQLite database — **zero external database setup required**.
+<h1 align="center">GitWalk</h1>
 
-![Architecture](https://img.shields.io/badge/Architecture-FastAPI%20%2B%20React%20%2B%20SQLite-6366f1?style=for-the-badge)
+<div align="center">
+
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=for-the-badge&logo=python&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react&logoColor=black)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-Built--in-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
+
+</div>
 
 ---
 
-## Architecture
+## 📌 Project Problem Challenge
+Managing distributed data collection often forces a choice between familiar but disconnected tools (like Microsoft Excel) and centralized but complex database systems. Integrating the two usually requires significant overhead: installing ODBC drivers, configuring complex database credentials, running external database servers, and maintaining custom sync scripts. **GitWalk** challenges this paradigm by offering a zero-setup solution where users can continue using native Excel while having their data instantly and painlessly synchronized to a centralized SQLite database.
+
+## 📖 Project Description
+**GitWalk** is an innovative live-synchronization platform that provides real-time, bi-directional data flow between Microsoft Excel Desktop and a centralized SQLite backend. It requires **zero external database setup**. Users simply drag-and-drop their existing `.xlsx` files into a premium dark-themed web interface. The system automatically provisions a dynamic SQLite table and injects an Office Web Add-in into the file. Once opened in Excel, every cell edit is instantaneously mirrored in the backend database.
+
+## 🏗️ Project Architecture
+
+<div align="center">
+  <img src="assets/architecture_concept.png" alt="Architecture Concept" width="80%" />
+</div>
+
+The architecture leverages a lightweight yet robust modern stack:
+* **Frontend UI (React 18)**: Handles file uploads and Office.js Add-in side-loading.
+* **Backend API (FastAPI)**: Serves endpoints for file provisioning and real-time synchronization.
+* **Database (SQLite)**: Auto-provisioned tables to store the Excel data directly (no servers needed).
+* **Client (Excel Add-in)**: Uses Office.js to listen to worksheet changes and pushes them to the backend.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -16,100 +39,103 @@
 ├────────────────────────────────────────────────────────────────────────────┤
 │                                                                            │
 │  ┌──────────────┐     POST /upload      ┌──────────────┐                  │
-│  │  Browser UI   │ ──────────────────>   │  FastAPI      │                  │
-│  │  (React App)  │ <──────────────────   │  Backend      │                  │
-│  │  Port 3000    │   Download .xlsx      │  Port 8000    │                  │
+│  │  Browser UI  │ ──────────────────>   │  FastAPI     │                  │
+│  │  (React)     │ <──────────────────   │  Backend     │                  │
+│  │  Port 3000   │   Download .xlsx      │  Port 8000   │                  │
 │  └──────────────┘                        └──────┬───────┘                  │
-│                                                  │                          │
+│                                                 │                          │
 │  ┌──────────────┐     POST /sync         ┌──────┴───────┐                  │
-│  │ Excel Desktop │ ──────────────────>   │   SQLite      │                  │
-│  │ + Taskpane    │   Cell-level edits    │  queue_board  │                  │
-│  │ (Office.js)   │                       │    .db        │                  │
+│  │ Excel Desktop│ ──────────────────>   │   SQLite     │                  │
+│  │ + Taskpane   │   Cell-level edits    │  queue_board │                  │
+│  │ (Office.js)  │                       │    .db       │                  │
 │  └──────────────┘                        └──────────────┘                  │
-│                                                                            │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Features
+## 📂 Project Folder Structure
 
-- 📁 **Drag & Drop Upload** — Upload any `.xlsx` file via a premium dark-themed web UI
-- 🗄️ **Auto-Provisioning** — Dynamically creates SQLite tables with sanitized column names and auto-incrementing `ROW_ID`
-- 📦 **OpenXML Injection** — Embeds an Office Web Add-in manifest directly into the `.xlsx` file structure
-- ⚡ **Real-Time Sync** — Cell edits in Excel Desktop fire instantly to the SQLite backend via the embedded taskpane
-- 🔒 **SQL Injection Protection** — All queries use parameterized binding (`?` placeholders)
-- 🚀 **Zero Setup** — SQLite is built into Python. No database server, no drivers, no credentials
+```text
+GitWalk/
+├── backend/                  # FastAPI Application
+│   ├── app/                  # API Logic & Setup
+│   │   ├── main.py           # Core FastAPI endpoints
+│   │   ├── database.py       # SQLite manager & provisioning
+│   │   ├── openxml_injector.py # OpenXML engine for .xlsx manipulation
+│   │   └── schemas.py        # Request/Response models (Pydantic)
+│   ├── queue_board.db        # Automatically created SQLite database
+│   └── requirements.txt      # Python dependencies
+├── frontend/                 # React UI & Office Add-in
+│   ├── public/               # Static assets & manifest
+│   │   ├── manifest.xml      # Office Web Add-in manifest
+│   │   └── index.html        # App HTML shell
+│   ├── src/                  # React Source Code
+│   │   ├── components/       # Reusable UI components
+│   │   ├── services/         # API integration
+│   │   ├── App.jsx           # Main React Application
+│   │   └── taskpane.jsx      # Office.js embedded entry point
+│   ├── package.json          # Node.js dependencies
+│   └── webpack.config.js     # Webpack build configurations
+└── README.md                 # Project Documentation
+```
 
----
+## 🔗 API Path
 
-## Quick Start
+### Base URL: `http://localhost:8000`
+
+| Endpoint | Method | Description | Request | Response |
+|----------|--------|-------------|---------|----------|
+| `/api/v1/upload-and-provision` | `POST` | Uploads an `.xlsx` file, provisions DB tables, and returns an add-in injected Excel file. | `multipart/form-data` | Configured `.xlsx` file download |
+| `/api/v1/realtime-sync` | `POST` | Syncs cell-level edits from Excel to the backend SQLite DB in real time. | JSON Body (Cell details) | Status Success JSON |
+| `/health` | `GET` | API Healthcheck to verify the backend server is running. | None | `{"status": "ok"}` |
+
+## 🚀 How to Run the Project
 
 ### Prerequisites
-
 - **Python 3.10+** (with pip)
 - **Node.js 18+** (with npm)
 - **Microsoft Excel Desktop** (for taskpane / add-in testing)
 
-### 1. Start the Backend
-
+### 1. Backend Setup
 ```bash
 cd backend
 
-# Create virtual environment (recommended)
+# Create and activate virtual environment
 python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # macOS/Linux
+# On Windows:
+venv\Scripts\activate
+# On macOS/Linux:
+# source venv/bin/activate
 
-# Install dependencies
+# Install requirements
 pip install -r requirements.txt
 
-# Start the server
+# Run the FastAPI server
 uvicorn app.main:app --reload --port 8000
 ```
+*Backend runs on `http://localhost:8000` with Swagger UI at `http://localhost:8000/docs`.*
 
-The API is now running at **http://localhost:8000**. Visit http://localhost:8000/docs for interactive Swagger UI.
-
-### 2. Start the Frontend
-
+### 2. Frontend Setup
 ```bash
 cd frontend
 
-# Install dependencies
+# Install Node dependencies
 npm install
 
-# Start the dev server (trusted HTTPS on port 3000)
-npm.cmd start
+# Start the React development server (trusted HTTPS on port 3000)
+npm start
 ```
+*Frontend UI runs on `https://localhost:3000`. Windows may prompt you to trust the `Developer CA for Microsoft Office Add-ins` certificate.*
 
-The upload app opens at **https://localhost:3000**. On the first run, Windows
-may ask once whether to trust `Developer CA for Microsoft Office Add-ins`.
-Later starts reuse and automatically renew that certificate.
+### 3. Usage Steps
+1. Navigate to **`https://localhost:3000`** in your browser.
+2. Drag-and-drop or upload your `.xlsx` file. Click "Upload & Provision" to download a modified version (`configured_<TABLE_ID>_<filename>.xlsx`).
+3. Open the downloaded file in **Excel Desktop**.
+4. Sideload the add-in (Insert → My Add-ins → Upload My Add-in) using `frontend/public/manifest.xml`. The SQLite LiveSync taskpane will open.
+5. Start editing any cell in the configured table. Your changes will automatically sync to the `queue_board.db` SQLite database in real time!
 
----
-
-## Usage
-
-### Step 1: Upload Your Excel File
-
-1. Open **https://localhost:3000** in your browser
-2. Drag-and-drop (or click to select) your `.xlsx` file
-3. Click **"Upload & Provision"**
-4. A `configured_<TABLE_ID>_<filename>.xlsx` file will auto-download
-5. The Table ID is embedded in the downloaded workbook and remembered locally
-
-### Step 2: Open in Excel & Sync
-
-1. Open the downloaded `configured_<TABLE_ID>_<filename>.xlsx` in **Excel Desktop**
-2. If the add-in is not already registered, side-load the manifest once:
-   - Go to **Insert** → **My Add-ins** → **Upload My Add-in**
-   - Browse to `frontend/public/manifest.xml` (or use the one at `https://localhost:3000/manifest.xml`)
-3. The **SQLite LiveSync** taskpane opens on the right
-4. The taskpane reads the workbook's Table ID and starts listening automatically
-5. Edit any single cell — changes sync to SQLite in real time!
-
-### Step 3: Verify in SQLite
-
+### 4. Verify in Database
 ```bash
-py -m sqlite3 C:\Projects\boardwalk-clone\excel-sqlite-sync\backend\queue_board.db
+py -m sqlite3 backend/queue_board.db
 
 # List tables
 .tables
@@ -118,87 +144,9 @@ py -m sqlite3 C:\Projects\boardwalk-clone\excel-sqlite-sync\backend\queue_board.
 SELECT * FROM QUEUE_BOARD_XXXXXXXX LIMIT 10;
 ```
 
----
-
-## API Reference
-
-### `POST /api/v1/upload-and-provision`
-
-Upload an `.xlsx` file, create a SQLite table, inject the taskpane manifest, and return the modified file.
-
-**Request:** `multipart/form-data` with `file` field
-
-**Response:** Binary `.xlsx` file download with headers:
-| Header | Description |
-|---|---|
-| `X-Table-ID` | Generated table name |
-| `X-Row-Count` | Number of rows seeded |
-| `X-Column-Count` | Number of columns |
-
-### `POST /api/v1/realtime-sync`
-
-Sync a single cell edit from Excel to SQLite.
-
-**Request Body:**
-```json
-{
-  "table_id": "QUEUE_BOARD_A1B2C3D4",
-  "row_id": 1,
-  "column_name": "EMPLOYEE_NAME",
-  "new_value": "Jane Doe"
-}
-```
-
-**Response:**
-```json
-{
-  "status": "SUCCESS",
-  "timestamp": "2025-01-15T10:30:00Z",
-  "message": "Updated QUEUE_BOARD_A1B2C3D4.EMPLOYEE_NAME @ ROW_ID=1"
-}
-```
-
-### `GET /health`
-
-Health check endpoint. Returns `{"status": "ok"}`.
-
----
-
-## Project Structure
-
-```
-excel-sqlite-sync/
-├── backend/
-│   ├── app/
-│   │   ├── __init__.py           # Package marker
-│   │   ├── main.py               # FastAPI endpoints
-│   │   ├── database.py           # SQLite manager & dynamic provisioning
-│   │   ├── openxml_injector.py   # .xlsx OpenXML manipulation engine
-│   │   └── schemas.py            # Pydantic v2 request/response models
-│   ├── queue_board.db            # Auto-created SQLite database
-│   └── requirements.txt          # Python dependencies
-├── frontend/
-│   ├── public/
-│   │   ├── manifest.xml          # Office Web Add-in manifest
-│   │   ├── index.html            # Upload app HTML shell
-│   │   └── taskpane.html         # Taskpane HTML shell (with Office.js)
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── FileUploader.jsx  # Drag-and-drop upload component
-│   │   │   ├── TaskpaneUI.jsx    # Office.js sync side panel
-│   │   │   └── StatusBanner.jsx  # Animated status indicator
-│   │   ├── services/
-│   │   │   └── api.js            # API client helpers
-│   │   ├── App.jsx               # Main upload application
-│   │   ├── taskpane.jsx          # Office.js entry point
-│   │   └── index.js              # Main app entry point
-│   ├── package.json              # Node.js dependencies
-│   └── webpack.config.js         # Webpack 5 build config
-└── README.md
-```
-
----
-
-## License
-
-MIT
+## 🛠️ Necessary Details
+- **SQL Injection Prevention**: All interactions with the database utilize parameterized bindings (`?`) ensuring security.
+- **Dynamic Table Creation**: During upload, column names are sanitized automatically, and an auto-incrementing `ROW_ID` is applied to track records natively.
+- **Trust Developer Certs**: The React frontend requires HTTPS for the Office Add-in. On the first run, ensure you trust the `Developer CA for Microsoft Office Add-ins` when prompted.
+- **Office Web Add-in Manifest**: An OpenXML Injection automatically embeds an Office Web Add-in manifest directly into the `.xlsx` file structure.
+- **License**: MIT
