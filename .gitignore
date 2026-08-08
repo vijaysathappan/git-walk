@@ -1,0 +1,9 @@
+backend/.env
+backend/.auth-secret
+backend/__pycache__/
+backend/app/__pycache__/
+backend/tests/__pycache__/
+frontend/dist/
+frontend/dev-server*.log
+*.db-shm
+*.db-wal

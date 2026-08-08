@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Office Web Add-in Manifest for ExcelSQLiteLiveSync.
+  Office Web Add-in Manifest for Git Walk.
   This manifest defines a TaskPaneApp that loads the React sync UI
   inside Excel Desktop's side panel via WebView2.
 -->
@@ -14,11 +14,11 @@
   <!-- Unique Add-in ID -->
   <Id>e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b</Id>
   <Version>1.0.0.0</Version>
-  <ProviderName>ExcelSQLiteLiveSync</ProviderName>
+  <ProviderName>Git Walk</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
 
-  <DisplayName DefaultValue="SQLite LiveSync" />
-  <Description DefaultValue="Real-time bi-directional sync between Excel and SQLite database." />
+  <DisplayName DefaultValue="Git Walk" />
+  <Description DefaultValue="Git-style version control and collaboration for Excel workbooks." />
   <IconUrl DefaultValue="https://localhost:3000/assets/icon-32.png" />
   <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-80.png" />
   <SupportUrl DefaultValue="https://localhost:3000" />
@@ -90,13 +90,13 @@
         <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:3000/taskpane.html" />
       </bt:Urls>
       <bt:ShortStrings>
-        <bt:String id="GetStarted.Title" DefaultValue="SQLite LiveSync Add-in" />
-        <bt:String id="CommandsGroup.Label" DefaultValue="LiveSync" />
-        <bt:String id="TaskpaneButton.Label" DefaultValue="Open Sync Panel" />
+        <bt:String id="GetStarted.Title" DefaultValue="Git Walk for Excel" />
+        <bt:String id="CommandsGroup.Label" DefaultValue="Git Walk" />
+        <bt:String id="TaskpaneButton.Label" DefaultValue="Open Git Walk" />
       </bt:ShortStrings>
       <bt:LongStrings>
-        <bt:String id="GetStarted.Description" DefaultValue="Real-time sync between Excel and SQLite is ready." />
-        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Opens the SQLite LiveSync side panel for real-time data synchronization." />
+        <bt:String id="GetStarted.Description" DefaultValue="Review, commit, pull, and audit workbook changes." />
+        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Open Git Walk to review, commit, and pull workbook changes." />
       </bt:LongStrings>
     </Resources>
   </VersionOverrides>

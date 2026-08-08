@@ -4,7 +4,7 @@ const CopyWebpackPlugin = require("copy-webpack-plugin");
 const devCerts = require("office-addin-dev-certs");
 
 /**
- * Webpack configuration for ExcelSQLiteLiveSync frontend.
+ * Webpack configuration for the Git Walk browser app and Excel taskpane.
  *
  * Two entry points:
  *   1. index   → Main browser upload app (index.html)
@@ -63,14 +63,14 @@ module.exports = async (env, argv) => {
         template: "./public/index.html",
         filename: "index.html",
         chunks: ["index"],
-        title: "ExcelSQLiteLiveSync — Upload",
+        title: "Git Walk | Spreadsheet version control",
       }),
       // Taskpane app (embedded in Excel)
       new HtmlWebpackPlugin({
         template: "./public/taskpane.html",
         filename: "taskpane.html",
         chunks: ["taskpane"],
-        title: "ExcelSQLiteLiveSync — Taskpane",
+        title: "Git Walk for Excel",
       }),
       // Copy manifest.xml to dist
       new CopyWebpackPlugin({

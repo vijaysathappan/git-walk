@@ -2,6 +2,8 @@
 Pydantic v2 schemas for request/response validation.
 """
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -28,6 +30,8 @@ class SyncRequest(BaseModel):
         None,
         description="The new cell value as a string (None for cleared cells)",
     )
+    source: str = "excel"
+    commit_message: str | None = None
 
 
 class SyncResponse(BaseModel):
@@ -76,3 +80,63 @@ class UploadResponse(BaseModel):
     table_id: str
     row_count: int
     column_count: int
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=254)
+
+
+class LoginVerifyRequest(LoginRequest):
+    code: str = Field(..., min_length=6, max_length=6)
+
+
+class BulkCellChange(BaseModel):
+    row_id: int = Field(..., ge=1)
+    column_name: str
+    new_value: Any = None
+
+
+class BulkSyncRequest(BaseModel):
+    table_id: str
+    changes: list[BulkCellChange] = Field(..., min_length=1, max_length=5000)
+    source: str = "excel"
+    commit_message: str | None = Field(default=None, max_length=300)
+
+
+class WorkbookCommitRequest(BaseModel):
+    table_id: str
+    base_version: int = Field(..., ge=0)
+    updates: list[BulkCellChange] = Field(default_factory=list, max_length=5000)
+    insert_rows: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
+    delete_row_ids: list[int] = Field(default_factory=list, max_length=2000)
+    new_columns: list[str] = Field(default_factory=list, max_length=100)
+    delete_columns: list[str] = Field(default_factory=list, max_length=100)
+    source: str = "excel_commit"
+    commit_message: str = Field(..., min_length=1, max_length=300)
+
+
+class RollbackRequest(BaseModel):
+    table_id: str
+    batch_id: str
+
+
+class DatasetMemberRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=254)
+    role: str = Field(default="viewer", pattern="^(viewer|editor)$")
+
+
+class PresenceRequest(BaseModel):
+    client_id: str = Field(..., min_length=8, max_length=100)
+    surface: str = Field(..., pattern="^(browser|excel)$")
+    activity: str = Field(default="viewing", pattern="^(viewing|editing|idle)$")
+
+
+class AIInsightRequest(BaseModel):
+    table_id: str | None = None
+    model: str | None = None
+    question: str = Field(..., min_length=3, max_length=1000)
+
+
+class AIConfigRequest(BaseModel):
+    api_key: str = Field(..., min_length=10, max_length=500)
+    model: str = Field(..., min_length=3, max_length=200)
