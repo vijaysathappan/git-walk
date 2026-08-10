@@ -13,13 +13,22 @@ from email.message import EmailMessage
 from fastapi import Header, HTTPException
 
 from .config import settings
-from .database import consume_login_code, create_login_code, get_or_create_user, get_user
+from .database import (
+    auth_session_is_active,
+    consume_login_code,
+    create_auth_session,
+    create_login_code,
+    get_or_create_user,
+    get_user,
+    revoke_auth_session,
+)
 
 
 @dataclass(frozen=True)
 class Principal:
     user_id: str
     email: str
+    session_id: str | None = None
 
 
 def _b64encode(raw: bytes) -> str:
@@ -37,16 +46,29 @@ def hash_login_code(email: str, code: str) -> str:
 
 def create_session_token(user_id: str, email: str) -> str:
     expires = datetime.now(timezone.utc) + timedelta(hours=settings.session_hours)
+    session_id = f"SES_{secrets.token_hex(12).upper()}"
     payload = _b64encode(
         json.dumps(
-            {"sub": user_id, "email": email, "exp": int(expires.timestamp())},
+            {
+                "sub": user_id,
+                "email": email,
+                "sid": session_id,
+                "exp": int(expires.timestamp()),
+            },
             separators=(",", ":"),
         ).encode("utf-8")
     )
     signature = _b64encode(
         hmac.new(settings.auth_secret.encode("utf-8"), payload.encode("ascii"), hashlib.sha256).digest()
     )
-    return f"{payload}.{signature}"
+    token = f"{payload}.{signature}"
+    create_auth_session(
+        session_id,
+        user_id,
+        hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        expires.isoformat(),
+    )
+    return token
 
 
 def verify_session_token(token: str) -> Principal:
@@ -63,7 +85,12 @@ def verify_session_token(token: str) -> Principal:
         user = get_user(claims["sub"])
         if not user or user["email"].lower() != claims["email"].lower():
             raise ValueError("user")
-        return Principal(user_id=user["user_id"], email=user["email"])
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if not auth_session_is_active(claims["sid"], user["user_id"], token_hash):
+            raise ValueError("session")
+        return Principal(
+            user_id=user["user_id"], email=user["email"], session_id=claims["sid"]
+        )
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired session.") from exc
 
@@ -79,7 +106,10 @@ def current_principal(authorization: str | None = Header(default=None)) -> Princ
 def send_login_code(email: str) -> str | None:
     code = f"{secrets.randbelow(1_000_000):06d}"
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.otp_minutes)
-    create_login_code(email, hash_login_code(email, code), expires_at.isoformat())
+    try:
+        create_login_code(email, hash_login_code(email, code), expires_at.isoformat())
+    except PermissionError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     if settings.smtp_user and settings.smtp_pass and settings.smtp_from:
         message = EmailMessage()
@@ -109,3 +139,8 @@ def verify_login_code(email: str, code: str) -> tuple[dict, str]:
         raise HTTPException(status_code=401, detail="Invalid or expired verification code.")
     user = get_or_create_user(email)
     return user, create_session_token(user["user_id"], user["email"])
+
+
+def logout_session(principal: Principal) -> None:
+    if principal.session_id:
+        revoke_auth_session(principal.session_id, principal.user_id)

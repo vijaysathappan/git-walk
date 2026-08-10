@@ -7,9 +7,12 @@ Serves as the central backend for Git Walk:
 """
 
 import os
+import asyncio
 import io
 import json
+import logging
 import re
+import shutil
 import sqlite3
 import tempfile
 import urllib.error
@@ -17,16 +20,20 @@ import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from openpyxl import load_workbook
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .config import settings
 from .database import (
     DB_PATH,
     VersionConflictError,
+    advance_branch_head,
     add_dataset_member,
     apply_bulk_updates,
     apply_workbook_commit,
@@ -35,6 +42,7 @@ from .database import (
     delete_user_ai_settings,
     get_audit_history,
     get_dataset_members,
+    get_workspace_snapshot,
     get_user_ai_settings,
     get_kpis,
     get_table_page,
@@ -44,16 +52,23 @@ from .database import (
     list_active_presence,
     read_cell,
     remove_dataset_presence,
+    remove_dataset_member,
     register_dataset,
     rollback_batch,
     save_user_ai_settings,
+    store_initial_formula_metadata,
     table_exists,
     touch_dataset_presence,
     user_can_access_table,
     user_can_edit_table,
+    validate_working_copy,
     validate_identifier,
+    working_copy_required,
 )
-from .openxml_injector import inject_taskpane_manifest
+from .api.repositories import router as repositories_router
+from .api.commits import router as commits_router
+from .api.merge_requests import router as merge_requests_router
+from .api.governance import router as governance_router
 from .schemas import (
     AIConfigRequest,
     AIInsightRequest,
@@ -68,8 +83,38 @@ from .schemas import (
     SyncResponse,
     WorkbookCommitRequest,
 )
-from .security import Principal, current_principal, send_login_code, verify_login_code
+from .security import (
+    Principal,
+    current_principal,
+    logout_session,
+    send_login_code,
+    verify_login_code,
+)
 from .secret_store import decrypt_secret, encrypt_secret
+from .services.workbook_service import issue_branch_workbook
+from .services.commit_service import CommitActor, commit_service
+from .repositories.commit_store import BranchHeadChangedError
+from .repositories.governance_store import (
+    list_audit_events,
+    repository_id_for_table,
+    repository_insights,
+)
+from .repositories.merge_store import branch_context
+from .services.merge_service import MergeActor, merge_service
+from .security_uploads import (
+    UnsafeWorkbookError,
+    inspect_xlsx,
+    validate_workbook_dimensions,
+    worksheet_data_dimensions,
+)
+from .observability import (
+    metric_timer,
+    new_request_context,
+    record_audit_event,
+    record_metric,
+    record_security_event,
+    structured_log,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Application Factory
@@ -77,6 +122,7 @@ from .secret_store import decrypt_secret, encrypt_secret
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     initialize_product_schema()
+    cleanup_abandoned_uploads()
     yield
 
 
@@ -89,11 +135,53 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+app.include_router(repositories_router)
+app.include_router(commits_router)
+app.include_router(merge_requests_router)
+app.include_router(governance_router)
+
+logging.basicConfig(
+    level=getattr(logging, settings.log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    context = new_request_context(
+        request.headers.get("X-Request-ID"), request.headers.get("X-Trace-ID")
+    )
+    started = asyncio.get_running_loop().time()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception:
+        structured_log(logging.ERROR, "request_failed", path=request.url.path, method=request.method)
+        raise
+    finally:
+        duration_ms = (asyncio.get_running_loop().time() - started) * 1000
+        record_metric(
+            "http_request_latency", duration_ms, "ms",
+            status="SUCCESS" if status_code < 500 else "FAILED",
+            tags={"method": request.method, "path": request.url.path, "status": status_code},
+        )
+        structured_log(
+            logging.INFO, "request_completed", method=request.method,
+            path=request.url.path, status=status_code, duration_ms=round(duration_ms, 2),
+        )
+        if 'response' in locals():
+            response.headers["X-Request-ID"] = context.request_id
+            response.headers["X-Trace-ID"] = context.trace_id
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+            response.headers["Cache-Control"] = "no-store"
 
 # ── CORS — Allow all origins for local dev ───────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -102,11 +190,65 @@ app.add_middleware(
         "X-Row-Count",
         "X-Column-Count",
         "X-Owner-User-ID",
+        "X-Branch-Table-ID",
+        "X-Repository-ID",
+        "X-Branch-ID",
+        "X-Working-Copy-ID",
+        "X-Request-ID",
+        "X-Trace-ID",
     ],
 )
 
 # Temp directory for storing processed files (cleaned up manually or by OS)
 _UPLOAD_DIR = tempfile.mkdtemp(prefix="excelsync_uploads_")
+
+
+def cleanup_abandoned_uploads() -> None:
+    cutoff = datetime.now(timezone.utc).timestamp() - settings.temp_file_max_age_hours * 3600
+    roots = [Path(tempfile.gettempdir())]
+    prefixes = ("excelsync_uploads_", "gitwalk_working_copy_", "xlsx_inject_")
+    for root in roots:
+        for item in root.iterdir():
+            try:
+                if item.is_dir() and item.name.startswith(prefixes) and item.stat().st_mtime < cutoff:
+                    shutil.rmtree(item, ignore_errors=True)
+            except OSError:
+                continue
+
+
+def _parse_xlsx(
+    path: str,
+) -> tuple[list[str], dict[str, pd.DataFrame], dict[str, list[dict[str, object]]]]:
+    workbook = load_workbook(path, read_only=True, data_only=False)
+    try:
+        sheet_names = workbook.sheetnames
+        formulas_by_sheet = {}
+        for sheet in workbook.worksheets:
+            rows, columns = worksheet_data_dimensions(sheet)
+            validate_workbook_dimensions(sheet_names, rows, columns)
+            formulas_by_sheet[sheet.title] = [
+                {
+                    "row_position": row_index - 2,
+                    "column_position": column_index - 1,
+                    "formula": cell.value,
+                }
+                for row_index, row in enumerate(sheet.iter_rows(min_row=2), start=2)
+                for column_index, cell in enumerate(row, start=1)
+                if cell.data_type == "f" and isinstance(cell.value, str)
+            ]
+    finally:
+        workbook.close()
+    excel_file = pd.ExcelFile(path, engine="openpyxl")
+    try:
+        frames = pd.read_excel(excel_file, sheet_name=None)
+        return sheet_names, frames, formulas_by_sheet
+    finally:
+        excel_file.close()
+
+
+def _cleanup_download(input_path: str, output_path: str) -> None:
+    Path(input_path).unlink(missing_ok=True)
+    shutil.rmtree(Path(output_path).parent, ignore_errors=True)
 
 
 def _normalize_table_id(table_id: str) -> str:
@@ -126,6 +268,10 @@ def _ensure_access(table_id: str, principal: Principal, write: bool = False) -> 
     )
     if not allowed:
         detail = "Editor access is required." if write else "You do not have access to this dataset."
+        record_security_event(
+            "ACCESS_DENIED", user_id=principal.user_id,
+            details={"table_id": normalized, "write": write},
+        )
         raise HTTPException(status_code=403, detail=detail)
     return normalized
 
@@ -135,6 +281,37 @@ def _valid_email(email: str) -> str:
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
         raise HTTPException(status_code=400, detail="Enter a valid email address.")
     return normalized
+
+
+def _validate_workbook_identity(table_id: str, principal: Principal, payload) -> None:
+    if not working_copy_required(table_id):
+        return
+    try:
+        validate_working_copy(
+            table_id=table_id,
+            user_id=principal.user_id,
+            repository_id=payload.repository_id,
+            branch_id=payload.branch_id,
+            working_copy_id=payload.working_copy_id,
+            base_commit_id=payload.base_commit_id,
+            issued_at=payload.issued_at,
+            signature=payload.signature,
+        )
+    except PermissionError as exc:
+        message = str(exc)
+        if "no longer active" in message:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "WORKING_COPY_CLOSED",
+                    "message": "This workspace has already been merged. Download latest main or create a new workspace.",
+                },
+            ) from exc
+        record_security_event(
+            "WORKING_COPY_IDENTITY_REJECTED", user_id=principal.user_id,
+            details={"table_id": table_id, "reason": message},
+        )
+        raise HTTPException(status_code=403, detail=message) from exc
 
 
 def _ai_credentials(principal: Principal) -> tuple[str, str, bool]:
@@ -169,7 +346,17 @@ def _openrouter_models(api_key: str) -> list[str]:
 @app.post("/api/v1/auth/request-code")
 async def request_login_code(payload: LoginRequest):
     email = _valid_email(payload.email)
-    dev_otp = send_login_code(email)
+    try:
+        dev_otp = send_login_code(email)
+        record_audit_event(
+            "LOGIN_REQUESTED", actor_user_id="USR_SYSTEM", actor_type="SYSTEM",
+            payload={"email": email},
+        )
+    except Exception as exc:
+        record_security_event(
+            "LOGIN_REQUEST_BLOCKED", details={"email": email, "reason": str(exc)}
+        )
+        raise
     response = {"status": "sent", "email": email}
     if dev_otp:
         response["dev_otp"] = dev_otp
@@ -179,7 +366,18 @@ async def request_login_code(payload: LoginRequest):
 @app.post("/api/v1/auth/verify-code")
 async def verify_code(payload: LoginVerifyRequest):
     email = _valid_email(payload.email)
-    user, token = verify_login_code(email, payload.code)
+    try:
+        user, token = verify_login_code(email, payload.code)
+    except Exception as exc:
+        record_audit_event(
+            "LOGIN_FAILED", actor_user_id="USR_SYSTEM", actor_type="SYSTEM",
+            payload={"email": email}, status="FAILED", failure_reason="Invalid or expired code",
+        )
+        record_security_event("LOGIN_FAILED", details={"email": email, "reason": str(exc)})
+        raise
+    record_audit_event(
+        "LOGIN_SUCCESS", actor_user_id=user["user_id"], payload={"email": email}
+    )
     return {"token": token, "user": user}
 
 
@@ -188,9 +386,23 @@ async def auth_me(principal: Principal = Depends(current_principal)):
     return {"user_id": principal.user_id, "email": principal.email}
 
 
+@app.post("/api/v1/auth/logout")
+async def auth_logout(principal: Principal = Depends(current_principal)):
+    logout_session(principal)
+    record_audit_event("LOGOUT", actor_user_id=principal.user_id)
+    return {"status": "signed_out"}
+
+
 @app.post("/api/v1/upload-and-provision")
 async def upload_and_provision(
     file: UploadFile = File(...),
+    repository_name: str | None = Form(default=None),
+    description: str | None = Form(default=None),
+    category_id: str = Form(default="CAT_UNSORTED"),
+    visibility: str = Form(default="private"),
+    business_owner: str | None = Form(default=None),
+    data_classification: str = Form(default="internal"),
+    retention_policy: str | None = Form(default=None),
     principal: Principal = Depends(current_principal),
 ):
     """
@@ -211,14 +423,26 @@ async def upload_and_provision(
 
     # ── Save uploaded file to a temp location ────────────────────────────
     original_name = file.filename
-    safe_name = original_name.replace(" ", "_")
+    try:
+        contents = await file.read(settings.max_upload_bytes + 1)
+        upload_profile = inspect_xlsx(contents, original_name, file.content_type)
+    except UnsafeWorkbookError as exc:
+        record_audit_event(
+            "WORKBOOK_UPLOAD_REJECTED", actor_user_id=principal.user_id,
+            payload={"filename": original_name}, status="FAILED", failure_reason=str(exc),
+        )
+        record_security_event(
+            "UNSAFE_WORKBOOK_UPLOAD", user_id=principal.user_id,
+            details={"filename": original_name, "reason": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    safe_name = upload_profile["safe_filename"]
     input_path = os.path.join(_UPLOAD_DIR, f"raw_{uuid.uuid4().hex}_{safe_name}")
     output_path = os.path.join(
         _UPLOAD_DIR, f"configured_{uuid.uuid4().hex}_{safe_name}"
     )
 
     try:
-        contents = await file.read()
         with open(input_path, "wb") as f:
             f.write(contents)
     except Exception as exc:
@@ -226,14 +450,22 @@ async def upload_and_provision(
 
     # ── Parse Excel with pandas ──────────────────────────────────────────
     try:
-        df = pd.read_excel(input_path, engine="openpyxl")
-    except Exception as exc:
+        with metric_timer("workbook_parsing_time", user_id=principal.user_id):
+            sheet_names, frames, formulas_by_sheet = await asyncio.wait_for(
+                asyncio.to_thread(_parse_xlsx, input_path),
+                timeout=settings.upload_processing_timeout_seconds,
+            )
+        for frame in frames.values():
+            validate_workbook_dimensions(sheet_names, len(frame.index), len(frame.columns))
+    except (Exception, asyncio.TimeoutError) as exc:
+        Path(input_path).unlink(missing_ok=True)
+        record_metric("upload_failure", 1, "count", status="FAILED", user_id=principal.user_id)
         raise HTTPException(
             status_code=400,
             detail=f"Failed to parse Excel file: {exc}",
         )
 
-    if df.empty:
+    if not any(len(frame.index) or len(frame.columns) for frame in frames.values()):
         raise HTTPException(
             status_code=400,
             detail="The uploaded Excel file contains no data rows.",
@@ -244,32 +476,69 @@ async def upload_and_provision(
     table_id = f"QUEUE_BOARD_{short_uuid}"
 
     # ── Provision SQLite table & seed data ───────────────────────────────
+    sheet_tables = []
+    provisioned_results = []
     try:
-        result = create_sqlite_table_from_df(table_id, df)
+        for index, sheet_name in enumerate(sheet_names):
+            physical_table = (
+                table_id if index == 0 else f"SHEET_DATA_{uuid.uuid4().hex[:12].upper()}"
+            )
+            sheet_result = create_sqlite_table_from_df(physical_table, frames[sheet_name])
+            sheet_tables.append({"name": sheet_name, "table_id": physical_table})
+            provisioned_results.append(sheet_result)
+        result = provisioned_results[0]
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
     # ── Inject Office Web Add-in taskpane manifest ───────────────────────
-    try:
-        inject_taskpane_manifest(
-            input_xlsx_path=input_path,
-            output_xlsx_path=output_path,
-            manifest_url="https://localhost:3000/taskpane.html",
-            table_id=table_id,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Manifest injection failed: {exc}",
-        )
-
     register_dataset(
         table_id,
         principal.user_id,
         original_name,
         result["row_count"],
         result["column_count"],
+        sheet_names=sheet_names,
+        category_id=category_id,
+        repository_name=repository_name,
+        description=description,
+        visibility=visibility,
+        business_owner=business_owner,
+        data_classification=data_classification,
+        retention_policy=retention_policy,
+        sheet_tables=sheet_tables,
     )
+    store_initial_formula_metadata(table_id, formulas_by_sheet)
+    record_audit_event(
+        "WORKBOOK_UPLOADED", actor_user_id=principal.user_id,
+        payload={**upload_profile, "filename": original_name, "table_id": table_id},
+    )
+
+    try:
+        working_copy = issue_branch_workbook(
+            table_id, principal.user_id, principal.email, source_workbook=input_path
+        )
+        output_path = working_copy["path"]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Branch workbook provisioning failed: {exc}",
+        ) from exc
+
+    record_audit_event(
+        "REPOSITORY_CREATED", actor_user_id=principal.user_id,
+        repository_id=working_copy["repository_id"], branch_id=working_copy["branch_id"],
+        payload={"table_id": table_id, "filename": original_name},
+    )
+    record_audit_event(
+        "WORKBOOK_VALIDATED", actor_user_id="USR_SYSTEM", actor_type="SYSTEM",
+        repository_id=working_copy["repository_id"], branch_id=working_copy["branch_id"],
+        payload={"rows": result["row_count"], "columns": result["column_count"],
+                 "sheets": len(sheet_names)},
+    )
+    record_metric("workbook_size", upload_profile["upload_bytes"], "bytes", user_id=principal.user_id, repository_id=working_copy["repository_id"])
+    record_metric("workbook_rows", result["row_count"], "count", user_id=principal.user_id, repository_id=working_copy["repository_id"])
+    record_metric("workbook_columns", result["column_count"], "count", user_id=principal.user_id, repository_id=working_copy["repository_id"])
+    record_metric("workbook_sheets", len(sheet_names), "count", user_id=principal.user_id, repository_id=working_copy["repository_id"])
 
     # ── Return modified file with metadata headers ───────────────────────
     download_name = f"configured_{table_id}_{safe_name}"
@@ -277,11 +546,27 @@ async def upload_and_provision(
         path=output_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=download_name,
+        background=BackgroundTask(_cleanup_download, input_path, output_path),
     )
     response.headers["X-Table-ID"] = table_id
     response.headers["X-Row-Count"] = str(result["row_count"])
     response.headers["X-Column-Count"] = str(result["column_count"])
     response.headers["X-Owner-User-ID"] = principal.user_id
+    response.headers["X-Branch-Table-ID"] = working_copy["table_id"]
+    response.headers["X-Repository-ID"] = working_copy["repository_id"]
+    response.headers["X-Branch-ID"] = working_copy["branch_id"]
+    response.headers["X-Working-Copy-ID"] = working_copy["working_copy_id"]
+    record_audit_event(
+        "WORKING_COPY_CREATED", actor_user_id=principal.user_id,
+        repository_id=working_copy["repository_id"], branch_id=working_copy["branch_id"],
+        working_copy_id=working_copy["working_copy_id"],
+        payload={"table_id": working_copy["table_id"]},
+    )
+    record_audit_event(
+        "WORKBOOK_DOWNLOADED", actor_user_id=principal.user_id,
+        repository_id=working_copy["repository_id"], branch_id=working_copy["branch_id"],
+        working_copy_id=working_copy["working_copy_id"], payload={"filename": download_name},
+    )
     return response
 
 
@@ -295,6 +580,7 @@ async def realtime_sync(
     to the corresponding SQLite row.
     """
     table_id = _ensure_access(payload.table_id, principal, write=True)
+    _validate_workbook_identity(table_id, principal, payload)
     column_name = payload.column_name.strip().upper()
     row_id = payload.row_id
     new_value = payload.new_value
@@ -346,6 +632,7 @@ async def bulk_sync(
     principal: Principal = Depends(current_principal),
 ):
     table_id = _ensure_access(payload.table_id, principal, write=True)
+    _validate_workbook_identity(table_id, principal, payload)
     try:
         return apply_bulk_updates(
             table_id,
@@ -368,7 +655,11 @@ async def workbook_commit(
 ):
     table_id = _ensure_access(payload.table_id, principal, write=True)
     try:
-        return apply_workbook_commit(
+        if working_copy_required(table_id):
+            return commit_service.commit(
+                payload, CommitActor(principal.user_id, principal.email)
+            )
+        result = apply_workbook_commit(
             table_id=table_id,
             base_version=payload.base_version,
             updates=[change.model_dump() for change in payload.updates],
@@ -381,6 +672,29 @@ async def workbook_commit(
             source=payload.source,
             commit_message=payload.commit_message,
         )
+        advance_branch_head(table_id, result["batch_id"])
+        return result
+    except BranchHeadChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "BRANCH_HEAD_CHANGED",
+                "message": "The branch advanced after this workbook was checked out.",
+                "expected_head_commit_id": exc.expected_head,
+                "current_head_commit_id": exc.current_head,
+            },
+        ) from exc
+    except PermissionError as exc:
+        message = str(exc)
+        if "no longer active" in message:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "WORKING_COPY_CLOSED",
+                    "message": "This workspace has already been merged. Download latest main or create a new workspace.",
+                },
+            ) from exc
+        raise HTTPException(status_code=403, detail=message) from exc
     except VersionConflictError as exc:
         raise HTTPException(
             status_code=409,
@@ -495,6 +809,40 @@ async def add_member(
         raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/v1/datasets/{table_id}/members")
+async def revoke_member(
+    table_id: str,
+    email: str,
+    principal: Principal = Depends(current_principal),
+):
+    normalized = _ensure_access(table_id, principal)
+    try:
+        return remove_dataset_member(normalized, principal.user_id, _valid_email(email))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/v1/datasets/{table_id}/workspace")
+async def workspace_state(
+    table_id: str,
+    since_revision: int = Query(default=0, ge=0),
+    wait_seconds: int = Query(default=0, ge=0, le=25),
+    principal: Principal = Depends(current_principal),
+):
+    normalized = _ensure_access(table_id, principal)
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while True:
+        snapshot = get_workspace_snapshot(normalized)
+        if snapshot["revision"] > since_revision or wait_seconds == 0:
+            return snapshot
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return snapshot
+        await asyncio.sleep(min(0.75, remaining))
 
 
 @app.get("/api/v1/datasets/{table_id}/presence")
@@ -642,6 +990,25 @@ async def ai_insights(
         "kpis": get_kpis(principal.user_id, table_id),
         "recent_changes": get_audit_history(table_id, 20) if table_id else [],
     }
+    repository_id = repository_id_for_table(table_id) if table_id else None
+    if repository_id:
+        context["repository_insights"] = repository_insights(repository_id)
+        context["audit_events"] = list_audit_events(repository_id=repository_id, limit=30)
+    if payload.branch_id:
+        branch = branch_context(payload.branch_id)
+        if not branch or not repository_id or branch["repository_id"] != repository_id:
+            raise HTTPException(status_code=403, detail="Branch is not accessible in this repository.")
+        context["branch"] = {
+            key: branch.get(key) for key in
+            ("branch_id", "branch_name", "branch_type", "base_commit_id", "head_commit_id", "status")
+        }
+    if payload.merge_request_id:
+        try:
+            context["merge_request"] = merge_service.get_request(
+                payload.merge_request_id, MergeActor(principal.user_id, principal.email)
+            )
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
     model = payload.model or configured_model
     if not user_configured and model not in settings.openrouter_models:
         raise HTTPException(status_code=400, detail="Model is not in OPENROUTER_MODELS.")
@@ -654,7 +1021,10 @@ async def ai_insights(
                     "role": "system",
                     "content": (
                         "You are a data-governance copilot. Analyze change history, "
-                        "surface anomalies and risks, and recommend concise actions."
+                        "surface anomalies and risks, and recommend concise actions. "
+                        "You are advisory only: never claim to approve, merge, or revert. "
+                        "Prioritize formulas converted to static values, validation failures, "
+                        "structural changes, duplicates, and unusually large value changes."
                     ),
                 },
                 {
@@ -670,10 +1040,16 @@ async def ai_insights(
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://localhost:3000",
+            "HTTP-Referer": settings.app_url,
             "X-Title": "Git Walk",
         },
         method="POST",
+    )
+    record_audit_event(
+        "AI_ANALYSIS_REQUESTED", actor_user_id=principal.user_id, actor_type="USER",
+        repository_id=repository_id, branch_id=payload.branch_id,
+        merge_request_id=payload.merge_request_id,
+        payload={"model": model, "question_length": len(payload.question)},
     )
     try:
         with urllib.request.urlopen(request, timeout=45) as response:
@@ -683,6 +1059,13 @@ async def ai_insights(
         raise HTTPException(status_code=502, detail=f"OpenRouter request failed: {detail}")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"OpenRouter request failed: {exc}")
+
+    record_audit_event(
+        "AI_RECOMMENDATION_GENERATED", actor_user_id=principal.user_id, actor_type="AI",
+        repository_id=repository_id, branch_id=payload.branch_id,
+        merge_request_id=payload.merge_request_id,
+        payload={"model": model},
+    )
 
     return {
         "model": model,

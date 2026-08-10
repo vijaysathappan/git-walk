@@ -39,6 +39,10 @@ async function apiFetch(path, options = {}) {
   if (auth?.token) headers.set("Authorization", `Bearer ${auth.token}`);
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!response.ok) {
+    if (response.status === 401) {
+      clearAuth();
+      window.dispatchEvent(new Event("gitwalk:auth-expired"));
+    }
     const parsed = await parseError(response);
     const message = typeof parsed.detail === "object"
       ? parsed.detail.message || JSON.stringify(parsed.detail)
@@ -83,9 +87,20 @@ export async function getProfile() {
   return (await apiFetch("/auth/me")).json();
 }
 
-export async function uploadAndProvision(file) {
+export async function logout() {
+  try {
+    await apiFetch("/auth/logout", { method: "POST" });
+  } finally {
+    clearAuth();
+  }
+}
+
+export async function uploadAndProvision(file, metadata = {}) {
   const formData = new FormData();
   formData.append("file", file);
+  Object.entries(metadata).forEach(([key, value]) => {
+    if (value != null && String(value).trim() !== "") formData.append(key, value);
+  });
   const response = await apiFetch("/upload-and-provision", {
     method: "POST",
     body: formData,
@@ -96,6 +111,10 @@ export async function uploadAndProvision(file) {
   return {
     blob,
     tableId: response.headers.get("X-Table-ID") || "UNKNOWN",
+    branchTableId: response.headers.get("X-Branch-Table-ID") || "",
+    repositoryId: response.headers.get("X-Repository-ID") || "",
+    branchId: response.headers.get("X-Branch-ID") || "",
+    workingCopyId: response.headers.get("X-Working-Copy-ID") || "",
     rowCount: response.headers.get("X-Row-Count") || "0",
     colCount: response.headers.get("X-Column-Count") || "0",
     filename: filenameMatch ? filenameMatch[1] : `configured_${file.name}`,
@@ -137,6 +156,85 @@ export async function commitWorkbook(payload) {
   ).json();
 }
 
+export async function getBranchState(branchId, commitId = "") {
+  const query = commitId ? `?commit_id=${encodeURIComponent(commitId)}` : "";
+  return (await apiFetch(`/branches/${branchId}/state${query}`)).json();
+}
+
+export async function getBranchCommits(branchId, limit = 100) {
+  return (await apiFetch(`/branches/${branchId}/commits?limit=${limit}`)).json();
+}
+
+export async function getBranchMetrics(branchId) {
+  return (await apiFetch(`/branches/${branchId}/metrics`)).json();
+}
+
+export async function getCommitDetail(commitId) {
+  return (await apiFetch(`/commits/${commitId}`)).json();
+}
+
+export async function getStableCellHistory(branchId, sheetId, rowId, columnId, limit = 100) {
+  return (
+    await apiFetch(
+      `/branches/${branchId}/cells/${sheetId}/${rowId}/${columnId}/history?limit=${limit}`
+    )
+  ).json();
+}
+
+export async function getBranchDivergence(branchId) {
+  return (await apiFetch(`/branches/${branchId}/divergence`)).json();
+}
+
+export async function syncBranchWithMain(branchId) {
+  return (await apiFetch(`/branches/${branchId}/sync`, { method: "POST" })).json();
+}
+
+export async function getMergeRequests(tableId) {
+  return (await apiFetch(`/repositories/${tableId}/merge-requests`)).json();
+}
+
+export async function createMergeRequest(payload) {
+  return (
+    await apiFetch("/merge-requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+  ).json();
+}
+
+export async function getMergeRequest(mergeRequestId) {
+  return (await apiFetch(`/merge-requests/${mergeRequestId}`)).json();
+}
+
+export async function resolveMergeConflict(mergeRequestId, conflictId, payload) {
+  return (
+    await apiFetch(`/merge-requests/${mergeRequestId}/conflicts/${conflictId}/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+  ).json();
+}
+
+export async function reviewMergeRequest(mergeRequestId, decision, comment = "") {
+  return (
+    await apiFetch(`/merge-requests/${mergeRequestId}/review`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision, comment }),
+    })
+  ).json();
+}
+
+export async function mergeMergeRequest(mergeRequestId) {
+  return (await apiFetch(`/merge-requests/${mergeRequestId}/merge`, { method: "POST" })).json();
+}
+
+export async function revertSemanticCommit(commitId) {
+  return (await apiFetch(`/commits/${commitId}/revert`, { method: "POST" })).json();
+}
+
 export async function getCellValue(payload) {
   const params = new URLSearchParams({
     table_id: payload.table_id,
@@ -148,6 +246,107 @@ export async function getCellValue(payload) {
 
 export async function getDatasets() {
   return (await apiFetch("/datasets")).json();
+}
+
+export async function getCategories() {
+  return (await apiFetch("/categories")).json();
+}
+
+export async function createCategory(name, description = "", parentCategoryId = "CAT_HOME") {
+  return (
+    await apiFetch("/categories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        description,
+        parent_category_id: parentCategoryId,
+      }),
+    })
+  ).json();
+}
+
+export async function getRepository(tableId) {
+  return (await apiFetch(`/repositories/${tableId}`)).json();
+}
+
+export async function checkRepositoryName(name) {
+  return (await apiFetch(`/repositories/name-availability?name=${encodeURIComponent(name)}`)).json();
+}
+
+export async function getRepositoryBranches(tableId) {
+  return (await apiFetch(`/repositories/${tableId}/branches`)).json();
+}
+
+export async function getMyWorkingCopies() {
+  return (await apiFetch("/working-copies/mine")).json();
+}
+
+export async function moveRepositoryToCategory(tableId, categoryId) {
+  return (
+    await apiFetch(`/repositories/${tableId}/category`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ category_id: categoryId }),
+    })
+  ).json();
+}
+
+export async function workOnWorkbook(tableId) {
+  const response = await apiFetch(`/repositories/${tableId}/work-on-workbook`, {
+    method: "POST",
+  });
+  const blob = await response.blob();
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const filenameMatch = disposition.match(/filename="?(.+?)"?$/);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filenameMatch ? filenameMatch[1] : `gitwalk_${tableId}.xlsx`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  return {
+    repositoryId: response.headers.get("X-Repository-ID"),
+    branchId: response.headers.get("X-Branch-ID"),
+    workingCopyId: response.headers.get("X-Working-Copy-ID"),
+  };
+}
+
+async function downloadResponse(response, fallbackName) {
+  const blob = await response.blob();
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const filenameMatch = disposition.match(/filename="?(.+?)"?$/);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filenameMatch ? filenameMatch[1] : fallbackName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function downloadRepositoryBranch(tableId, branchId) {
+  const response = await apiFetch(`/repositories/${tableId}/branches/${branchId}/download`);
+  await downloadResponse(response, `gitwalk_${branchId}.xlsx`);
+}
+
+export async function getRepositorySheetData(tableId, branchId, sheetId, limit = 100, offset = 0) {
+  return (
+    await apiFetch(
+      `/repositories/${tableId}/branches/${branchId}/sheets/${sheetId}/records?limit=${limit}&offset=${offset}`
+    )
+  ).json();
+}
+
+export async function deleteRepository(tableId) {
+  return (await apiFetch(`/repositories/${tableId}`, { method: "DELETE" })).json();
+}
+
+export async function deleteBranch(branchId) {
+  return (await apiFetch(`/branches/${branchId}`, { method: "DELETE" })).json();
 }
 
 export async function getDatasetData(tableId, limit = 100, offset = 0) {
@@ -170,6 +369,19 @@ export async function addDatasetMember(tableId, email, role) {
       body: JSON.stringify({ email, role }),
     })
   ).json();
+}
+
+export async function revokeDatasetMember(tableId, email) {
+  const query = new URLSearchParams({ email });
+  return (await apiFetch(`/datasets/${tableId}/members?${query}`, { method: "DELETE" })).json();
+}
+
+export async function getWorkspaceState(tableId, sinceRevision = 0, waitSeconds = 0) {
+  const query = new URLSearchParams({
+    since_revision: String(sinceRevision),
+    wait_seconds: String(waitSeconds),
+  });
+  return (await apiFetch(`/datasets/${tableId}/workspace?${query}`)).json();
 }
 
 export async function heartbeatPresence(tableId, clientId, surface, activity = "viewing") {
@@ -244,5 +456,44 @@ export async function generateAIInsight(payload) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     })
+  ).json();
+}
+
+export async function getAuditEvents(tableId = "", options = {}) {
+  const query = new URLSearchParams();
+  if (tableId) query.set("table_id", tableId);
+  if (options.eventType) query.set("event_type", options.eventType);
+  if (options.status) query.set("status", options.status);
+  query.set("limit", String(options.limit || 300));
+  return (await apiFetch(`/audit/events?${query}`)).json();
+}
+
+export async function getOperationalMetrics(hours = 24) {
+  return (await apiFetch(`/observability/metrics?hours=${hours}`)).json();
+}
+
+export async function getSecurityPosture() {
+  return (await apiFetch("/security/posture")).json();
+}
+
+export async function getRepositoryInsights(tableId) {
+  return (await apiFetch(`/repositories/${tableId}/insights`)).json();
+}
+
+export async function getWorkbookBlame(branchId, sheetId = "", limit = 5000) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (sheetId) query.set("sheet_id", sheetId);
+  return (await apiFetch(`/branches/${branchId}/blame?${query}`)).json();
+}
+
+export async function getRowHistory(branchId, sheetId, rowId) {
+  return (await apiFetch(`/branches/${branchId}/rows/${sheetId}/${rowId}/history`)).json();
+}
+
+export async function getCellTraceability(branchId, sheetId, rowId, columnId) {
+  return (
+    await apiFetch(
+      `/branches/${branchId}/cells/${sheetId}/${rowId}/${columnId}/traceability`
+    )
   ).json();
 }

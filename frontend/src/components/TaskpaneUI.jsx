@@ -3,17 +3,36 @@ import StatusBanner from "./StatusBanner";
 import {
   clearAuth,
   commitWorkbook,
+  getBranchState,
+  getBranchDivergence,
   getClientId,
   getStoredAuth,
   getWorkbookSnapshot,
   heartbeatPresence,
   leaveDatasetPresence,
+  logout,
   requestLoginCode,
+  syncBranchWithMain,
   verifyLoginCode,
 } from "../services/api";
 
 const TABLE_ID_DEFINED_NAME = "_EXCEL_SQLITE_SYNC_TABLE_ID";
-const ROW_ID_HEADER = "__LIVESYNC_ROW_ID";
+const WORKBOOK_METADATA_NAMES = {
+  repository_id: "_GITWALK_REPOSITORY_ID",
+  branch_id: "_GITWALK_BRANCH_ID",
+  working_copy_id: "_GITWALK_WORKING_COPY_ID",
+  base_commit_id: "_GITWALK_BASE_COMMIT_ID",
+  issued_at: "_GITWALK_ISSUED_AT",
+  signature: "_GITWALK_SIGNATURE",
+};
+const ROW_ID_HEADER = "__GITWALK_ROW_ID";
+const LEGACY_ROW_ID_HEADER = "__LIVESYNC_ROW_ID";
+
+function clientStableId(prefix) {
+  const random = globalThis.crypto?.randomUUID?.().replace(/-/g, "").toUpperCase()
+    || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`.toUpperCase();
+  return `${prefix}_${random.slice(0, 20)}`;
+}
 
 function sanitizeColumnName(raw) {
   let name = String(raw || "")
@@ -44,7 +63,15 @@ function parseTableIdFormula(formula) {
     .replace(/^=/, "")
     .replace(/^"|"$/g, "")
     .toUpperCase();
-  return /^QUEUE_BOARD_[A-Z0-9]+$/.test(tableId) ? tableId : null;
+  return /^(QUEUE_BOARD|BRANCH_DATA)_[A-Z0-9]+$/.test(tableId) ? tableId : null;
+}
+
+function parseDefinedValue(formula) {
+  return String(formula || "")
+    .trim()
+    .replace(/^=/, "")
+    .replace(/^"|"$/g, "")
+    .replace(/""/g, '"');
 }
 
 function snapshotModel(snapshot) {
@@ -65,6 +92,377 @@ function snapshotModel(snapshot) {
     rows.set(rowId, values);
   }
   return { columns, rows };
+}
+
+function semanticSheet(snapshot) {
+  const sheet = snapshot?.semantic?.sheets?.[0];
+  if (!sheet) throw new Error("This checkout has no Stage 2 identity map. Pull latest and reconnect.");
+  return sheet;
+}
+
+function sequenceMoves(baseIds, localIds, positions) {
+  const localSet = new Set(localIds);
+  const working = baseIds.filter((id) => localSet.has(id));
+  const target = localIds.filter((id) => working.includes(id));
+  const moves = [];
+  target.forEach((id, targetIndex) => {
+    const currentIndex = working.indexOf(id);
+    if (currentIndex === targetIndex) return;
+    working.splice(currentIndex, 1);
+    working.splice(targetIndex, 0, id);
+    moves.push({ id, position: positions.get(id) });
+  });
+  return moves;
+}
+
+function buildSemanticSheetDiff(baseSheet, workbook) {
+  const operations = [];
+  const preview = [];
+  const baseColumns = [...baseSheet.columns].sort((a, b) => a.position - b.position);
+  const unusedBase = new Set(baseColumns.map((column) => column.column_id));
+  const mappedColumns = workbook.columns.map((name, position) => {
+    let match = baseColumns.find(
+      (column) => unusedBase.has(column.column_id) && column.name === name
+    );
+    if (!match) {
+      match = baseColumns.find(
+        (column) => unusedBase.has(column.column_id) && column.position === position
+      );
+    }
+    if (match) unusedBase.delete(match.column_id);
+    return {
+      columnId: match?.column_id || clientStableId("COL"),
+      name,
+      position,
+      base: match || null,
+    };
+  });
+  const columnByName = new Map(mappedColumns.map((column) => [column.name, column]));
+  const columnPositions = new Map(mappedColumns.map((column) => [column.columnId, column.position]));
+
+  mappedColumns.forEach((column) => {
+    if (!column.base) {
+      operations.push({
+        operation_type: "COLUMN_INSERT", sheet_id: baseSheet.sheet_id,
+        column_id: column.columnId, new_column_position: column.position,
+        new_value: column.name, new_data_type: "TEXT",
+      });
+      preview.push(`COLUMN_INSERT ${column.name} at ${column.position + 1}`);
+    } else if (column.base.name !== column.name) {
+      operations.push({
+        operation_type: "COLUMN_RENAME", sheet_id: baseSheet.sheet_id,
+        column_id: column.columnId, old_value: column.base.name, new_value: column.name,
+      });
+      preview.push(`COLUMN_RENAME ${column.base.name} -> ${column.name}`);
+    }
+  });
+  unusedBase.forEach((columnId) => {
+    const column = baseColumns.find((item) => item.column_id === columnId);
+    operations.push({
+      operation_type: "COLUMN_DELETE", sheet_id: baseSheet.sheet_id,
+      column_id: columnId, previous_column_position: column.position, old_value: column.name,
+    });
+    preview.push(`COLUMN_DELETE ${column.name}`);
+  });
+  sequenceMoves(
+    baseColumns.map((column) => column.column_id),
+    mappedColumns.map((column) => column.columnId),
+    columnPositions
+  ).forEach(({ id, position }) => {
+    const base = baseColumns.find((column) => column.column_id === id);
+    operations.push({
+      operation_type: "COLUMN_MOVE", sheet_id: baseSheet.sheet_id, column_id: id,
+      previous_column_position: base.position, new_column_position: position,
+    });
+    preview.push(`COLUMN_MOVE ${base.name}: ${base.position + 1} -> ${position + 1}`);
+  });
+
+  if (baseSheet.name !== workbook.sheetName) {
+    operations.push({
+      operation_type: "SHEET_RENAME", sheet_id: baseSheet.sheet_id,
+      old_value: baseSheet.name, new_value: workbook.sheetName,
+    });
+    preview.push(`SHEET_RENAME ${baseSheet.name} -> ${workbook.sheetName}`);
+  }
+
+  const baseRows = [...baseSheet.rows].sort((a, b) => a.position - b.position);
+  const baseById = new Map(baseRows.map((row) => [row.row_id, row]));
+  const seenRows = new Set();
+  const localRows = workbook.rows.map((row, position) => ({
+    ...row,
+    rowId: row.rowId || clientStableId("ROW"),
+    position,
+  }));
+  const rowPositions = new Map(localRows.map((row) => [row.rowId, row.position]));
+
+  localRows.forEach((row) => {
+    if (seenRows.has(row.rowId)) throw new Error(`Duplicate hidden row identity ${row.rowId}. Pull latest to repair it.`);
+    seenRows.add(row.rowId);
+    const original = baseById.get(row.rowId);
+    const valuesById = {};
+    mappedColumns.forEach((column) => { valuesById[column.columnId] = row.values[column.name] ?? null; });
+    if (!original) {
+      operations.push({
+        operation_type: "ROW_INSERT", sheet_id: baseSheet.sheet_id,
+        row_id: row.rowId, new_row_position: row.position, new_value: valuesById,
+      });
+      preview.push(`ROW_INSERT at ${row.position + 2}`);
+    }
+    mappedColumns.forEach((column) => {
+      if (!original) {
+        if (row.formulas[column.name]) {
+          operations.push({
+            operation_type: "CELL_FORMULA_UPDATE", sheet_id: baseSheet.sheet_id,
+            row_id: row.rowId, column_id: column.columnId,
+            old_formula: null, new_formula: row.formulas[column.name],
+          });
+        }
+        return;
+      }
+      if (!column.base) {
+        const newValue = row.values[column.name] ?? null;
+        if (newValue != null) {
+          operations.push({
+            operation_type: "CELL_VALUE_UPDATE", sheet_id: baseSheet.sheet_id,
+            row_id: row.rowId, column_id: column.columnId,
+            old_value: null, new_value: newValue,
+          });
+          preview.push(`${column.name} [${row.position + 2}]: NULL -> ${String(newValue)}`);
+        }
+        if (row.formulas[column.name]) {
+          operations.push({
+            operation_type: "CELL_FORMULA_UPDATE", sheet_id: baseSheet.sheet_id,
+            row_id: row.rowId, column_id: column.columnId,
+            old_formula: null, new_formula: row.formulas[column.name],
+          });
+        }
+        return;
+      }
+      const oldValue = original.values[column.columnId] ?? null;
+      const newValue = row.values[column.name] ?? null;
+      const oldFormula = original.formulas?.[column.columnId] || null;
+      const newFormula = row.formulas[column.name] || null;
+      if (!valuesEqual(oldValue, newValue)) {
+        operations.push({
+          operation_type: "CELL_VALUE_UPDATE", sheet_id: baseSheet.sheet_id,
+          row_id: row.rowId, column_id: column.columnId,
+          old_value: oldValue, new_value: newValue,
+        });
+        preview.push(`${column.name} [${row.position + 2}]: ${String(oldValue)} -> ${String(newValue)}`);
+      }
+      if (oldFormula !== newFormula) {
+        operations.push({
+          operation_type: "CELL_FORMULA_UPDATE", sheet_id: baseSheet.sheet_id,
+          row_id: row.rowId, column_id: column.columnId,
+          old_formula: oldFormula, new_formula: newFormula,
+        });
+        preview.push(`FORMULA ${column.name} [${row.position + 2}]: ${oldFormula || "none"} -> ${newFormula || "none"}`);
+      }
+    });
+  });
+
+  sequenceMoves(
+    baseRows.map((row) => row.row_id),
+    localRows.map((row) => row.rowId),
+    rowPositions
+  ).forEach(({ id, position }) => {
+    const original = baseById.get(id);
+    operations.push({
+      operation_type: "ROW_MOVE", sheet_id: baseSheet.sheet_id, row_id: id,
+      previous_row_position: original.position, new_row_position: position,
+    });
+    preview.push(`ROW_MOVE ${original.position + 2} -> ${position + 2}`);
+  });
+  baseRows.filter((row) => !seenRows.has(row.row_id)).forEach((row) => {
+    operations.push({
+      operation_type: "ROW_DELETE", sheet_id: baseSheet.sheet_id,
+      row_id: row.row_id, previous_row_position: row.position,
+    });
+    preview.push(`ROW_DELETE at ${row.position + 2}`);
+  });
+
+  const counts = operations.reduce((result, operation) => {
+    if (operation.operation_type.startsWith("CELL_")) result.cells += 1;
+    if (operation.operation_type.startsWith("ROW_")) result.rows += 1;
+    if (operation.operation_type.startsWith("COLUMN_")) result.columns += 1;
+    if (operation.operation_type === "CELL_FORMULA_UPDATE") result.formulas += 1;
+    return result;
+  }, { cells: 0, rows: 0, columns: 0, formulas: 0 });
+
+  return {
+    semantic_changes: operations,
+    changeCount: operations.length,
+    preview,
+    counts,
+    updates: [], insert_rows: [], delete_row_ids: [], new_columns: [], delete_columns: [],
+  };
+}
+
+function buildSemanticWorkbookDiff(baseline, workbook) {
+  const baseSheets = [...(baseline?.semantic?.sheets || [])].sort((a, b) => a.position - b.position);
+  const localSheets = [...(workbook?.sheets || [])].sort((a, b) => a.sheetPosition - b.sheetPosition);
+  const unused = new Set(baseSheets.map((sheet) => sheet.sheet_id));
+  const combined = {
+    semantic_changes: [], preview: [], changeCount: 0,
+    counts: { cells: 0, rows: 0, columns: 0, formulas: 0, sheets: 0 },
+    updates: [], insert_rows: [], delete_row_ids: [], new_columns: [], delete_columns: [],
+  };
+  const mapped = localSheets.map((local, position) => {
+    let base = baseSheets.find((sheet) => unused.has(sheet.sheet_id) && sheet.name === local.sheetName);
+    if (!base) base = baseSheets.find((sheet) => unused.has(sheet.sheet_id) && sheet.position === position);
+    if (base) unused.delete(base.sheet_id);
+    if (!base) {
+      const sheetId = clientStableId("SHEET");
+      combined.semantic_changes.push({
+        operation_type: "SHEET_CREATE", sheet_id: sheetId,
+        new_value: local.sheetName, new_row_position: position,
+      });
+      combined.preview.push(`SHEET_CREATE ${local.sheetName}`);
+      combined.counts.sheets += 1;
+      base = { sheet_id: sheetId, name: local.sheetName, position, columns: [], rows: [] };
+    }
+    const diff = buildSemanticSheetDiff(base, local);
+    combined.semantic_changes.push(...diff.semantic_changes);
+    combined.preview.push(...diff.preview.map((line) => `${local.sheetName}: ${line}`));
+    Object.keys(diff.counts).forEach((key) => { combined.counts[key] += diff.counts[key] || 0; });
+    if (base.position !== position && (baseline?.semantic?.sheets || []).some((sheet) => sheet.sheet_id === base.sheet_id)) {
+      combined.semantic_changes.push({
+        operation_type: "SHEET_MOVE", sheet_id: base.sheet_id,
+        previous_row_position: base.position, new_row_position: position,
+      });
+      combined.preview.push(`SHEET_MOVE ${local.sheetName}: ${base.position + 1} -> ${position + 1}`);
+      combined.counts.sheets += 1;
+    }
+    return base.sheet_id;
+  });
+  void mapped;
+  unused.forEach((sheetId) => {
+    const sheet = baseSheets.find((item) => item.sheet_id === sheetId);
+    combined.semantic_changes.push({
+      operation_type: "SHEET_DELETE", sheet_id: sheetId,
+      old_value: sheet.name, previous_row_position: sheet.position,
+    });
+    combined.preview.push(`SHEET_DELETE ${sheet.name}`);
+    combined.counts.sheets += 1;
+  });
+  combined.changeCount = combined.semantic_changes.length;
+  return combined;
+}
+
+function semanticTarget(change) {
+  if (change.operation_type.startsWith("CELL_")) return `CELL:${change.row_id}:${change.column_id}`;
+  if (change.operation_type.startsWith("ROW_")) return `ROW:${change.row_id}`;
+  if (change.operation_type.startsWith("COLUMN_")) return `COLUMN:${change.column_id}`;
+  return `SHEET:${change.sheet_id}`;
+}
+
+function workbookFromSemantic(snapshot) {
+  return {
+    sheets: [...(snapshot?.semantic?.sheets || [])].sort((a, b) => a.position - b.position).map((sheet) => {
+      const columns = [...sheet.columns].sort((a, b) => a.position - b.position);
+      return {
+        sheetName: sheet.name,
+        sheetPosition: sheet.position,
+        columns: columns.map((column) => column.name),
+        rows: [...sheet.rows].sort((a, b) => a.position - b.position).map((row) => ({
+          rowId: row.row_id,
+          values: Object.fromEntries(columns.map((column) => [column.name, row.values[column.column_id] ?? null])),
+          formulas: Object.fromEntries(columns.map((column) => [column.name, row.formulas?.[column.column_id] || null])),
+        })),
+      };
+    }),
+  };
+}
+
+function semanticRebaseConflicts(baseline, remote, localDiff) {
+  const remoteDiff = buildSemanticWorkbookDiff(baseline, workbookFromSemantic(remote));
+  const remoteTargets = new Set(remoteDiff.semantic_changes.map(semanticTarget));
+  return localDiff.semantic_changes
+    .filter((change) => remoteTargets.has(semanticTarget(change)))
+    .map((change) => `${semanticTarget(change)} changed locally and remotely.`);
+}
+
+function applySemanticChanges(snapshot, changes) {
+  const rebased = JSON.parse(JSON.stringify(snapshot));
+  const sheets = rebased.semantic.sheets;
+  const sortState = (sheet) => {
+    sheet.columns.sort((a, b) => a.position - b.position)
+      .forEach((column, index) => { column.position = index; });
+    sheet.rows.sort((a, b) => a.position - b.position)
+      .forEach((row, index) => { row.position = index; });
+    sheets.sort((a, b) => a.position - b.position)
+      .forEach((item, index) => { item.position = index; });
+  };
+  changes.forEach((change) => {
+    const operation = change.operation_type;
+    if (operation === "SHEET_CREATE") {
+      sheets.splice(change.new_row_position, 0, {
+        sheet_id: change.sheet_id, name: change.new_value,
+        position: change.new_row_position, columns: [], rows: [],
+      });
+      sortState(sheets[change.new_row_position]);
+      return;
+    }
+    const sheet = sheets.find((item) => item.sheet_id === change.sheet_id);
+    if (!sheet) return;
+    if (operation === "SHEET_DELETE") {
+      const index = sheets.findIndex((item) => item.sheet_id === change.sheet_id);
+      if (index >= 0) sheets.splice(index, 1);
+      return;
+    }
+    if (operation === "SHEET_RENAME") sheet.name = change.new_value;
+    if (operation === "SHEET_MOVE") {
+      const index = sheets.findIndex((item) => item.sheet_id === change.sheet_id);
+      if (index >= 0) sheets.splice(change.new_row_position, 0, sheets.splice(index, 1)[0]);
+    }
+    if (operation === "COLUMN_INSERT") {
+      sheet.columns.splice(change.new_column_position, 0, {
+        column_id: change.column_id, name: change.new_value,
+        position: change.new_column_position, data_type: change.new_data_type || "TEXT",
+      });
+      sheet.rows.forEach((row) => { row.values[change.column_id] = null; });
+    }
+    if (operation === "COLUMN_DELETE") {
+      sheet.columns = sheet.columns.filter((column) => column.column_id !== change.column_id);
+      sheet.rows.forEach((row) => {
+        delete row.values[change.column_id];
+        delete row.formulas?.[change.column_id];
+      });
+    }
+    if (operation === "COLUMN_RENAME") {
+      const column = sheet.columns.find((item) => item.column_id === change.column_id);
+      if (column) column.name = change.new_value;
+    }
+    if (operation === "COLUMN_MOVE") {
+      const index = sheet.columns.findIndex((column) => column.column_id === change.column_id);
+      if (index >= 0) sheet.columns.splice(change.new_column_position, 0, sheet.columns.splice(index, 1)[0]);
+    }
+    if (operation === "ROW_INSERT") {
+      sheet.rows.splice(change.new_row_position, 0, {
+        row_id: change.row_id, position: change.new_row_position,
+        values: { ...(change.new_value || {}) }, formulas: {}, styles: {}, comments: {},
+      });
+    }
+    if (operation === "ROW_DELETE") {
+      sheet.rows = sheet.rows.filter((row) => row.row_id !== change.row_id);
+    }
+    if (operation === "ROW_MOVE") {
+      const index = sheet.rows.findIndex((row) => row.row_id === change.row_id);
+      if (index >= 0) sheet.rows.splice(change.new_row_position, 0, sheet.rows.splice(index, 1)[0]);
+    }
+    if (operation.startsWith("CELL_")) {
+      const row = sheet.rows.find((item) => item.row_id === change.row_id);
+      if (!row) return;
+      if (operation === "CELL_VALUE_UPDATE") row.values[change.column_id] = change.new_value;
+      if (operation === "CELL_FORMULA_UPDATE") {
+        row.formulas ||= {};
+        if (change.new_formula) row.formulas[change.column_id] = change.new_formula;
+        else delete row.formulas[change.column_id];
+      }
+    }
+    sortState(sheet);
+  });
+  return rebased;
 }
 
 function buildWorkbookDiff(baseline, workbook) {
@@ -191,12 +589,12 @@ function rebaseDiffOntoSnapshot(remote, diff) {
 
 const containerStyle = {
   minHeight: "100vh", padding: "18px 15px", color: "#e8f0f2",
-  background: "radial-gradient(circle at top right, #17343c 0, #101821 38%, #0b1017 100%)",
+  background: "linear-gradient(180deg,#181818 0,#1f1f1f 100%)",
   display: "flex", flexDirection: "column", gap: 13,
 };
 const cardStyle = {
-  padding: 14, border: "1px solid rgba(118,232,209,.13)", borderRadius: 14,
-  background: "rgba(18,29,40,.84)", boxShadow: "0 16px 45px rgba(0,0,0,.16)",
+  padding: 14, border: "1px solid #3c3c3c", borderRadius: 6,
+  background: "#252526", boxShadow: "0 8px 24px rgba(0,0,0,.16)",
 };
 const labelStyle = {
   color: "#8399a5", fontSize: 10, fontWeight: 800, letterSpacing: ".12em",
@@ -204,12 +602,12 @@ const labelStyle = {
 };
 const inputStyle = {
   boxSizing: "border-box", width: "100%", padding: "10px 11px", color: "#edf8f7",
-  background: "#0b131c", border: "1px solid #29404c", borderRadius: 9, outline: "none",
+  background: "#1e1e1e", border: "1px solid #4c4c4c", borderRadius: 4, outline: "none",
 };
 const buttonStyle = {
-  width: "100%", padding: "11px 13px", border: 0, borderRadius: 9, color: "#071716",
-  background: "linear-gradient(135deg,#75ead0,#41cbb4)", fontSize: 12, fontWeight: 800,
-  cursor: "pointer", boxShadow: "0 8px 25px rgba(65,203,180,.18)",
+  width: "100%", padding: "11px 13px", border: "1px solid #2ea043", borderRadius: 4, color: "#fff",
+  background: "#238636", fontSize: 12, fontWeight: 800,
+  cursor: "pointer", boxShadow: "0 4px 14px rgba(35,134,54,.18)",
 };
 
 function AuthPanel({ onAuthenticated }) {
@@ -265,10 +663,12 @@ export default function TaskpaneUI() {
   const [commitMessage, setCommitMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [conflicts, setConflicts] = useState([]);
+  const [divergence, setDivergence] = useState(null);
+  const [workspaceClosed, setWorkspaceClosed] = useState(false);
 
   const baselineRef = useRef(null);
-  const handlerRef = useRef(null);
-  const boundSheetRef = useRef(null);
+  const workbookIdentityRef = useRef(null);
+  const handlerRef = useRef([]);
   const applyingRemoteRef = useRef(false);
   const autoConnectedRef = useRef(false);
   const displayHeadersRef = useRef({});
@@ -276,180 +676,221 @@ export default function TaskpaneUI() {
   const presenceTimerRef = useRef(null);
   const clientIdRef = useRef(getClientId("excel"));
 
+  useEffect(() => {
+    const expireSession = () => setAuth(null);
+    window.addEventListener("gitwalk:auth-expired", expireSession);
+    return () => window.removeEventListener("gitwalk:auth-expired", expireSession);
+  }, []);
+
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
   const addLog = useCallback((message, isError = false) => {
     const time = new Date().toLocaleTimeString();
     setLogs((previous) => [...previous.slice(-119), { time, message, isError }]);
   }, []);
 
-  const saveBaseVersion = useCallback((version, targetTableId = tableId) => new Promise((resolve) => {
+  const saveBaseVersion = useCallback((version, targetTableId = tableId, headCommitId = null) => new Promise((resolve) => {
     Office.context.document.settings.set(`baseVersion:${targetTableId}`, version);
     Office.context.document.settings.set("baseVersion", version);
+    if (headCommitId) Office.context.document.settings.set(`baseHead:${targetTableId}`, headCommitId);
     Office.context.document.settings.saveAsync(() => resolve());
   }), [tableId]);
 
   const readWorkbook = useCallback(async () => window.Excel.run(async (context) => {
-    const sheet = context.workbook.worksheets.getActiveWorksheet();
-    const used = sheet.getUsedRange(true);
-    used.load(["values", "rowCount", "columnCount"]);
-    sheet.load("id");
+    const worksheets = context.workbook.worksheets;
+    worksheets.load("items/id,name,position");
     await context.sync();
-    const headers = used.values[0] || [];
-    const metadataIndex = headers.findIndex((value) => String(value).trim() === ROW_ID_HEADER);
-    if (metadataIndex < 0) throw new Error("Workbook row identity is missing. Pull latest to repair it.");
-
-    const columns = [];
-    const headerIndexes = [];
-    const seen = new Set();
-    headers.forEach((raw, index) => {
-      if (index === metadataIndex || String(raw || "").trim() === "") return;
-      const column = sanitizeColumnName(raw);
-      if (seen.has(column)) throw new Error(`Duplicate column after sanitizing: ${column}`);
-      seen.add(column); columns.push(column); headerIndexes.push(index);
-      displayHeadersRef.current[column] = String(raw);
+    const entries = worksheets.items.map((sheet) => {
+      const used = sheet.getUsedRangeOrNullObject(true);
+      used.load(["isNullObject", "values", "formulas", "rowCount", "columnCount"]);
+      return { sheet, used };
     });
-
-    const rows = [];
-    for (let rowIndex = 1; rowIndex < used.rowCount; rowIndex += 1) {
-      const rawId = used.values[rowIndex]?.[metadataIndex];
-      const rowId = rawId === "" || rawId == null ? null : Number(rawId);
-      if (rowId != null && (!Number.isInteger(rowId) || rowId < 1)) {
-        throw new Error(`Invalid hidden ROW_ID at Excel row ${rowIndex + 1}.`);
+    await context.sync();
+    const sheets = entries.map(({ sheet, used }) => {
+      if (used.isNullObject) {
+        return { sheetId: sheet.id, sheetName: sheet.name, sheetPosition: sheet.position, columns: [], rows: [] };
       }
-      const values = {};
-      headerIndexes.forEach((columnIndex, index) => {
-        values[columns[index]] = normalizeValue(used.values[rowIndex]?.[columnIndex]);
+      const headers = used.values[0] || [];
+      const metadataIndex = headers.findIndex((value) => {
+        const header = String(value).trim();
+        return header === ROW_ID_HEADER || header === LEGACY_ROW_ID_HEADER;
       });
-      const hasData = columns.some((column) => values[column] != null);
-      if (hasData || rowId != null) rows.push({ rowId, values });
-    }
-    return { sheetId: sheet.id, columns, rows };
+      const columns = [];
+      const headerIndexes = [];
+      const seen = new Set();
+      headers.forEach((raw, index) => {
+        if (index === metadataIndex || String(raw || "").trim() === "") return;
+        const column = sanitizeColumnName(raw);
+        if (seen.has(column)) throw new Error(`Duplicate column after sanitizing on ${sheet.name}: ${column}`);
+        seen.add(column); columns.push(column); headerIndexes.push(index);
+        displayHeadersRef.current[`${sheet.name}:${column}`] = String(raw);
+      });
+      const rows = [];
+      for (let rowIndex = 1; rowIndex < used.rowCount; rowIndex += 1) {
+        const rawId = metadataIndex >= 0 ? used.values[rowIndex]?.[metadataIndex] : null;
+        const rowId = rawId === "" || rawId == null ? null : String(rawId).trim().toUpperCase();
+        if (rowId != null && !/^ROW_[A-Z0-9]+$/.test(rowId)) {
+          throw new Error(`Invalid hidden Git Walk row identity on ${sheet.name}, row ${rowIndex + 1}. Pull latest to repair it.`);
+        }
+        const values = {};
+        const formulas = {};
+        headerIndexes.forEach((columnIndex, index) => {
+          values[columns[index]] = normalizeValue(used.values[rowIndex]?.[columnIndex]);
+          const formula = used.formulas[rowIndex]?.[columnIndex];
+          formulas[columns[index]] = typeof formula === "string" && formula.startsWith("=") ? formula : null;
+        });
+        const hasData = columns.some((column) => values[column] != null);
+        if (hasData || rowId != null) rows.push({ rowId, values, formulas });
+      }
+      return { sheetId: sheet.id, sheetName: sheet.name, sheetPosition: sheet.position, columns, rows };
+    });
+    return { sheets };
   }), []);
 
   const ensureRowIdentity = useCallback(async (snapshot) => window.Excel.run(async (context) => {
-    const sheet = context.workbook.worksheets.getActiveWorksheet();
-    const used = sheet.getUsedRange(true);
-    used.load(["values", "rowCount", "columnCount"]);
-    const tables = sheet.tables;
-    tables.load("items");
+    const worksheets = context.workbook.worksheets;
+    worksheets.load("items/id,name,position");
     await context.sync();
-    let metadataIndex = (used.values[0] || []).findIndex(
-      (value) => String(value).trim() === ROW_ID_HEADER
-    );
-    if (metadataIndex < 0) {
-      const rowIdIndex = snapshot.columns.findIndex((column) => String(column).toUpperCase() === "ROW_ID");
-      if (tables.items.length) {
-        const table = tables.items[0];
-        const identityColumn = table.columns.add(null, null, ROW_ID_HEADER);
-        await context.sync();
-        const body = identityColumn.getDataBodyRange();
-        body.load("rowCount");
-        const identityRange = identityColumn.getRange();
-        identityRange.load("columnIndex");
-        await context.sync();
-        metadataIndex = identityRange.columnIndex;
-        if (body.rowCount > 0) {
-          body.values = Array.from({ length: body.rowCount }, (_, index) => [
-            index < snapshot.rows.length ? snapshot.rows[index][rowIdIndex] : null,
-          ]);
+    const semanticSheets = [...(snapshot?.semantic?.sheets || [])].sort((a, b) => a.position - b.position);
+    for (const semantic of semanticSheets) {
+      const sheet = worksheets.items.find((item) => item.name === semantic.name)
+        || worksheets.items.find((item) => item.position === semantic.position);
+      if (!sheet) continue;
+      const used = sheet.getUsedRangeOrNullObject(true);
+      used.load(["isNullObject", "values", "rowCount", "columnCount"]);
+      const tables = sheet.tables;
+      tables.load("items");
+      await context.sync();
+      if (used.isNullObject) continue;
+      const expectedIds = [...semantic.rows].sort((a, b) => a.position - b.position).map((row) => row.row_id);
+      let metadataIndex = (used.values[0] || []).findIndex((value) => {
+        const header = String(value).trim();
+        return header === ROW_ID_HEADER || header === LEGACY_ROW_ID_HEADER;
+      });
+      if (metadataIndex < 0) {
+        if (tables.items.length) {
+          const identityColumn = tables.items[0].columns.add(null, null, ROW_ID_HEADER);
+          await context.sync();
+          const body = identityColumn.getDataBodyRange();
+          body.load("rowCount");
+          const identityRange = identityColumn.getRange();
+          identityRange.load("columnIndex");
+          await context.sync();
+          metadataIndex = identityRange.columnIndex;
+          if (body.rowCount > 0) {
+            body.values = Array.from({ length: body.rowCount }, (_, index) => [expectedIds[index] || null]);
+          }
+          identityRange.getEntireColumn().format.columnHidden = true;
+        } else {
+          metadataIndex = used.columnCount;
+          sheet.getRangeByIndexes(0, metadataIndex, 1, 1).values = [[ROW_ID_HEADER]];
+          const dataRows = Math.max(used.rowCount - 1, expectedIds.length);
+          if (dataRows > 0) {
+            sheet.getRangeByIndexes(1, metadataIndex, dataRows, 1).values =
+              Array.from({ length: dataRows }, (_, index) => [expectedIds[index] || null]);
+          }
         }
-        identityRange.getEntireColumn().format.columnHidden = true;
-        addLog(`Attached hidden row identity to the Excel table (${body.rowCount} row(s)).`);
+        addLog(`Attached stable row identity to ${semantic.name} (${expectedIds.length} row(s)).`);
       } else {
-        metadataIndex = used.columnCount;
-        sheet.getRangeByIndexes(0, metadataIndex, 1, 1).values = [[ROW_ID_HEADER]];
-        const dataRows = Math.max(used.rowCount - 1, snapshot.rows.length);
-        if (dataRows > 0) {
-          const ids = Array.from({ length: dataRows }, (_, index) => [
-            index < snapshot.rows.length ? snapshot.rows[index][rowIdIndex] : null,
-          ]);
-          sheet.getRangeByIndexes(1, metadataIndex, dataRows, 1).values = ids;
+        const existingIds = used.values.slice(1).map((row) => row[metadataIndex]);
+        const validIdCount = existingIds.filter((value) => /^ROW_[A-Z0-9]+$/.test(String(value))).length;
+        if (String((used.values[0] || [])[metadataIndex]).trim() !== ROW_ID_HEADER) {
+          sheet.getRangeByIndexes(0, metadataIndex, 1, 1).values = [[ROW_ID_HEADER]];
         }
-        addLog(`Created hidden row identity for ${Math.min(dataRows, snapshot.rows.length)} server row(s).`);
+        if (validIdCount === 0 || (used.rowCount - 1 === expectedIds.length
+          && existingIds.some((value, index) => String(value || "") !== expectedIds[index]))) {
+          sheet.getRangeByIndexes(1, metadataIndex, Math.max(used.rowCount - 1, expectedIds.length), 1).values =
+            Array.from({ length: Math.max(used.rowCount - 1, expectedIds.length) }, (_, index) => [expectedIds[index] || null]);
+          addLog(`Repaired stable row identity on ${semantic.name}.`);
+        }
       }
-    } else {
-      const existingIds = used.values.slice(1).map((row) => row[metadataIndex]);
-      const validIdCount = existingIds.filter((value) => Number.isInteger(Number(value)) && Number(value) > 0).length;
-      if (validIdCount === 0 && used.rowCount - 1 === snapshot.rows.length) {
-        const rowIdIndex = snapshot.columns.findIndex((column) => String(column).toUpperCase() === "ROW_ID");
-        sheet.getRangeByIndexes(1, metadataIndex, snapshot.rows.length, 1).values =
-          snapshot.rows.map((row) => [row[rowIdIndex]]);
-        addLog(`Repaired hidden row identity for ${snapshot.rows.length} row(s).`);
-      }
+      sheet.getRangeByIndexes(0, metadataIndex, 1, 1).getEntireColumn().format.columnHidden = true;
+      await context.sync();
     }
-    sheet.getRangeByIndexes(0, metadataIndex, 1, 1).getEntireColumn().format.columnHidden = true;
-    await context.sync();
   }), [addLog]);
 
   const writeSnapshot = useCallback(async (snapshot) => {
     applyingRemoteRef.current = true;
     try {
       await window.Excel.run(async (context) => {
-        const sheet = context.workbook.worksheets.getActiveWorksheet();
-        const used = sheet.getUsedRangeOrNullObject(true);
-        used.load(["isNullObject", "rowIndex", "columnIndex", "rowCount", "columnCount"]);
-        const tables = sheet.tables;
-        tables.load("items");
+        const worksheets = context.workbook.worksheets;
+        worksheets.load("items/id,name,position");
         await context.sync();
-
-        const rowIdIndex = snapshot.columns.findIndex((column) => String(column).toUpperCase() === "ROW_ID");
-        const dataColumns = snapshot.columns.filter((_, index) => index !== rowIdIndex);
-        const output = [[
-          ...dataColumns.map((column) => displayHeadersRef.current[String(column).toUpperCase()] || column),
-          ROW_ID_HEADER,
-        ]];
-        snapshot.rows.forEach((row) => output.push([
-          ...dataColumns.map((_, index) => row[index < rowIdIndex ? index : index + 1]),
-          row[rowIdIndex],
-        ]));
-        if (output.length === 1 && tables.items.length) {
-          output.push(Array.from({ length: output[0].length }, () => null));
-        }
-
-        let startRow = 0;
-        let startColumn = 0;
-        let oldRowCount = used.isNullObject ? 0 : used.rowCount;
-        let oldColumnCount = used.isNullObject ? 0 : used.columnCount;
-        if (tables.items.length) {
-          const tableRange = tables.items[0].getRange();
-          tableRange.load(["rowIndex", "columnIndex", "rowCount", "columnCount"]);
-          await context.sync();
-          startRow = tableRange.rowIndex;
-          startColumn = tableRange.columnIndex;
-          oldRowCount = tableRange.rowCount;
-          oldColumnCount = tableRange.columnCount;
-          let target = sheet.getRangeByIndexes(startRow, startColumn, output.length, output[0].length);
-          if (oldRowCount !== output.length || oldColumnCount !== output[0].length) {
-            tables.items[0].resize(target);
+        const semanticSheets = [...(snapshot?.semantic?.sheets || [])].sort((a, b) => a.position - b.position);
+        const claimed = new Set();
+        for (const [sheetIndex, semantic] of semanticSheets.entries()) {
+          let sheet = worksheets.items.find((item) => !claimed.has(item.id) && item.name === semantic.name)
+            || worksheets.items.find((item) => !claimed.has(item.id) && item.position === semantic.position);
+          if (!sheet) {
+            sheet = worksheets.add(semantic.name);
+            sheet.load("id,name,position");
             await context.sync();
-            // Excel Desktop can invalidate a range proxy after table resize.
-            target = sheet.getRangeByIndexes(startRow, startColumn, output.length, output[0].length);
           }
-          target.values = output;
-          if (oldRowCount > output.length) {
-            sheet.getRangeByIndexes(
-              startRow + output.length, startColumn,
-              oldRowCount - output.length, oldColumnCount
-            ).clear(window.Excel.ClearApplyTo.contents);
-          }
-          if (oldColumnCount > output[0].length) {
-            sheet.getRangeByIndexes(
-              startRow, startColumn + output[0].length,
-              Math.min(oldRowCount, output.length), oldColumnCount - output[0].length
-            ).clear(window.Excel.ClearApplyTo.contents);
-          }
-        } else {
-          if (!used.isNullObject) used.clear(window.Excel.ClearApplyTo.contents);
-          sheet.getRangeByIndexes(0, 0, output.length, output[0].length).values = output;
-        }
+          claimed.add(sheet.id);
+          if (sheet.name !== semantic.name) sheet.name = semantic.name;
+          sheet.position = sheetIndex;
+          const used = sheet.getUsedRangeOrNullObject(true);
+          used.load(["isNullObject", "rowIndex", "columnIndex", "rowCount", "columnCount"]);
+          const tables = sheet.tables;
+          tables.load("items");
+          await context.sync();
 
-        const header = sheet.getRangeByIndexes(startRow, startColumn, 1, dataColumns.length);
-        header.format.font.bold = true;
-        header.format.fill.color = "#1F5A82";
-        header.format.font.color = "#FFFFFF";
-        sheet.getRangeByIndexes(
-          startRow, startColumn + dataColumns.length, 1, 1
-        ).getEntireColumn().format.columnHidden = true;
+          const dataColumns = [...semantic.columns].sort((a, b) => a.position - b.position);
+          const rows = [...semantic.rows].sort((a, b) => a.position - b.position);
+          const output = [[...dataColumns.map((column) => column.name), ROW_ID_HEADER]];
+          const formulaOutput = [[...dataColumns.map((column) => column.name), ROW_ID_HEADER]];
+          rows.forEach((row) => {
+            output.push([...dataColumns.map((column) => row.values[column.column_id] ?? null), row.row_id]);
+            formulaOutput.push([
+              ...dataColumns.map((column) => row.formulas?.[column.column_id] || (row.values[column.column_id] ?? "")),
+              row.row_id,
+            ]);
+          });
+          if (output.length === 1 && tables.items.length) {
+            output.push(Array.from({ length: output[0].length }, () => null));
+            formulaOutput.push(Array.from({ length: output[0].length }, () => null));
+          }
+
+          let startRow = 0;
+          let startColumn = 0;
+          let oldRowCount = used.isNullObject ? 0 : used.rowCount;
+          let oldColumnCount = used.isNullObject ? 0 : used.columnCount;
+          if (tables.items.length) {
+            const tableRange = tables.items[0].getRange();
+            tableRange.load(["rowIndex", "columnIndex", "rowCount", "columnCount"]);
+            await context.sync();
+            startRow = tableRange.rowIndex;
+            startColumn = tableRange.columnIndex;
+            oldRowCount = tableRange.rowCount;
+            oldColumnCount = tableRange.columnCount;
+            let target = sheet.getRangeByIndexes(startRow, startColumn, output.length, output[0].length);
+            if (oldRowCount !== output.length || oldColumnCount !== output[0].length) {
+              tables.items[0].resize(target);
+              await context.sync();
+              target = sheet.getRangeByIndexes(startRow, startColumn, output.length, output[0].length);
+            }
+            target.formulas = formulaOutput;
+            if (oldRowCount > output.length) {
+              sheet.getRangeByIndexes(startRow + output.length, startColumn, oldRowCount - output.length, oldColumnCount)
+                .clear(window.Excel.ClearApplyTo.contents);
+            }
+            if (oldColumnCount > output[0].length) {
+              sheet.getRangeByIndexes(startRow, startColumn + output[0].length, Math.min(oldRowCount, output.length), oldColumnCount - output[0].length)
+                .clear(window.Excel.ClearApplyTo.contents);
+            }
+          } else {
+            if (!used.isNullObject) used.clear(window.Excel.ClearApplyTo.contents);
+            sheet.getRangeByIndexes(0, 0, output.length, output[0].length).formulas = formulaOutput;
+          }
+          if (dataColumns.length) {
+            const header = sheet.getRangeByIndexes(startRow, startColumn, 1, dataColumns.length);
+            header.format.font.bold = true;
+            header.format.fill.color = "#1F6FEB";
+            header.format.font.color = "#FFFFFF";
+          }
+          sheet.getRangeByIndexes(startRow, startColumn + dataColumns.length, 1, 1)
+            .getEntireColumn().format.columnHidden = true;
+        }
+        worksheets.items.filter((sheet) => !claimed.has(sheet.id)).forEach((sheet) => sheet.delete());
         await context.sync();
       });
     } finally {
@@ -460,7 +901,7 @@ export default function TaskpaneUI() {
   const reviewChanges = useCallback(async () => {
     if (!baselineRef.current) throw new Error("Connect to a dataset first.");
     const workbook = await readWorkbook();
-    const diff = buildWorkbookDiff(baselineRef.current, workbook);
+    const diff = buildSemanticWorkbookDiff(baselineRef.current, workbook);
     setStaged(diff); setDirty(diff.changeCount > 0); setConflicts([]);
     setSyncStatus(diff.changeCount ? "syncing" : "connected");
     setStatusMsg(diff.changeCount ? `${diff.changeCount} staged change(s)` : "Working tree clean");
@@ -472,7 +913,7 @@ export default function TaskpaneUI() {
     const latest = await getWorkbookSnapshot(tableId);
     await writeSnapshot(latest);
     baselineRef.current = latest;
-    await saveBaseVersion(latest.version);
+    await saveBaseVersion(latest.version, tableId, latest.head_commit_id);
     setBaseVersion(latest.version); setDirty(false); setStaged(null); setConflicts([]);
     return latest;
   }, [saveBaseVersion, tableId, writeSnapshot]);
@@ -485,16 +926,14 @@ export default function TaskpaneUI() {
       if (!diff.changeCount) return;
       const result = await commitWorkbook({
         table_id: tableId,
+        ...(workbookIdentityRef.current || {}),
         base_version: baselineRef.current.version,
-        updates: diff.updates,
-        insert_rows: diff.insert_rows,
-        delete_row_ids: diff.delete_row_ids,
-        new_columns: diff.new_columns,
-        delete_columns: diff.delete_columns,
+        expected_head_commit_id: baselineRef.current.head_commit_id,
+        semantic_changes: diff.semantic_changes,
         source: "excel_commit",
         commit_message: commitMessage.trim(),
       });
-      addLog(`Committed ${result.batch_id} as version ${result.version}; risk ${result.risk_score}/100.`);
+      addLog(`Committed ${result.commit_id} as version ${result.version}; ${result.change_count} semantic operation(s).`);
       setCommitMessage("");
       try {
         await refreshAfterCommit();
@@ -510,12 +949,47 @@ export default function TaskpaneUI() {
       }
     } catch (err) {
       setSyncStatus("error"); setStatusMsg(err.message);
-      if (err.status === 409) {
-        setConflicts([`Server is at version ${err.detail?.current_version}; workbook is based on version ${err.detail?.base_version}.`]);
+      if (err.detail?.code === "WORKING_COPY_CLOSED") {
+        setWorkspaceClosed(true);
+        setStatusMsg("Workspace merged");
+        addLog("This branch was merged. Commit is disabled; create a new workspace from Git Walk.", true);
+      } else if (err.status === 409) {
+        const currentHead = err.detail?.current_head_commit_id || err.detail?.current_head || "a newer commit";
+        setConflicts([`Branch HEAD advanced to ${currentHead}. Pull latest before committing.`]);
         addLog("Commit rejected because the server advanced. Pull latest to rebase your local work.", true);
       } else addLog(`Commit failed: ${err.message}`, true);
     } finally { setBusy(false); }
   }, [addLog, commitMessage, refreshAfterCommit, reviewChanges, tableId]);
+
+  const syncMain = useCallback(async () => {
+    const branchId = workbookIdentityRef.current?.branch_id;
+    if (!branchId) { addLog("This workbook has no signed branch identity.", true); return; }
+    setBusy(true); setSyncStatus("syncing"); setStatusMsg("Syncing protected main...");
+    try {
+      const local = await reviewChanges();
+      if (local.changeCount) {
+        setStatusMsg("Commit local changes before syncing main");
+        addLog("Sync paused because the working tree has local changes. Commit them first.", true);
+        return;
+      }
+      const result = await syncBranchWithMain(branchId);
+      const latest = await getWorkbookSnapshot(tableId);
+      await writeSnapshot(latest);
+      baselineRef.current = latest;
+      await saveBaseVersion(latest.version, tableId, latest.head_commit_id);
+      const status = await getBranchDivergence(branchId);
+      setDivergence(status); setBaseVersion(latest.version); setStaged(null); setDirty(false);
+      setSyncStatus("synced"); setStatusMsg(result.status === "UP_TO_DATE" ? "Already current with main" : "Main synced");
+      addLog(result.status === "UP_TO_DATE" ? "Branch is already current with main." : `Created sync commit ${result.commit_id}.`);
+    } catch (err) {
+      const mergeConflicts = err.detail?.conflicts || [];
+      if (mergeConflicts.length) {
+        setConflicts(mergeConflicts.map((item) => `${item.conflict_type}: ${item.row_id || item.column_id || item.sheet_id || "workbook"}`));
+        setStatusMsg(`${mergeConflicts.length} main-sync conflict(s)`);
+      } else setStatusMsg(err.message);
+      setSyncStatus("error"); addLog(`Sync main failed: ${err.message}`, true);
+    } finally { setBusy(false); }
+  }, [addLog, reviewChanges, saveBaseVersion, tableId, writeSnapshot]);
 
   const pullLatest = useCallback(async (discardLocal = false) => {
     setBusy(true); setSyncStatus("syncing"); setStatusMsg("Pulling server changes...");
@@ -523,24 +997,24 @@ export default function TaskpaneUI() {
       const diff = discardLocal ? null : await reviewChanges();
       const remote = await getWorkbookSnapshot(tableId);
       if (!discardLocal && diff?.changeCount) {
-        const found = findRebaseConflicts(baselineRef.current, remote, diff);
+        const found = semanticRebaseConflicts(baselineRef.current, remote, diff);
         if (found.length) {
           setConflicts(found); setSyncStatus("error");
           setStatusMsg(`${found.length} merge conflict(s)`);
           addLog(`Pull paused with ${found.length} conflict(s). Local cells were not overwritten.`, true);
           return;
         }
-        const rebased = rebaseDiffOntoSnapshot(remote, diff);
+        const rebased = applySemanticChanges(remote, diff.semantic_changes);
         await writeSnapshot(rebased);
         baselineRef.current = remote;
-        await saveBaseVersion(remote.version);
+        await saveBaseVersion(remote.version, tableId, remote.head_commit_id);
         setBaseVersion(remote.version); setDirty(true); setStaged(null); setConflicts([]);
         setSyncStatus("syncing"); setStatusMsg("Pulled and reapplied local changes");
         addLog(`Pulled version ${remote.version} and rebased ${diff.changeCount} local change(s). Review and commit next.`);
       } else {
         await writeSnapshot(remote);
         baselineRef.current = remote;
-        await saveBaseVersion(remote.version);
+        await saveBaseVersion(remote.version, tableId, remote.head_commit_id);
         setBaseVersion(remote.version); setDirty(false); setStaged(null); setConflicts([]);
         setSyncStatus("synced"); setStatusMsg(`Pulled version ${remote.version}`);
         addLog(`Pulled server version ${remote.version}. Working tree is clean.`);
@@ -556,13 +1030,23 @@ export default function TaskpaneUI() {
     if (tableId) leaveDatasetPresence(tableId, clientIdRef.current).catch(() => {});
     try {
       await window.Excel.run(async (context) => {
-        if (!handlerRef.current) return;
-        const sheet = boundSheetRef.current || context.workbook.worksheets.getActiveWorksheet();
-        sheet.onChanged.remove(handlerRef.current); await context.sync();
+        const worksheets = context.workbook.worksheets;
+        worksheets.load("items/id");
+        await context.sync();
+        for (const binding of handlerRef.current) {
+          if (binding.kind === "changed") {
+            const sheet = worksheets.items.find((item) => item.id === binding.sheetId);
+            if (sheet) sheet.onChanged.remove(binding.handler);
+          }
+          if (binding.kind === "added") worksheets.onAdded.remove(binding.handler);
+          if (binding.kind === "deleted") worksheets.onDeleted.remove(binding.handler);
+        }
+        await context.sync();
       });
     } catch (err) { addLog(`Could not unbind: ${err.message}`, true); }
-    handlerRef.current = null; boundSheetRef.current = null; baselineRef.current = null;
+    handlerRef.current = []; baselineRef.current = null;
     setConnected(false); setSyncStatus("idle"); setStatusMsg(null); setStaged(null); setDirty(false);
+    setDivergence(null); setWorkspaceClosed(false);
   }, [addLog, tableId]);
 
   const connect = useCallback(async (requestedTableId = tableId) => {
@@ -575,12 +1059,22 @@ export default function TaskpaneUI() {
       const keyedVersion = Office.context.document.settings.get(`baseVersion:${normalized}`);
       const legacyVersion = savedTableId === normalized
         ? Office.context.document.settings.get("baseVersion") : null;
+      const branchId = workbookIdentityRef.current?.branch_id;
+      const savedHead = Office.context.document.settings.get(`baseHead:${normalized}`)
+        || workbookIdentityRef.current?.base_commit_id;
       const hasSavedVersion = keyedVersion != null || legacyVersion != null;
       const savedVersion = Number(keyedVersion ?? legacyVersion);
       let baseline = latest;
-      if (hasSavedVersion && Number.isInteger(savedVersion) && savedVersion >= 0 && savedVersion < latest.version) {
-        try { baseline = await getWorkbookSnapshot(normalized, savedVersion); }
-        catch { addLog(`Saved base version ${savedVersion} was unavailable; using server version ${latest.version}.`, true); }
+      if (branchId && savedHead && savedHead !== latest.head_commit_id) {
+        try {
+          const state = await getBranchState(branchId, savedHead);
+          baseline = {
+            ...latest, semantic: state, head_commit_id: savedHead,
+            version: hasSavedVersion && Number.isInteger(savedVersion) ? savedVersion : latest.version,
+          };
+        } catch {
+          addLog(`Saved checkout ${savedHead} was unavailable; using current branch HEAD.`, true);
+        }
       }
       await ensureRowIdentity(baseline);
       const workbook = await readWorkbook();
@@ -588,19 +1082,40 @@ export default function TaskpaneUI() {
       setBaseVersion(baseline.version);
 
       await window.Excel.run(async (context) => {
-        const sheet = context.workbook.worksheets.getItem(workbook.sheetId);
-        const handler = () => {
+        const worksheets = context.workbook.worksheets;
+        worksheets.load("items/id,name");
+        await context.sync();
+        const markDirty = () => {
           if (applyingRemoteRef.current) return;
           setDirty(true); setStaged(null); setConflicts([]);
           setSyncStatus("syncing"); setStatusMsg("Local changes pending review");
           heartbeatPresence(normalized, clientIdRef.current, "excel", "editing").catch(() => {});
         };
-        sheet.onChanged.add(handler); handlerRef.current = handler; boundSheetRef.current = sheet;
+        const bindings = worksheets.items.map((sheet) => {
+          const handler = () => markDirty();
+          sheet.onChanged.add(handler);
+          return { kind: "changed", sheetId: sheet.id, handler };
+        });
+        const addedHandler = () => markDirty();
+        const deletedHandler = () => markDirty();
+        worksheets.onAdded.add(addedHandler);
+        worksheets.onDeleted.add(deletedHandler);
+        bindings.push({ kind: "added", handler: addedHandler });
+        bindings.push({ kind: "deleted", handler: deletedHandler });
+        handlerRef.current = bindings;
         await context.sync();
       });
       Office.context.document.settings.set("tableId", normalized);
+      Office.context.document.settings.set(`baseHead:${normalized}`, baseline.head_commit_id);
       Office.context.document.settings.saveAsync(() => {});
       setConnected(true); setSyncStatus("connected");
+      if (workbookIdentityRef.current?.branch_id) {
+        try {
+          const branchStatus = await getBranchDivergence(workbookIdentityRef.current.branch_id);
+          setDivergence(branchStatus);
+          setWorkspaceClosed(branchStatus.source_status === "MERGED");
+        } catch { setDivergence(null); }
+      }
       const heartbeat = () => heartbeatPresence(
         normalized, clientIdRef.current, "excel", "viewing"
       ).catch(() => {});
@@ -615,12 +1130,24 @@ export default function TaskpaneUI() {
     } finally { setBusy(false); }
   }, [addLog, ensureRowIdentity, readWorkbook, tableId]);
 
-  const getEmbeddedTableId = useCallback(async () => {
+  const getEmbeddedIdentity = useCallback(async () => {
     try {
       return await window.Excel.run(async (context) => {
-        const item = context.workbook.names.getItemOrNullObject(TABLE_ID_DEFINED_NAME);
-        item.load("formula"); await context.sync();
-        return item.isNullObject ? null : parseTableIdFormula(item.formula);
+        const definitions = { table_id: TABLE_ID_DEFINED_NAME, ...WORKBOOK_METADATA_NAMES };
+        const items = Object.fromEntries(
+          Object.entries(definitions).map(([key, name]) => {
+            const item = context.workbook.names.getItemOrNullObject(name);
+            item.load("formula");
+            return [key, item];
+          })
+        );
+        await context.sync();
+        const identity = {};
+        Object.entries(items).forEach(([key, item]) => {
+          if (!item.isNullObject) identity[key] = parseDefinedValue(item.formula);
+        });
+        identity.table_id = parseTableIdFormula(identity.table_id);
+        return identity.table_id ? identity : null;
       });
     } catch { return null; }
   }, []);
@@ -629,25 +1156,34 @@ export default function TaskpaneUI() {
     if (!auth || autoConnectedRef.current) return;
     autoConnectedRef.current = true;
     (async () => {
-      const embedded = await getEmbeddedTableId();
+      const embedded = await getEmbeddedIdentity();
       const saved = Office.context.document.settings.get("tableId");
-      if (embedded || saved) await connect(embedded || saved);
+      workbookIdentityRef.current = embedded
+        ? Object.fromEntries(Object.entries(embedded).filter(([key]) => key !== "table_id"))
+        : null;
+      if (embedded?.table_id || saved) await connect(embedded?.table_id || saved);
       else addLog("No embedded Table ID found. Enter it once to connect.");
     })();
-  }, [addLog, auth, connect, getEmbeddedTableId]);
+  }, [addLog, auth, connect, getEmbeddedIdentity]);
 
   const signOut = useCallback(async () => {
     if (connected) await disconnect();
-    clearAuth(); setAuth(null); setTableId(""); setLogs([]); autoConnectedRef.current = false;
+    await logout().catch(() => clearAuth());
+    setAuth(null); setTableId(""); setLogs([]); autoConnectedRef.current = false;
+    workbookIdentityRef.current = null;
   }, [connected, disconnect]);
 
   if (!auth?.token) return <AuthPanel onAuthenticated={setAuth} />;
-  const summary = staged || { changeCount: dirty ? "?" : 0, updates: [], insert_rows: [], delete_row_ids: [], new_columns: [], delete_columns: [], preview: [] };
+  const summary = staged || {
+    changeCount: dirty ? "?" : 0,
+    counts: { cells: 0, rows: 0, columns: 0, formulas: 0, sheets: 0 },
+    preview: [],
+  };
 
   return (
     <div style={containerStyle}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div><div style={{ color: "#58a6ff", fontSize: 10, fontWeight: 800, letterSpacing: ".13em" }}>GIT WALK</div><div style={{ fontSize: 20, fontWeight: 800 }}>Workbook repository</div></div>
+        <div><div style={{ color: "#58a6ff", fontSize: 10, fontWeight: 800, letterSpacing: ".13em" }}>GIT WALK / SOURCE CONTROL</div><div style={{ fontSize: 20, fontWeight: 800 }}>Repository workspace</div></div>
         <button onClick={signOut} style={{ border: 0, color: "#92a6af", background: "transparent" }}>Sign out</button>
       </div>
       <div style={{ ...cardStyle, padding: 11, display: "flex", justifyContent: "space-between" }}>
@@ -655,25 +1191,29 @@ export default function TaskpaneUI() {
         <div style={{ color: "#75ead0", fontSize: 10, fontWeight: 800 }}>BASE v{baseVersion}</div>
       </div>
       <StatusBanner status={syncStatus} message={statusMsg} />
-      <div style={cardStyle}><div style={labelStyle}>Table ID</div><input style={inputStyle} value={tableId} onChange={(e) => setTableId(e.target.value.toUpperCase())} disabled={connected} placeholder="QUEUE_BOARD_A1B2C3D4" /></div>
+      <div style={cardStyle}><div style={labelStyle}>Repository data ID</div><input style={inputStyle} value={tableId} onChange={(e) => setTableId(e.target.value.toUpperCase())} disabled={connected} placeholder="QUEUE_BOARD_A1B2C3D4" /></div>
 
-      {!connected ? <button style={buttonStyle} disabled={busy || !tableId} onClick={() => connect()}>{busy ? "Connecting..." : "Clone and connect"}</button> : <>
+      {!connected ? <button style={buttonStyle} disabled={busy || !tableId} onClick={() => connect()}>{busy ? "Connecting..." : "Open repository workspace"}</button> : <>
+        {workspaceClosed ? <div style={{ ...cardStyle, borderColor: "#b9862d", background: "#2a2114" }}><div style={{ ...labelStyle, color: "#f4ba62" }}>Workspace merged</div><div style={{ color: "#e9d7b5", fontSize: 11, lineHeight: 1.55 }}>This signed working copy is closed. Download latest main or create a new workspace in Git Walk.</div></div> : null}
+        {divergence ? <div style={{ ...cardStyle, padding: 10, display: "flex", justifyContent: "space-between", color: "#9bafb8", fontSize: 10 }}><span><b style={{ color: "#75ead0" }}>{divergence.ahead}</b> ahead</span><span><b style={{ color: "#f4ba62" }}>{divergence.behind}</b> behind main</span></div> : null}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#172632", boxShadow: "none" }} disabled={busy} onClick={reviewChanges}>Review changes</button>
-          <button style={{ ...buttonStyle, color: "#071716", background: "linear-gradient(135deg,#66c4ff,#49a8e8)" }} disabled={busy} onClick={() => pullLatest(false)}>Pull latest</button>
+          <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#172632", boxShadow: "none" }} disabled={busy || workspaceClosed} onClick={reviewChanges}>Review changes</button>
+          <button style={{ ...buttonStyle, color: "#071716", background: "linear-gradient(135deg,#66c4ff,#49a8e8)" }} disabled={busy || workspaceClosed} onClick={() => pullLatest(false)}>Pull branch</button>
         </div>
+        <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#263245", boxShadow: "none" }} disabled={busy || workspaceClosed} onClick={syncMain}>Sync with protected main</button>
         <div style={cardStyle}>
           <div style={labelStyle}>Commit message</div>
           <input style={inputStyle} value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder="Describe this data change" maxLength={300} />
-          <button style={{ ...buttonStyle, marginTop: 10, opacity: !commitMessage.trim() || busy ? .55 : 1 }} disabled={!commitMessage.trim() || busy} onClick={commitChanges}>{busy ? "Working..." : `Commit ${summary.changeCount === "?" ? "changes" : `${summary.changeCount} change(s)`}`}</button>
+          <button style={{ ...buttonStyle, marginTop: 10, opacity: !commitMessage.trim() || busy || workspaceClosed ? .55 : 1 }} disabled={!commitMessage.trim() || busy || workspaceClosed} onClick={commitChanges}>{busy ? "Working..." : `Commit ${summary.changeCount === "?" ? "changes" : `${summary.changeCount} change(s)`}`}</button>
         </div>
         <button style={{ ...buttonStyle, color: "#ffaaa3", background: "#2a191c", boxShadow: "none" }} onClick={disconnect}>Disconnect</button>
       </>}
 
-      {connected ? <div style={{ ...cardStyle, display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, textAlign: "center" }}>
-        <div><div style={labelStyle}>Cells</div><strong style={{ color: "#75ead0" }}>{summary.updates.length}</strong></div>
-        <div><div style={labelStyle}>Rows +/-</div><strong style={{ color: "#66c4ff" }}>{summary.insert_rows.length}/{summary.delete_row_ids.length}</strong></div>
-        <div><div style={labelStyle}>Columns +/-</div><strong style={{ color: "#f4ba62" }}>{summary.new_columns.length}/{summary.delete_columns.length}</strong></div>
+      {connected ? <div style={{ ...cardStyle, display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 8, textAlign: "center" }}>
+        <div><div style={labelStyle}>Cells / formulas</div><strong style={{ color: "#75ead0" }}>{summary.counts.cells}/{summary.counts.formulas}</strong></div>
+        <div><div style={labelStyle}>Row operations</div><strong style={{ color: "#66c4ff" }}>{summary.counts.rows}</strong></div>
+        <div><div style={labelStyle}>Column operations</div><strong style={{ color: "#f4ba62" }}>{summary.counts.columns}</strong></div>
+        <div><div style={labelStyle}>Sheet operations</div><strong style={{ color: "#d2a8ff" }}>{summary.counts.sheets || 0}</strong></div>
       </div> : null}
 
       {staged?.preview.length ? <div style={cardStyle}><div style={labelStyle}>Staged diff</div><div style={{ maxHeight: 155, overflowY: "auto" }}>{staged.preview.slice(0, 30).map((line, index) => <div key={index} style={{ color: "#a8bbc3", borderBottom: "1px solid #20303a", padding: "5px 0", font: "10px Consolas,monospace" }}>{line}</div>)}</div></div> : null}

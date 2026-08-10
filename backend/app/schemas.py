@@ -32,6 +32,12 @@ class SyncRequest(BaseModel):
     )
     source: str = "excel"
     commit_message: str | None = None
+    repository_id: str | None = None
+    branch_id: str | None = None
+    working_copy_id: str | None = None
+    base_commit_id: str | None = None
+    issued_at: str | None = None
+    signature: str | None = None
 
 
 class SyncResponse(BaseModel):
@@ -101,6 +107,36 @@ class BulkSyncRequest(BaseModel):
     changes: list[BulkCellChange] = Field(..., min_length=1, max_length=5000)
     source: str = "excel"
     commit_message: str | None = Field(default=None, max_length=300)
+    repository_id: str | None = None
+    branch_id: str | None = None
+    working_copy_id: str | None = None
+    base_commit_id: str | None = None
+    issued_at: str | None = None
+    signature: str | None = None
+
+
+class SemanticChange(BaseModel):
+    operation_type: str = Field(..., min_length=3, max_length=40)
+    sheet_id: str | None = None
+    row_id: str | None = None
+    column_id: str | None = None
+    previous_row_position: int | None = Field(default=None, ge=0)
+    new_row_position: int | None = Field(default=None, ge=0)
+    previous_column_position: int | None = Field(default=None, ge=0)
+    new_column_position: int | None = Field(default=None, ge=0)
+    previous_cell_reference: str | None = None
+    new_cell_reference: str | None = None
+    old_value: Any = None
+    new_value: Any = None
+    old_formula: str | None = None
+    new_formula: str | None = None
+    old_data_type: str | None = None
+    new_data_type: str | None = None
+    old_style_hash: str | None = None
+    new_style_hash: str | None = None
+    old_comment: str | None = None
+    new_comment: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkbookCommitRequest(BaseModel):
@@ -113,6 +149,24 @@ class WorkbookCommitRequest(BaseModel):
     delete_columns: list[str] = Field(default_factory=list, max_length=100)
     source: str = "excel_commit"
     commit_message: str = Field(..., min_length=1, max_length=300)
+    repository_id: str | None = None
+    branch_id: str | None = None
+    working_copy_id: str | None = None
+    base_commit_id: str | None = None
+    issued_at: str | None = None
+    signature: str | None = None
+    expected_head_commit_id: str | None = None
+    semantic_changes: list[SemanticChange] = Field(default_factory=list, max_length=10000)
+
+
+class CategoryCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
+    parent_category_id: str | None = Field(default="CAT_HOME", max_length=64)
+
+
+class RepositoryCategoryRequest(BaseModel):
+    category_id: str = Field(..., min_length=4, max_length=64)
 
 
 class RollbackRequest(BaseModel):
@@ -133,6 +187,8 @@ class PresenceRequest(BaseModel):
 
 class AIInsightRequest(BaseModel):
     table_id: str | None = None
+    branch_id: str | None = None
+    merge_request_id: str | None = None
     model: str | None = None
     question: str = Field(..., min_length=3, max_length=1000)
 
@@ -140,3 +196,20 @@ class AIInsightRequest(BaseModel):
 class AIConfigRequest(BaseModel):
     api_key: str = Field(..., min_length=10, max_length=500)
     model: str = Field(..., min_length=3, max_length=200)
+
+
+class MergeRequestCreate(BaseModel):
+    source_branch_id: str = Field(..., min_length=4, max_length=80)
+    target_branch_id: str = Field(..., min_length=4, max_length=80)
+    title: str = Field(..., min_length=3, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class ConflictResolutionRequest(BaseModel):
+    resolution_type: str = Field(pattern="^(KEEP_MAIN|ACCEPT_BRANCH|CUSTOM)$")
+    custom_value: Any = None
+
+
+class MergeReviewRequest(BaseModel):
+    decision: str = Field(pattern="^(APPROVED|REJECTED)$")
+    comment: str | None = Field(default=None, max_length=1000)

@@ -129,6 +129,23 @@ class DatabaseSyncTests(unittest.TestCase):
         self.assertTrue(database.consume_login_code("editor@example.com", "hashed-code"))
         self.assertFalse(database.consume_login_code("editor@example.com", "hashed-code"))
 
+    def test_login_code_locks_after_failed_attempts(self):
+        database.initialize_product_schema()
+        expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        database.create_login_code("locked@example.com", "correct-hash", expires)
+
+        for _ in range(5):
+            self.assertFalse(database.consume_login_code("locked@example.com", "wrong-hash"))
+        self.assertFalse(database.consume_login_code("locked@example.com", "correct-hash"))
+
+    def test_auth_session_can_be_revoked(self):
+        database.initialize_product_schema()
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        database.create_auth_session("SES_TEST", "USR_TEST", "token-hash", expires)
+        self.assertTrue(database.auth_session_is_active("SES_TEST", "USR_TEST", "token-hash"))
+        database.revoke_auth_session("SES_TEST", "USR_TEST")
+        self.assertFalse(database.auth_session_is_active("SES_TEST", "USR_TEST", "token-hash"))
+
     def test_dataset_roles_separate_read_and_write_access(self):
         owner = self._registered_user()
         viewer = database.get_or_create_user("viewer@example.com")
@@ -269,6 +286,88 @@ class DatabaseSyncTests(unittest.TestCase):
         self.assertNotIn(raw_key, stored["api_key_encrypted"])
         self.assertEqual(raw_key, decrypt_secret(stored["api_key_encrypted"]))
         self.assertEqual("vendor/model", stored["model"])
+
+    def test_pending_workspace_invitation_activates_on_first_login(self):
+        owner = self._registered_user()
+        invited = database.add_dataset_member(
+            "QUEUE_BOARD_TEST", owner["user_id"], "new.member@example.com", "editor"
+        )
+        self.assertEqual("pending", invited["status"])
+        before = database.get_workspace_snapshot("QUEUE_BOARD_TEST")
+        self.assertEqual(1, len(before["invitations"]))
+
+        member = database.get_or_create_user("new.member@example.com")
+        after = database.get_workspace_snapshot("QUEUE_BOARD_TEST")
+        self.assertEqual([], after["invitations"])
+        self.assertIn(member["user_id"], {item["user_id"] for item in after["members"]})
+        self.assertTrue(database.user_can_edit_table("QUEUE_BOARD_TEST", member["user_id"]))
+        self.assertGreater(after["revision"], before["revision"])
+
+    def test_workspace_owner_can_revoke_active_member(self):
+        owner = self._registered_user()
+        member = database.get_or_create_user("member@example.com")
+        database.add_dataset_member(
+            "QUEUE_BOARD_TEST", owner["user_id"], member["email"], "viewer"
+        )
+        database.remove_dataset_member(
+            "QUEUE_BOARD_TEST", owner["user_id"], member["email"]
+        )
+
+        self.assertFalse(database.user_can_access_table("QUEUE_BOARD_TEST", member["user_id"]))
+        workspace = database.get_workspace_snapshot("QUEUE_BOARD_TEST")
+        self.assertNotIn(member["user_id"], {item["user_id"] for item in workspace["members"]})
+
+    def test_personal_branch_is_isolated_signed_and_main_is_protected(self):
+        user = self._registered_user()
+        working_copy = database.create_working_copy(
+            "QUEUE_BOARD_TEST", user["user_id"], user["email"]
+        )
+
+        self.assertTrue(working_copy["table_id"].startswith("BRANCH_DATA_"))
+        self.assertFalse(database.user_can_edit_table("QUEUE_BOARD_TEST", user["user_id"]))
+        self.assertTrue(database.user_can_edit_table(working_copy["table_id"], user["user_id"]))
+        database.update_cell(
+            working_copy["table_id"], "BATTING_TEAM", 1, "SRH"
+        )
+        self.assertEqual(
+            "KKR", database.read_cell("QUEUE_BOARD_TEST", "BATTING_TEAM", 1)
+        )
+        verified = database.validate_working_copy(
+            table_id=working_copy["table_id"],
+            user_id=user["user_id"],
+            repository_id=working_copy["repository_id"],
+            branch_id=working_copy["branch_id"],
+            working_copy_id=working_copy["working_copy_id"],
+            base_commit_id=working_copy["base_commit_id"],
+            issued_at=working_copy["issued_at"],
+            signature=working_copy["signature"],
+        )
+        self.assertEqual(working_copy["branch_id"], verified["branch_id"])
+        with self.assertRaises(PermissionError):
+            database.validate_working_copy(
+                table_id=working_copy["table_id"],
+                user_id="USR_ATTACKER",
+                repository_id=working_copy["repository_id"],
+                branch_id=working_copy["branch_id"],
+                working_copy_id=working_copy["working_copy_id"],
+                base_commit_id=working_copy["base_commit_id"],
+                issued_at=working_copy["issued_at"],
+                signature=working_copy["signature"],
+            )
+
+    def test_categories_and_repository_metadata_are_queryable(self):
+        user = self._registered_user()
+        category = database.create_category("Payments", "Payment operations", "CAT_HOME")
+        database.move_repository("QUEUE_BOARD_TEST", category["category_id"], user["user_id"])
+        repository = database.get_repository("QUEUE_BOARD_TEST", user["user_id"])
+
+        self.assertEqual(category["category_id"], repository["category_id"])
+        self.assertEqual("Payments", repository["category_name"])
+        self.assertEqual(1, len(repository["sheets"]))
+        self.assertIn(
+            category["category_id"],
+            {item["category_id"] for item in database.list_categories()},
+        )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,14 @@ class OpenXmlInjectorTests(unittest.TestCase):
                 str(source),
                 str(output),
                 table_id="QUEUE_BOARD_TEST1234",
+                metadata={
+                    "repository_id": "REP_TEST",
+                    "branch_id": "BR_TEST",
+                    "working_copy_id": "WC_TEST",
+                    "base_commit_id": "CMT_TEST",
+                    "issued_at": "2026-08-10T00:00:00+00:00",
+                    "signature": "signed-value",
+                },
             )
 
             with zipfile.ZipFile(output) as workbook:
@@ -30,12 +38,19 @@ class OpenXmlInjectorTests(unittest.TestCase):
             self.assertIn('name="tableId"', settings_xml)
             self.assertIn('value="QUEUE_BOARD_TEST1234"', settings_xml)
             self.assertIn('name="_EXCEL_SQLITE_SYNC_TABLE_ID"', workbook_xml)
+            self.assertIn('name="_GITWALK_REPOSITORY_ID"', workbook_xml)
+            self.assertIn('name="repository_id"', settings_xml)
+            self.assertIn('value="REP_TEST"', settings_xml)
 
             configured_workbook = load_workbook(output, read_only=True)
             embedded_name = configured_workbook.defined_names[
                 "_EXCEL_SQLITE_SYNC_TABLE_ID"
             ]
             self.assertEqual('"QUEUE_BOARD_TEST1234"', embedded_name.attr_text)
+            self.assertEqual(
+                '"BR_TEST"',
+                configured_workbook.defined_names["_GITWALK_BRANCH_ID"].attr_text,
+            )
             configured_workbook.close()
 
 
