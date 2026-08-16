@@ -18,6 +18,7 @@ import {
   getBranchState,
   getCommitDetail,
   getCellTraceability,
+  getCheckoutOptions,
   getClientId,
   getDatasetData,
   getDatasetHistory,
@@ -37,7 +38,7 @@ import {
   getSecurityPosture,
   getStoredAuth,
   getStableCellHistory,
-  getWorkbookBlame,
+  getWorkbookChangeActivity,
   heartbeatPresence,
   leaveDatasetPresence,
   logout,
@@ -203,6 +204,56 @@ function groupCommits(history) {
   return [...grouped.values()];
 }
 
+const REVIEW_EXCEL_EPOCH_MS = Date.UTC(1899, 11, 30);
+
+function reviewDateMilliseconds(value) {
+  if (typeof value !== "string") return null;
+  const match = value.trim().match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/
+  );
+  if (!match) return null;
+  return Date.UTC(
+    Number(match[1]), Number(match[2]) - 1, Number(match[3]),
+    Number(match[4] || 0), Number(match[5] || 0), Number(match[6] || 0)
+  );
+}
+
+function reviewExcelDateMilliseconds(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 1 && value <= 2958465
+    ? REVIEW_EXCEL_EPOCH_MS + value * 86400000 : null;
+}
+
+function reviewValuesEqual(left, right) {
+  if (left == null || left === "") return right == null || right === "";
+  if (right == null || right === "") return false;
+  const leftDate = reviewDateMilliseconds(left);
+  const rightDate = reviewDateMilliseconds(right);
+  if (leftDate != null && rightDate != null) return Math.abs(leftDate - rightDate) < 1;
+  if (leftDate != null && reviewExcelDateMilliseconds(right) != null) {
+    return Math.abs(leftDate - reviewExcelDateMilliseconds(right)) < 1;
+  }
+  if (rightDate != null && reviewExcelDateMilliseconds(left) != null) {
+    return Math.abs(rightDate - reviewExcelDateMilliseconds(left)) < 1;
+  }
+  return String(left) === String(right);
+}
+
+function isMeaningfulReviewChange(change) {
+  if (change.operation_type !== "CELL_VALUE_UPDATE") return true;
+  return !reviewValuesEqual(change.old_value, change.new_value);
+}
+
+function formatReviewValue(value, counterpart = null) {
+  const serialDate = reviewExcelDateMilliseconds(value);
+  if (serialDate != null && reviewDateMilliseconds(counterpart) != null) {
+    const rendered = new Date(serialDate).toISOString();
+    value = typeof counterpart === "string" && /^\d{4}-\d{2}-\d{2}$/.test(counterpart.trim())
+      ? rendered.slice(0, 10)
+      : `${rendered.slice(0, 10)} ${rendered.slice(11, 19)}`;
+  }
+  return value == null ? "null" : typeof value === "string" ? value : JSON.stringify(value);
+}
+
 export default function App() {
   const [auth, setAuth] = useState(getStoredAuth());
   const [datasets, setDatasets] = useState([]);
@@ -256,7 +307,6 @@ export default function App() {
   const [operationalMetrics, setOperationalMetrics] = useState({ metrics: {}, security_events: {} });
   const [repositoryInsights, setRepositoryInsights] = useState(null);
   const [securityPosture, setSecurityPosture] = useState(null);
-  const [workbookBlame, setWorkbookBlame] = useState({ cells: [] });
   const [selectedTrace, setSelectedTrace] = useState(null);
   const [selectedSheetId, setSelectedSheetId] = useState("");
   const [repoSearch, setRepoSearch] = useState("");
@@ -264,7 +314,13 @@ export default function App() {
   const [repositoryDescription, setRepositoryDescription] = useState("");
   const [repositoryClassification, setRepositoryClassification] = useState("internal");
   const [repositoryRetention, setRepositoryRetention] = useState("3 years");
+  const [repositoryOwnerEmail, setRepositoryOwnerEmail] = useState("");
+  const [repositoryOwnerEmployeeId, setRepositoryOwnerEmployeeId] = useState("");
   const [selectedCommit, setSelectedCommit] = useState(null);
+  const [checkoutPrompt, setCheckoutPrompt] = useState(null);
+  const [changeActivity, setChangeActivity] = useState({ events: [] });
+  const [activitySort, setActivitySort] = useState("desc");
+  const [activityOperation, setActivityOperation] = useState("");
 
   const viewTableId = selectedBranchTable || selectedTable;
   const selectedBranch = branches.find((branch) => branch.data_table_id === viewTableId) || null;
@@ -274,11 +330,6 @@ export default function App() {
   const selectedSemanticSheet = branchState?.sheets?.find(
     (sheet) => sheet.sheet_id === selectedSheetId
   ) || branchState?.sheets?.[0] || null;
-  const filteredDatasets = datasets.filter((dataset) => {
-    const query = repoSearch.trim().toLowerCase();
-    return !query || `${dataset.repository_name} ${dataset.table_id}`.toLowerCase().includes(query);
-  });
-
   useEffect(() => {
     const expireSession = () => setAuth(null);
     window.addEventListener("gitwalk:auth-expired", expireSession);
@@ -288,7 +339,10 @@ export default function App() {
   const loadDatasets = async () => {
     const result = await getDatasets();
     setDatasets(result.datasets);
-    if (!selectedTable && result.datasets.length) setSelectedTable(result.datasets[0].table_id);
+    if (!selectedTable) {
+      const firstAccessible = result.datasets.find((dataset) => dataset.can_view);
+      if (firstAccessible) setSelectedTable(firstAccessible.table_id);
+    }
   };
 
   const loadFoundation = async () => {
@@ -346,11 +400,11 @@ export default function App() {
   }, [auth]);
 
   useEffect(() => {
-    if (!auth || !selectedTable) return;
+    if (!auth || !selectedTable || tab === "new") return;
     refresh();
     const timer = setInterval(() => refresh(true), 2000);
     return () => clearInterval(timer);
-  }, [auth, selectedTable, selectedBranchTable, selectedSheetId]);
+  }, [auth, selectedTable, selectedBranchTable, selectedSheetId, tab]);
 
   useEffect(() => {
     if (!auth || !selectedTable) return;
@@ -436,13 +490,15 @@ export default function App() {
 
   useEffect(() => {
     if (!auth || !selectedBranch?.branch_id) {
-      setWorkbookBlame({ cells: [] });
+      setChangeActivity({ events: [] });
       return;
     }
-    getWorkbookBlame(selectedBranch.branch_id, selectedSemanticSheet?.sheet_id || "", 5000)
-      .then(setWorkbookBlame)
-      .catch((err) => setError(err.message));
-  }, [auth, selectedBranch?.branch_id, branchState?.head_commit_id, selectedSemanticSheet?.sheet_id]);
+    getWorkbookChangeActivity(selectedBranch.branch_id, {
+      sheetId: selectedSemanticSheet?.sheet_id || "",
+      operation: activityOperation,
+      sort: activitySort,
+    }).then(setChangeActivity).catch((err) => setError(err.message));
+  }, [auth, selectedBranch?.branch_id, branchState?.head_commit_id, selectedSemanticSheet?.sheet_id, activityOperation, activitySort]);
 
   useEffect(() => {
     const sheet = selectedSemanticSheet;
@@ -465,7 +521,7 @@ export default function App() {
   }, [selectedSemanticSheet?.sheet_id]);
 
   useEffect(() => {
-    if (!auth || !selectedTable) return undefined;
+    if (!auth || !selectedTable || tab === "new") return undefined;
     let cancelled = false;
     const applyWorkspace = (result) => {
       if (cancelled) return;
@@ -489,10 +545,10 @@ export default function App() {
     };
     watch().catch((err) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
-  }, [auth, selectedTable]);
+  }, [auth, selectedTable, tab]);
 
   useEffect(() => {
-    if (!auth || !selectedTable) return undefined;
+    if (!auth || !selectedTable || tab === "new") return undefined;
     let active = true;
     const heartbeat = async () => {
       try {
@@ -513,7 +569,7 @@ export default function App() {
       document.removeEventListener("visibilitychange", heartbeat);
       leaveDatasetPresence(selectedTable, browserClientId).catch(() => {});
     };
-  }, [auth, browserClientId, selectedTable]);
+  }, [auth, browserClientId, selectedTable, tab]);
 
   if (!auth) return <LoginPage onAuthenticated={setAuth} />;
 
@@ -533,7 +589,9 @@ export default function App() {
         description: repositoryDescription.trim(),
         data_classification: repositoryClassification,
         retention_policy: repositoryRetention.trim(),
-        business_owner: auth.user.email,
+        business_owner: repositoryOwnerEmail.trim() || auth.user.email,
+        owner_email: repositoryOwnerEmail.trim() || auth.user.email,
+        owner_employee_id: repositoryOwnerEmployeeId.trim(),
       });
       const url = URL.createObjectURL(result.blob);
       const link = document.createElement("a");
@@ -548,6 +606,8 @@ export default function App() {
       setSelectedFile(null);
       setRepositoryName("");
       setRepositoryDescription("");
+      setRepositoryOwnerEmail("");
+      setRepositoryOwnerEmployeeId("");
       setTab("data");
     } catch (err) {
       setError(err.message);
@@ -600,18 +660,37 @@ export default function App() {
     }
   };
 
-  const handleWorkOnWorkbook = async () => {
+  const issueWorkingCopy = async (mode, branchId = null) => {
     if (!selectedTable) return;
     setWorkingCopyBusy(true);
     setError("");
     try {
-      await workOnWorkbook(selectedTable);
+      await workOnWorkbook(selectedTable, mode, branchId);
+      setCheckoutPrompt(null);
       await loadFoundation();
       const result = await getRepositoryBranches(selectedTable);
       setBranches(result.branches || []);
     } catch (err) {
       setError(err.message);
     } finally {
+      setWorkingCopyBusy(false);
+    }
+  };
+
+  const handleWorkOnWorkbook = async () => {
+    if (!selectedTable || !selectedDataset?.can_edit) return;
+    setWorkingCopyBusy(true);
+    setError("");
+    try {
+      const options = await getCheckoutOptions(selectedTable);
+      if (options.branches?.length) {
+        setCheckoutPrompt(options);
+        setWorkingCopyBusy(false);
+        return;
+      }
+      await issueWorkingCopy("new");
+    } catch (err) {
+      setError(err.message);
       setWorkingCopyBusy(false);
     }
   };
@@ -817,6 +896,12 @@ export default function App() {
     }
   };
 
+  const mergeReviewTimeline = (
+    mergeRequestDetail?.timeline?.length
+      ? mergeRequestDetail.timeline
+      : mergeRequestDetail?.changes || []
+  ).filter(isMeaningfulReviewChange).slice(0, 250);
+
   return (
     <div className="product-shell">
       <aside className="sidebar">
@@ -836,10 +921,10 @@ export default function App() {
       <main className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">{tab === "home" ? "GIT WALK / COMMAND CENTER" : "GIT WALK / REPOSITORY"}</p>
-            <h1>{tab === "home" ? "Repository workspaces" : repository?.repository_name || selectedDataset?.original_filename || "Repository workspace"}</h1>
+            <p className="eyebrow">{tab === "home" ? "GIT WALK / COMMAND CENTER" : tab === "new" ? "GIT WALK / CREATE" : "GIT WALK / REPOSITORY"}</p>
+            <h1>{tab === "home" ? "Repository workspaces" : tab === "new" ? "Create a repository" : repository?.repository_name || selectedDataset?.original_filename || "Repository workspace"}</h1>
           </div>
-          <div className="topbar-actions">
+          {tab !== "new" ? <div className="topbar-actions">
             <div className="active-users" title={activeUsers.map((user) => user.email).join("\n") || "No active users"}>
               <div className="avatar-stack">
                 {activeUsers.slice(0, 4).map((user, index) => (
@@ -854,23 +939,28 @@ export default function App() {
               const value = event.target.value;
               setRepoSearch(value);
               const match = datasets.find((item) => item.table_id === value || item.repository_name === value);
-              if (match) setSelectedTable(match.table_id);
+              if (match?.can_view) {
+                setSelectedTable(match.table_id);
+                setRepoSearch("");
+              }
             }} placeholder="Search repositories" />
-            <datalist id="repository-options">{datasets.map((dataset) => <option key={dataset.table_id} value={dataset.repository_name}>{dataset.table_id}</option>)}</datalist>
-            <select value={selectedTable} onChange={(event) => setSelectedTable(event.target.value)}>
-              {filteredDatasets.map((dataset) => <option key={dataset.table_id} value={dataset.table_id}>{dataset.repository_name} / {dataset.table_id}</option>)}
+            <datalist id="repository-options">{datasets.map((dataset) => <option key={dataset.table_id} value={dataset.repository_name}>{dataset.access_level} / {dataset.table_id}</option>)}</datalist>
+            <select value={selectedTable} onChange={(event) => { setSelectedTable(event.target.value); setRepoSearch(""); }}>
+              {datasets.map((dataset) => <option key={dataset.table_id} value={dataset.table_id} disabled={!dataset.can_view}>[{dataset.can_edit ? "EDIT" : dataset.can_view ? "VIEW" : "LOCKED"}] {dataset.repository_name} / {dataset.table_id}</option>)}
             </select>
             {selectedTable ? <select className="branch-selector" value={viewTableId} onChange={(event) => setSelectedBranchTable(event.target.value === selectedTable ? "" : event.target.value)}>
               {branches.map((branch) => <option key={branch.branch_id} value={branch.data_table_id}>{branch.branch_name}</option>)}
             </select> : null}
-            <button className="primary-button compact" onClick={handleWorkOnWorkbook} disabled={!selectedTable || workingCopyBusy}>{workingCopyBusy ? "Preparing branch..." : "Open branch in Excel"}</button>
+            <button className="primary-button compact" onClick={handleWorkOnWorkbook} disabled={!selectedTable || !selectedDataset?.can_edit || workingCopyBusy}>{workingCopyBusy ? "Preparing branch..." : selectedDataset?.can_edit ? "Open branch in Excel" : "Viewer access"}</button>
             <button className="secondary-button" onClick={() => refresh()} disabled={!selectedTable}>Refresh</button>
-          </div>
+          </div> : null}
         </header>
 
         {error ? <div className="error-banner global"><span>{error}</span><button onClick={() => setError("")}>Dismiss</button></div> : null}
 
-        <section className="status-rail">
+        {checkoutPrompt ? <div className="checkout-backdrop" role="presentation"><section className="checkout-dialog" role="dialog" aria-modal="true" aria-labelledby="checkout-title"><button className="checkout-close" onClick={() => setCheckoutPrompt(null)}>Close</button><p className="eyebrow">SIGNED WORKING COPY</p><h2 id="checkout-title">Resume a branch or start clean?</h2><p className="muted">A fresh Excel file will be generated either way. Resume keeps the selected branch history; new branch clones protected main.</p><div className="checkout-branch-list">{checkoutPrompt.branches.map((branch) => <button key={branch.branch_id} onClick={() => issueWorkingCopy("continue", branch.branch_id)} disabled={workingCopyBusy}><span><strong>{branch.branch_name}</strong><small>Last opened {branch.last_opened_at ? new Date(branch.last_opened_at).toLocaleString() : "not recorded"}</small></span><b>Resume</b></button>)}</div><button className="primary-button checkout-new" onClick={() => issueWorkingCopy("new")} disabled={workingCopyBusy}>{workingCopyBusy ? "Preparing workbook..." : "Create a new personal branch"}</button></section></div> : null}
+
+        {tab !== "new" ? <><section className="status-rail">
           <span><i className="live-dot" /> {branches.find((branch) => branch.data_table_id === viewTableId)?.branch_name || "main"}</span>
           <span>HEAD <strong>v{data?.version || 0}</strong></span>
           <span>{data?.total || 0} records</span>
@@ -883,7 +973,7 @@ export default function App() {
           <KpiCard label="Semantic changes" value={semanticMetrics.changes ?? kpis.successes ?? 0} note={`${semanticMetrics.changed_sheets || 0} sheets touched`} tone="green" />
           <KpiCard label="Active branches" value={branches.filter((branch) => branch.status === "ACTIVE").length} note={`${workingCopies.length} signed working copies`} tone="amber" />
           <KpiCard label="Review queue" value={mergeRequests.filter((request) => !["MERGED", "CLOSED"].includes(request.status)).length} note={`${members.length} repository members`} tone="ink" />
-        </section>
+        </section></> : null}
 
         {tab === "home" ? (
           <div className="home-grid">
@@ -904,10 +994,10 @@ export default function App() {
               <div className="panel-header"><div><p className="eyebrow">OPEN REPOSITORIES</p><h2>Continue your work</h2></div><span className="pill">{datasets.length} repositories</span></div>
               <div className="repository-card-grid">
                 {datasets.map((dataset) => (
-                  <button key={dataset.table_id} onClick={() => { setSelectedTable(dataset.table_id); setTab("data"); }}>
+                  <button key={dataset.table_id} className={!dataset.can_view ? "repository-locked" : ""} disabled={!dataset.can_view} onClick={() => { setSelectedTable(dataset.table_id); setTab("data"); }}>
                     <span className="repo-icon">XL</span>
                     <span><strong>{dataset.repository_name || dataset.original_filename}</strong><small>{dataset.category_name} / {dataset.row_count} rows</small></span>
-                    <b>{dataset.my_branch ? "Branch ready" : "View main"}</b>
+                    <b className={`access-badge access-${dataset.access_level}`}>{dataset.can_edit ? `${dataset.repository_role} / edit` : dataset.can_view ? "viewer / read" : "locked / request access"}</b>
                   </button>
                 ))}
                 {!datasets.length ? <div className="empty-state">Upload an Excel workbook to create your first repository.</div> : null}
@@ -941,8 +1031,10 @@ export default function App() {
               <label className="wide">Purpose and audit context<textarea value={repositoryDescription} onChange={(event) => setRepositoryDescription(event.target.value)} placeholder="What business process does this repository govern?" /></label>
               <label>Data classification<select value={repositoryClassification} onChange={(event) => setRepositoryClassification(event.target.value)}><option value="internal">Internal</option><option value="confidential">Confidential</option><option value="restricted">Restricted</option><option value="public">Public</option></select></label>
               <label>Retention policy<input value={repositoryRetention} onChange={(event) => setRepositoryRetention(event.target.value)} placeholder="3 years" /></label>
+              <label>Repository owner email<input type="email" value={repositoryOwnerEmail} onChange={(event) => setRepositoryOwnerEmail(event.target.value)} placeholder={auth.user.email} /></label>
+              <label>Owner employee ID<input value={repositoryOwnerEmployeeId} onChange={(event) => setRepositoryOwnerEmployeeId(event.target.value)} placeholder="EMP-1042 (optional)" maxLength={80} /></label>
             </div>
-            <div className="repository-create-footer"><span>Owner: <strong>{auth.user.email}</strong></span><button className="primary-button compact" onClick={handleUpload} disabled={!selectedFile || !repositoryName.trim() || uploading}>{uploading ? "Creating repository..." : "Create repository and download branch"}</button></div>
+            <div className="repository-create-footer"><span>Owner: <strong>{repositoryOwnerEmail.trim() || auth.user.email}</strong><small>{repositoryOwnerEmail.trim() && repositoryOwnerEmail.trim().toLowerCase() !== auth.user.email.toLowerCase() ? "You remain an editor and receive the initial branch." : "You will own protected main."}</small></span><button className="primary-button compact" onClick={handleUpload} disabled={!selectedFile || !repositoryName.trim() || uploading}>{uploading ? "Creating repository..." : "Create repository and download branch"}</button></div>
           </section>
         ) : null}
 
@@ -1038,8 +1130,8 @@ export default function App() {
                 <div className="change-impact-strip"><span><b>{mergeRequestDetail.change_summary?.cells || 0}</b> cells</span><span><b>{mergeRequestDetail.change_summary?.formulas || 0}</b> formulas</span><span><b>{mergeRequestDetail.change_summary?.rows_added || 0}</b> rows added</span><span><b>{mergeRequestDetail.change_summary?.rows_deleted || 0}</b> rows deleted</span><span><b>{mergeRequestDetail.change_summary?.columns || 0}</b> column operations</span><span><b>{mergeRequestDetail.change_summary?.sheets || 0}</b> sheets</span></div>
 
                 <section className="review-block diff-block">
-                  <div className="review-block-title"><div><p className="eyebrow">SEMANTIC DIFFERENCE</p><h3>Workbook changes</h3></div><span>{mergeRequestDetail.change_summary?.total || 0} operations</span></div>
-                  <div className="semantic-diff-table">{(mergeRequestDetail.changes || []).slice(0, 100).map((change, index) => <article key={`${change.operation_type}-${change.row_id}-${change.column_id}-${index}`}><b>{change.operation_type}</b><code>{change.sheet_id} / {change.row_id || "sheet"} / {change.column_id || "structure"}</code><span><del>{JSON.stringify(change.old_formula ?? change.old_value ?? null)}</del><i>to</i><ins>{JSON.stringify(change.new_formula ?? change.new_value ?? null)}</ins></span></article>)}</div>
+                  <div className="review-block-title"><div><p className="eyebrow">CHRONOLOGICAL REVIEW</p><h3>Approved change journey</h3><p className="muted">Only effective workbook changes are shown, in the exact commit order they reached this branch.</p></div><span>{mergeReviewTimeline.length} operation{mergeReviewTimeline.length === 1 ? "" : "s"}</span></div>
+                  <div className="merge-timeline">{mergeReviewTimeline.map((change, index) => <article key={`${change.commit_id || "diff"}-${change.change_id || index}`}><div className="timeline-rail"><span>{index + 1}</span><i /></div><div className="timeline-change"><header><b>{change.operation_type.replaceAll("_", " ")}</b><time>{change.occurred_at ? new Date(change.occurred_at).toLocaleString() : "Computed review diff"}</time></header><p>{change.commit_message || "Pending semantic change"}<small>{change.author_email || "Git Walk validation"}</small></p><code>{change.previous_cell_reference || change.new_cell_reference || `${change.sheet_id} / ${change.row_id || "structure"} / ${change.column_id || "structure"}`}</code><div className="timeline-values"><del><span>-</span> {formatReviewValue(change.old_formula ?? change.old_value ?? null, change.new_formula ?? change.new_value ?? null)}</del><ins><span>+</span> {formatReviewValue(change.new_formula ?? change.new_value ?? null, change.old_formula ?? change.old_value ?? null)}</ins></div></div></article>)}</div>
                 </section>
 
                 <section className="review-block validation-block">
@@ -1117,13 +1209,14 @@ export default function App() {
               </div>
             </section>
             <section className="panel workbook-blame-panel">
-              <div className="panel-header"><div><p className="eyebrow">WHO CHANGED WHAT / CURRENT HEAD</p><h2>Repository cell attribution</h2><p className="muted">Every visible value is attributed to its last semantic commit, author, merge request, and stable Excel coordinate.</p></div><span className="pill ready">{workbookBlame.cells?.length || 0} attributed cells</span></div>
+              <div className="panel-header"><div><p className="eyebrow">CHANGE TRACEABILITY / COMMITTED EVENTS</p><h2>Workbook mutation ledger</h2><p className="muted">Only cells, rows, columns, and sheets that were created, updated, moved, or deleted are listed. Unchanged imported data is intentionally excluded.</p></div><span className="pill ready">{changeActivity.events?.length || 0} events</span></div>
+              <div className="activity-controls"><label>Operation<select value={activityOperation} onChange={(event) => setActivityOperation(event.target.value)}><option value="">All activity</option><option value="CELL_READ">Cell reads</option><option value="CELL_VALUE_UPDATE">Cell value updates</option><option value="CELL_FORMULA_UPDATE">Formula updates</option><option value="ROW_INSERT">Rows created</option><option value="ROW_DELETE">Rows deleted</option><option value="COLUMN_INSERT">Columns created</option><option value="COLUMN_DELETE">Columns deleted</option><option value="SHEET_CREATE">Sheets created</option><option value="SHEET_DELETE">Sheets deleted</option></select></label><label>Order<select value={activitySort} onChange={(event) => setActivitySort(event.target.value)}><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label></div>
               <div className="blame-table-wrap">
-                <table className="blame-table"><thead><tr><th>Cell identity</th><th>Current value</th><th>Last author</th><th>Commit</th><th>Changed</th><th /></tr></thead><tbody>
-                  {(workbookBlame.cells || []).slice(0, 500).map((cell) => <tr key={`${cell.sheet_id}-${cell.row_id}-${cell.column_id}`}><td><strong>{cell.column_name}</strong><small>{cell.sheet_name} / row {cell.row_position + 1}</small></td><td><code>{cell.formula || JSON.stringify(cell.value)}</code></td><td>{cell.last_author_email || cell.last_author_user_id}</td><td><span className="trace-commit">{String(cell.last_commit_id || "initial").slice(0, 14)}</span>{cell.merge_request_id ? <small>{cell.merge_request_id}</small> : null}</td><td>{new Date(cell.last_modified_at).toLocaleString()}</td><td><button className="trace-button" onClick={() => inspectBlameCell(cell)}>Trace</button></td></tr>)}
+                <table className="blame-table activity-table"><thead><tr><th>Action</th><th>Excel coordinate</th><th>Before / after</th><th>Author</th><th>Commit / time</th><th /></tr></thead><tbody>
+                  {(changeActivity.events || []).map((event) => <tr key={event.change_id}><td><b className={`event-action action-${event.action}`}>{event.action}</b><small>{event.operation_type.replaceAll("_", " ")}</small></td><td><strong>{event.column_name || event.sheet_name || "Workbook structure"}</strong><small>{event.sheet_name || event.sheet_id} / row {event.row_position == null ? "-" : event.row_position + 1} / col {event.column_position == null ? "-" : event.column_position + 1}</small><code>{event.previous_cell_reference || event.new_cell_reference || event.row_id || event.column_id || event.sheet_id}</code></td><td><div className="compact-value-diff"><del>{JSON.stringify(event.old_formula ?? event.old_value ?? null)}</del><ins>{JSON.stringify(event.new_formula ?? event.new_value ?? null)}</ins></div></td><td>{event.author_email || event.author_user_id}</td><td><span className="trace-commit">{String(event.commit_id).slice(0, 14)}</span><small>{new Date(event.occurred_at).toLocaleString()}</small></td><td>{event.row_id && event.column_id && event.action !== "deleted" ? <button className="trace-button" onClick={() => inspectBlameCell(event)}>Trace</button> : null}</td></tr>)}
                 </tbody></table>
               </div>
-              {workbookBlame.truncated ? <p className="blame-note">Showing the first 5,000 cells. Select a sheet or use the traceability API for larger workbooks.</p> : null}
+              {!changeActivity.events?.length ? <div className="empty-state compact">No committed mutations match this sheet and filter.</div> : null}
             </section>
             {selectedTrace ? <section className="panel traceability-card"><button className="trace-close" onClick={() => setSelectedTrace(null)}>Close</button><p className="eyebrow">VALUE PROVENANCE</p><h2>{selectedTrace.column_name} / {selectedTrace.row_id}</h2><div className="trace-current"><span>Current</span><strong>{selectedTrace.formula || JSON.stringify(selectedTrace.value)}</strong></div><div className="trace-facts"><div><span>Author</span><strong>{selectedTrace.last_author_email || selectedTrace.last_author_user_id}</strong></div><div><span>Commit</span><strong>{selectedTrace.last_commit_id}</strong></div><div><span>Merge request</span><strong>{selectedTrace.merge_request_id || "Not merged through an MR"}</strong></div><div><span>Modified</span><strong>{new Date(selectedTrace.last_modified_at).toLocaleString()}</strong></div></div><div className="trace-history">{(selectedTrace.history || []).map((event) => <article key={event.change_id}><i /><div><strong>{event.operation_type.replaceAll("_", " ")}</strong><span>{event.author_email} / {event.message}</span><code>{JSON.stringify(event.old_value)} to {JSON.stringify(event.new_value)}</code></div></article>)}</div></section> : null}
           </div>

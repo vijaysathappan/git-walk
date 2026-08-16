@@ -12,7 +12,7 @@ import os
 import uuid
 import hashlib
 import hmac
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -518,6 +518,11 @@ def initialize_product_schema() -> None:
             conn.execute(
                 "ALTER TABLE AUTH_LOGIN_CODES ADD COLUMN MAX_ATTEMPTS INTEGER NOT NULL DEFAULT 5"
             )
+        user_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info('APP_USERS')")
+        }
+        if "EMPLOYEE_ID" not in user_columns:
+            conn.execute("ALTER TABLE APP_USERS ADD COLUMN EMPLOYEE_ID TEXT")
         repository_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info('WORKBOOK_REPOSITORIES')")
         }
@@ -756,6 +761,28 @@ def _map_dtype(dtype) -> str:
     return "TEXT"
 
 
+def _sqlite_scalar(value: Any) -> Any:
+    """Convert pandas/Excel scalar types to values accepted by sqlite3."""
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat(sep=" ")
+    if isinstance(value, pd.Timedelta):
+        return str(value)
+
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bytes)):
+        return value
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -813,13 +840,7 @@ def create_sqlite_table_from_df(table_name: str, df: pd.DataFrame) -> dict[str, 
     # Prepare row data — convert NaN/NaT to None for SQLite
     rows: list[tuple] = []
     for _, row in df.iterrows():
-        vals = []
-        for v in row:
-            if pd.isna(v):
-                vals.append(None)
-            else:
-                vals.append(v)
-        rows.append(tuple(vals))
+        rows.append(tuple(_sqlite_scalar(value) for value in row))
 
     # Execute within a transaction
     conn = _get_connection()
@@ -1170,6 +1191,24 @@ def get_or_create_user(email: str) -> dict[str, Any]:
         conn.close()
 
 
+def resolve_repository_owner(email: str, employee_id: str | None = None) -> dict[str, Any]:
+    """Resolve or provision a delegated repository owner identity."""
+    user = get_or_create_user(email)
+    normalized_employee_id = (employee_id or "").strip()[:80] or None
+    if normalized_employee_id:
+        conn = _get_connection()
+        try:
+            conn.execute(
+                "UPDATE APP_USERS SET EMPLOYEE_ID=? WHERE USER_ID=?",
+                (normalized_employee_id, user["user_id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        user["employee_id"] = normalized_employee_id
+    return user
+
+
 def get_user(user_id: str) -> dict[str, Any] | None:
     conn = _get_connection()
     try:
@@ -1491,8 +1530,13 @@ def _clone_table(conn: sqlite3.Connection, source_table: str, destination_table:
     conn.execute(f'INSERT INTO "{destination_table}" SELECT * FROM "{source_table}"')
 
 
-def create_working_copy(table_id: str, user_id: str, user_email: str) -> dict[str, Any]:
+def create_working_copy(
+    table_id: str, user_id: str, user_email: str, branch_mode: str = "continue",
+    branch_id: str | None = None,
+) -> dict[str, Any]:
     """Create or reuse an isolated personal branch and issue signed workbook identity."""
+    if branch_mode not in {"continue", "new"}:
+        raise ValueError("Working copy mode must be continue or new")
     conn = _get_connection()
     try:
         repo = conn.execute(
@@ -1503,10 +1547,23 @@ def create_working_copy(table_id: str, user_id: str, user_email: str) -> dict[st
         slug = re.sub(r"[^a-z0-9]+", "-", user_email.split("@", 1)[0].lower()).strip("-") or "user"
         branch_name_base = f"users/{slug}/{repo['REPOSITORY_NAME'].lower().replace(' ', '-')}"
         branch_name = branch_name_base
-        branch = conn.execute(
-            "SELECT * FROM BRANCHES WHERE REPOSITORY_ID=? AND BRANCH_NAME=? AND STATUS='ACTIVE'",
-            (repo["REPOSITORY_ID"], branch_name),
-        ).fetchone()
+        branch = None
+        if branch_mode == "continue":
+            if branch_id:
+                branch = conn.execute(
+                    """
+                    SELECT * FROM BRANCHES WHERE BRANCH_ID=? AND REPOSITORY_ID=?
+                      AND CREATED_BY=? AND BRANCH_TYPE='USER' AND STATUS='ACTIVE'
+                    """,
+                    (branch_id, repo["REPOSITORY_ID"], user_id),
+                ).fetchone()
+                if not branch:
+                    raise ValueError("The selected personal branch is not active")
+            else:
+                branch = conn.execute(
+                    "SELECT * FROM BRANCHES WHERE REPOSITORY_ID=? AND BRANCH_NAME=? AND STATUS='ACTIVE'",
+                    (repo["REPOSITORY_ID"], branch_name),
+                ).fetchone()
         now = _utcnow()
         if not branch:
             suffix = 2
@@ -1609,6 +1666,80 @@ def create_working_copy(table_id: str, user_id: str, user_email: str) -> dict[st
         }
     finally:
         conn.close()
+
+
+def working_copy_checkout_options(table_id: str, user_id: str) -> dict[str, Any]:
+    """Describe reusable branches before issuing another local workbook."""
+    conn = _get_connection()
+    try:
+        repository = conn.execute(
+            """
+            SELECT R.REPOSITORY_ID,R.REPOSITORY_NAME,M.ROLE
+            FROM WORKBOOK_REPOSITORIES R
+            LEFT JOIN REPOSITORY_MEMBERS M
+              ON M.REPOSITORY_ID=R.REPOSITORY_ID AND M.USER_ID=?
+            WHERE R.TABLE_ID=? AND R.STATUS='ACTIVE'
+            """,
+            (user_id, table_id),
+        ).fetchone()
+        if not repository:
+            raise ValueError("Workbook repository does not exist")
+        branches = conn.execute(
+            """
+            SELECT B.BRANCH_ID,B.BRANCH_NAME,B.HEAD_COMMIT_ID,B.UPDATED_AT,
+                   COUNT(CASE WHEN W.STATUS='ACTIVE' THEN 1 END) AS ACTIVE_COPIES,
+                   MAX(W.LAST_SEEN_AT) AS LAST_OPENED_AT
+            FROM BRANCHES B
+            LEFT JOIN WORKING_COPIES W ON W.BRANCH_ID=B.BRANCH_ID AND W.USER_ID=?
+            WHERE B.REPOSITORY_ID=? AND B.CREATED_BY=?
+              AND B.BRANCH_TYPE='USER' AND B.STATUS='ACTIVE'
+            GROUP BY B.BRANCH_ID
+            ORDER BY B.UPDATED_AT DESC
+            """,
+            (user_id, repository["REPOSITORY_ID"], user_id),
+        ).fetchall()
+        return {
+            "repository_id": repository["REPOSITORY_ID"],
+            "repository_name": repository["REPOSITORY_NAME"],
+            "role": repository["ROLE"],
+            "can_edit": repository["ROLE"] in {"owner", "editor"},
+            "branches": [
+                {key.lower(): row[key] for key in row.keys()} for row in branches
+            ],
+        }
+    finally:
+        conn.close()
+
+
+def authenticate_working_copy_identity(
+    table_id: str,
+    repository_id: str,
+    branch_id: str,
+    working_copy_id: str,
+    base_commit_id: str,
+    issued_at: str,
+    signature: str,
+) -> dict[str, Any]:
+    """Authenticate the owner of an active, signed workbook checkout."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT W.USER_ID,U.EMAIL
+            FROM WORKING_COPIES W JOIN APP_USERS U ON U.USER_ID=W.USER_ID
+            WHERE W.WORKING_COPY_ID=?
+            """,
+            (working_copy_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise PermissionError("Working copy is not registered")
+    validate_working_copy(
+        table_id, row["USER_ID"], repository_id, branch_id, working_copy_id,
+        base_commit_id, issued_at, signature,
+    )
+    return {"user_id": row["USER_ID"], "email": row["EMAIL"]}
 
 
 def validate_working_copy(
@@ -2333,7 +2464,11 @@ def list_datasets(user_id: str) -> list[dict[str, Any]]:
             """
             SELECT D.*, U.EMAIL AS OWNER_EMAIL, R.REPOSITORY_ID, R.REPOSITORY_NAME,
                    R.CATEGORY_ID, R.DEFAULT_BRANCH_ID, R.MAIN_PROTECTED,
-                   R.REPOSITORY_SLUG, R.VISIBILITY, M.ROLE AS REPOSITORY_ROLE,
+                   R.REPOSITORY_SLUG, R.VISIBILITY,
+                   COALESCE(M.ROLE, 'locked') AS REPOSITORY_ROLE,
+                   CASE WHEN M.ROLE IS NULL THEN 'denied' ELSE M.ROLE END AS ACCESS_LEVEL,
+                   CASE WHEN M.ROLE IS NULL THEN 0 ELSE 1 END AS CAN_VIEW,
+                   CASE WHEN M.ROLE IN ('owner','editor') THEN 1 ELSE 0 END AS CAN_EDIT,
                    C.NAME AS CATEGORY_NAME,
                    (SELECT COUNT(DISTINCT BATCH_ID) FROM AUDIT_COMMITS A
                     WHERE A.TABLE_ID=D.TABLE_ID) AS COMMIT_COUNT,
@@ -2345,7 +2480,7 @@ def list_datasets(user_id: str) -> list[dict[str, Any]]:
             FROM DATASET_REGISTRY D
             JOIN APP_USERS U ON U.USER_ID=D.OWNER_USER_ID
             JOIN WORKBOOK_REPOSITORIES R ON R.TABLE_ID=D.TABLE_ID AND R.STATUS='ACTIVE'
-            JOIN REPOSITORY_MEMBERS M ON M.REPOSITORY_ID=R.REPOSITORY_ID AND M.USER_ID=?
+            LEFT JOIN REPOSITORY_MEMBERS M ON M.REPOSITORY_ID=R.REPOSITORY_ID AND M.USER_ID=?
             JOIN CATEGORIES C ON C.CATEGORY_ID=R.CATEGORY_ID
             ORDER BY D.UPDATED_AT DESC
             """,

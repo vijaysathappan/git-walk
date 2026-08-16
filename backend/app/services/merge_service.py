@@ -9,6 +9,7 @@ from ..excel.diff_engine import semantic_diff
 from ..excel.merge_engine import resolution_key, three_way_merge
 from ..excel.validation import validate_workbook
 from ..repositories.commit_store import (
+    branch_change_timeline,
     commit_semantic_delta,
     get_commit,
     reconstruct_branch,
@@ -180,6 +181,11 @@ class MergeService:
             "sheets": len({item.get("sheet_id") for item in changes}),
         }
         request["changes"] = changes[:500]
+        request["timeline"] = branch_change_timeline(
+            request["source_branch_id"],
+            request["source_head_commit_id"],
+            request["merge_base_commit_id"],
+        )[:1000]
         return request
 
     def resolve_conflict(

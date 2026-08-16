@@ -4,6 +4,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+
 from app import database
 from app.secret_store import decrypt_secret, encrypt_secret
 
@@ -47,6 +49,27 @@ class DatabaseSyncTests(unittest.TestCase):
         self.assertEqual(
             "SRH", database.read_cell("QUEUE_BOARD_TEST", "BATTING_TEAM", 1)
         )
+
+    def test_dataframe_dates_are_serialized_for_sqlite(self):
+        frame = pd.DataFrame(
+            {
+                "ORDER_DATE": [pd.Timestamp("2026-08-14 09:30:00"), pd.NaT],
+                "QUANTITY": [1, 2],
+            }
+        )
+
+        result = database.create_sqlite_table_from_df("QUEUE_BOARD_DATES", frame)
+
+        self.assertEqual(2, result["row_count"])
+        conn = sqlite3.connect(database.DB_PATH)
+        try:
+            values = conn.execute(
+                'SELECT "ORDER_DATE" FROM "QUEUE_BOARD_DATES" ORDER BY ROW_ID'
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual("2026-08-14 09:30:00", values[0][0])
+        self.assertIsNone(values[1][0])
 
     def test_repeated_update_is_reported_as_no_change(self):
         database.update_cell("QUEUE_BOARD_TEST", "BATTING_TEAM", 1, "SRH")

@@ -37,6 +37,7 @@ from .database import (
     add_dataset_member,
     apply_bulk_updates,
     apply_workbook_commit,
+    authenticate_working_copy_identity,
     column_exists,
     create_sqlite_table_from_df,
     delete_user_ai_settings,
@@ -51,6 +52,7 @@ from .database import (
     list_datasets,
     list_active_presence,
     read_cell,
+    resolve_repository_owner,
     remove_dataset_presence,
     remove_dataset_member,
     register_dataset,
@@ -77,6 +79,7 @@ from .schemas import (
     DatasetMemberRequest,
     LoginRequest,
     LoginVerifyRequest,
+    WorkbookAuthRequest,
     PresenceRequest,
     RollbackRequest,
     SyncRequest,
@@ -85,6 +88,7 @@ from .schemas import (
 )
 from .security import (
     Principal,
+    create_session_token,
     current_principal,
     logout_session,
     send_login_code,
@@ -381,6 +385,25 @@ async def verify_code(payload: LoginVerifyRequest):
     return {"token": token, "user": user}
 
 
+@app.post("/api/v1/auth/workbook")
+async def authenticate_workbook(payload: WorkbookAuthRequest):
+    try:
+        user = authenticate_working_copy_identity(**payload.model_dump())
+    except PermissionError as exc:
+        record_security_event(
+            "WORKBOOK_AUTH_REJECTED",
+            details={"working_copy_id": payload.working_copy_id, "reason": str(exc)},
+        )
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    token = create_session_token(user["user_id"], user["email"])
+    record_audit_event(
+        "WORKBOOK_AUTHENTICATED", actor_user_id=user["user_id"],
+        repository_id=payload.repository_id, branch_id=payload.branch_id,
+        working_copy_id=payload.working_copy_id,
+    )
+    return {"token": token, "user": user}
+
+
 @app.get("/api/v1/auth/me")
 async def auth_me(principal: Principal = Depends(current_principal)):
     return {"user_id": principal.user_id, "email": principal.email}
@@ -401,6 +424,8 @@ async def upload_and_provision(
     category_id: str = Form(default="CAT_UNSORTED"),
     visibility: str = Form(default="private"),
     business_owner: str | None = Form(default=None),
+    owner_email: str | None = Form(default=None),
+    owner_employee_id: str | None = Form(default=None),
     data_classification: str = Form(default="internal"),
     retention_policy: str | None = Form(default=None),
     principal: Principal = Depends(current_principal),
@@ -471,6 +496,15 @@ async def upload_and_provision(
             detail="The uploaded Excel file contains no data rows.",
         )
 
+    owner_user_id = principal.user_id
+    normalized_owner_email = (owner_email or principal.email).strip().lower()
+    if normalized_owner_email != principal.email.lower() or owner_employee_id:
+        normalized_owner_email = _valid_email(normalized_owner_email)
+        delegated_owner = resolve_repository_owner(
+            normalized_owner_email, owner_employee_id
+        )
+        owner_user_id = delegated_owner["user_id"]
+
     # ── Generate unique table name ───────────────────────────────────────
     short_uuid = uuid.uuid4().hex[:8].upper()
     table_id = f"QUEUE_BOARD_{short_uuid}"
@@ -493,7 +527,7 @@ async def upload_and_provision(
     # ── Inject Office Web Add-in taskpane manifest ───────────────────────
     register_dataset(
         table_id,
-        principal.user_id,
+        owner_user_id,
         original_name,
         result["row_count"],
         result["column_count"],
@@ -502,11 +536,15 @@ async def upload_and_provision(
         repository_name=repository_name,
         description=description,
         visibility=visibility,
-        business_owner=business_owner,
+        business_owner=business_owner or normalized_owner_email,
         data_classification=data_classification,
         retention_policy=retention_policy,
         sheet_tables=sheet_tables,
     )
+    if owner_user_id != principal.user_id:
+        add_dataset_member(
+            table_id, owner_user_id, principal.email, "editor"
+        )
     store_initial_formula_metadata(table_id, formulas_by_sheet)
     record_audit_event(
         "WORKBOOK_UPLOADED", actor_user_id=principal.user_id,

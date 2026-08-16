@@ -68,9 +68,14 @@ def issue_branch_workbook(
     user_id: str,
     user_email: str,
     source_workbook: str | None = None,
+    branch_mode: str = "continue",
+    branch_id: str | None = None,
 ) -> dict:
     """Create/reuse a personal branch and return a signed branch workbook."""
-    identity = create_working_copy(main_table_id, user_id, user_email)
+    identity = create_working_copy(
+        main_table_id, user_id, user_email, branch_mode=branch_mode,
+        branch_id=branch_id,
+    )
     directory = Path(tempfile.mkdtemp(prefix="gitwalk_working_copy_"))
     raw_path = directory / "branch.xlsx"
     output_path = directory / f"gitwalk_{identity['branch_id']}.xlsx"

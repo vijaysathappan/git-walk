@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import StatusBanner from "./StatusBanner";
 import {
+  authenticateWorkbook,
   clearAuth,
   commitWorkbook,
   getBranchState,
@@ -20,6 +21,7 @@ const TABLE_ID_DEFINED_NAME = "_EXCEL_SQLITE_SYNC_TABLE_ID";
 const WORKBOOK_METADATA_NAMES = {
   repository_id: "_GITWALK_REPOSITORY_ID",
   branch_id: "_GITWALK_BRANCH_ID",
+  branch_name: "_GITWALK_BRANCH_NAME",
   working_copy_id: "_GITWALK_WORKING_COPY_ID",
   base_commit_id: "_GITWALK_BASE_COMMIT_ID",
   issued_at: "_GITWALK_ISSUED_AT",
@@ -51,9 +53,61 @@ function normalizeValue(value) {
   return value === "" || value == null ? null : value;
 }
 
+const EXCEL_EPOCH_MS = Date.UTC(1899, 11, 30);
+
+function dateTextMilliseconds(value) {
+  if (typeof value !== "string") return null;
+  const match = value.trim().match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/
+  );
+  if (!match) return null;
+  const milliseconds = Number((match[7] || "").padEnd(3, "0").slice(0, 3));
+  return Date.UTC(
+    Number(match[1]), Number(match[2]) - 1, Number(match[3]),
+    Number(match[4] || 0), Number(match[5] || 0), Number(match[6] || 0), milliseconds
+  );
+}
+
+function excelSerialMilliseconds(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1 || value > 2958465) return null;
+  return EXCEL_EPOCH_MS + value * 86400000;
+}
+
+function formatExcelDateLike(serial, reference) {
+  const milliseconds = excelSerialMilliseconds(serial);
+  if (milliseconds == null) return serial;
+  const date = new Date(milliseconds);
+  const datePart = date.toISOString().slice(0, 10);
+  if (typeof reference === "string" && /^\d{4}-\d{2}-\d{2}$/.test(reference.trim())) return datePart;
+  const separator = typeof reference === "string" && reference.includes("T") ? "T" : " ";
+  return `${datePart}${separator}${date.toISOString().slice(11, 19)}`;
+}
+
+function normalizeSemanticValue(value, reference = null, dataType = "") {
+  const normalized = normalizeValue(value);
+  if (
+    typeof normalized === "number"
+    && (dateTextMilliseconds(reference) != null || /DATE|TIME/i.test(String(dataType)))
+  ) {
+    return formatExcelDateLike(normalized, reference);
+  }
+  return normalized;
+}
+
 function valuesEqual(left, right) {
   if (left == null || left === "") return right == null || right === "";
   if (right == null || right === "") return false;
+  const leftDate = dateTextMilliseconds(left);
+  const rightDate = dateTextMilliseconds(right);
+  if (leftDate != null && rightDate != null) return Math.abs(leftDate - rightDate) < 1;
+  if (leftDate != null) {
+    const serialDate = excelSerialMilliseconds(right);
+    if (serialDate != null) return Math.abs(leftDate - serialDate) < 1;
+  }
+  if (rightDate != null) {
+    const serialDate = excelSerialMilliseconds(left);
+    if (serialDate != null) return Math.abs(rightDate - serialDate) < 1;
+  }
   return String(left) === String(right);
 }
 
@@ -187,6 +241,14 @@ function buildSemanticSheetDiff(baseSheet, workbook) {
 
   const baseRows = [...baseSheet.rows].sort((a, b) => a.position - b.position);
   const baseById = new Map(baseRows.map((row) => [row.row_id, row]));
+  const dateReferenceByColumn = new Map(
+    mappedColumns.map((column) => [
+      column.columnId,
+      baseRows.map((row) => row.values[column.columnId]).find(
+        (value) => dateTextMilliseconds(value) != null
+      ) || null,
+    ])
+  );
   const seenRows = new Set();
   const localRows = workbook.rows.map((row, position) => ({
     ...row,
@@ -200,7 +262,13 @@ function buildSemanticSheetDiff(baseSheet, workbook) {
     seenRows.add(row.rowId);
     const original = baseById.get(row.rowId);
     const valuesById = {};
-    mappedColumns.forEach((column) => { valuesById[column.columnId] = row.values[column.name] ?? null; });
+    mappedColumns.forEach((column) => {
+      const reference = original?.values[column.columnId]
+        ?? dateReferenceByColumn.get(column.columnId);
+      valuesById[column.columnId] = normalizeSemanticValue(
+        row.values[column.name] ?? null, reference, column.base?.data_type
+      );
+    });
     if (!original) {
       operations.push({
         operation_type: "ROW_INSERT", sheet_id: baseSheet.sheet_id,
@@ -220,7 +288,11 @@ function buildSemanticSheetDiff(baseSheet, workbook) {
         return;
       }
       if (!column.base) {
-        const newValue = row.values[column.name] ?? null;
+        const newValue = normalizeSemanticValue(
+          row.values[column.name] ?? null,
+          dateReferenceByColumn.get(column.columnId),
+          column.base?.data_type
+        );
         if (newValue != null) {
           operations.push({
             operation_type: "CELL_VALUE_UPDATE", sheet_id: baseSheet.sheet_id,
@@ -239,7 +311,11 @@ function buildSemanticSheetDiff(baseSheet, workbook) {
         return;
       }
       const oldValue = original.values[column.columnId] ?? null;
-      const newValue = row.values[column.name] ?? null;
+      const newValue = normalizeSemanticValue(
+        row.values[column.name] ?? null,
+        oldValue,
+        column.base?.data_type
+      );
       const oldFormula = original.formulas?.[column.columnId] || null;
       const newFormula = row.formulas[column.name] || null;
       if (!valuesEqual(oldValue, newValue)) {
@@ -652,6 +728,7 @@ function AuthPanel({ onAuthenticated }) {
 
 export default function TaskpaneUI() {
   const [auth, setAuth] = useState(getStoredAuth());
+  const [authBootstrapping, setAuthBootstrapping] = useState(true);
   const [tableId, setTableId] = useState("");
   const [connected, setConnected] = useState(false);
   const [syncStatus, setSyncStatus] = useState("idle");
@@ -665,12 +742,15 @@ export default function TaskpaneUI() {
   const [conflicts, setConflicts] = useState([]);
   const [divergence, setDivergence] = useState(null);
   const [workspaceClosed, setWorkspaceClosed] = useState(false);
+  const [branchName, setBranchName] = useState("");
+  const [pullSource, setPullSource] = useState("branch");
 
   const baselineRef = useRef(null);
   const workbookIdentityRef = useRef(null);
   const handlerRef = useRef([]);
   const applyingRemoteRef = useRef(false);
   const autoConnectedRef = useRef(false);
+  const autoAuthAttemptedRef = useRef(false);
   const displayHeadersRef = useRef({});
   const logEndRef = useRef(null);
   const presenceTimerRef = useRef(null);
@@ -964,12 +1044,12 @@ export default function TaskpaneUI() {
   const syncMain = useCallback(async () => {
     const branchId = workbookIdentityRef.current?.branch_id;
     if (!branchId) { addLog("This workbook has no signed branch identity.", true); return; }
-    setBusy(true); setSyncStatus("syncing"); setStatusMsg("Syncing protected main...");
+    setBusy(true); setSyncStatus("syncing"); setStatusMsg("Pulling protected main...");
     try {
       const local = await reviewChanges();
       if (local.changeCount) {
-        setStatusMsg("Commit local changes before syncing main");
-        addLog("Sync paused because the working tree has local changes. Commit them first.", true);
+        setStatusMsg("Commit local changes before pulling main");
+        addLog("Main pull paused because the working tree has local changes. Commit them first.", true);
         return;
       }
       const result = await syncBranchWithMain(branchId);
@@ -978,7 +1058,8 @@ export default function TaskpaneUI() {
       baselineRef.current = latest;
       await saveBaseVersion(latest.version, tableId, latest.head_commit_id);
       const status = await getBranchDivergence(branchId);
-      setDivergence(status); setBaseVersion(latest.version); setStaged(null); setDirty(false);
+      setDivergence(status); setBranchName((current) => status.source_branch_name || current);
+      setBaseVersion(latest.version); setStaged(null); setDirty(false);
       setSyncStatus("synced"); setStatusMsg(result.status === "UP_TO_DATE" ? "Already current with main" : "Main synced");
       addLog(result.status === "UP_TO_DATE" ? "Branch is already current with main." : `Created sync commit ${result.commit_id}.`);
     } catch (err) {
@@ -987,7 +1068,7 @@ export default function TaskpaneUI() {
         setConflicts(mergeConflicts.map((item) => `${item.conflict_type}: ${item.row_id || item.column_id || item.sheet_id || "workbook"}`));
         setStatusMsg(`${mergeConflicts.length} main-sync conflict(s)`);
       } else setStatusMsg(err.message);
-      setSyncStatus("error"); addLog(`Sync main failed: ${err.message}`, true);
+      setSyncStatus("error"); addLog(`Pull from main failed: ${err.message}`, true);
     } finally { setBusy(false); }
   }, [addLog, reviewChanges, saveBaseVersion, tableId, writeSnapshot]);
 
@@ -1046,7 +1127,7 @@ export default function TaskpaneUI() {
     } catch (err) { addLog(`Could not unbind: ${err.message}`, true); }
     handlerRef.current = []; baselineRef.current = null;
     setConnected(false); setSyncStatus("idle"); setStatusMsg(null); setStaged(null); setDirty(false);
-    setDivergence(null); setWorkspaceClosed(false);
+    setDivergence(null); setWorkspaceClosed(false); setPullSource("branch");
   }, [addLog, tableId]);
 
   const connect = useCallback(async (requestedTableId = tableId) => {
@@ -1113,6 +1194,7 @@ export default function TaskpaneUI() {
         try {
           const branchStatus = await getBranchDivergence(workbookIdentityRef.current.branch_id);
           setDivergence(branchStatus);
+          setBranchName((current) => branchStatus.source_branch_name || current);
           setWorkspaceClosed(branchStatus.source_status === "MERGED");
         } catch { setDivergence(null); }
       }
@@ -1153,13 +1235,36 @@ export default function TaskpaneUI() {
   }, []);
 
   useEffect(() => {
+    if (autoAuthAttemptedRef.current) return;
+    autoAuthAttemptedRef.current = true;
+    (async () => {
+      try {
+        const embedded = await getEmbeddedIdentity();
+        if (!embedded?.working_copy_id || !embedded?.signature) return;
+        setBranchName(embedded.branch_name || "");
+        workbookIdentityRef.current = Object.fromEntries(
+          Object.entries(embedded).filter(([key]) => key !== "table_id" && key !== "branch_name")
+        );
+        setAuth(await authenticateWorkbook(Object.fromEntries(
+          Object.entries(embedded).filter(([key]) => key !== "branch_name")
+        )));
+      } catch (err) {
+        addLog(`Signed workbook login unavailable: ${err.message}`, true);
+      } finally {
+        setAuthBootstrapping(false);
+      }
+    })();
+  }, [addLog, getEmbeddedIdentity]);
+
+  useEffect(() => {
     if (!auth || autoConnectedRef.current) return;
     autoConnectedRef.current = true;
     (async () => {
       const embedded = await getEmbeddedIdentity();
       const saved = Office.context.document.settings.get("tableId");
+      setBranchName(embedded?.branch_name || "");
       workbookIdentityRef.current = embedded
-        ? Object.fromEntries(Object.entries(embedded).filter(([key]) => key !== "table_id"))
+        ? Object.fromEntries(Object.entries(embedded).filter(([key]) => key !== "table_id" && key !== "branch_name"))
         : null;
       if (embedded?.table_id || saved) await connect(embedded?.table_id || saved);
       else addLog("No embedded Table ID found. Enter it once to connect.");
@@ -1169,10 +1274,21 @@ export default function TaskpaneUI() {
   const signOut = useCallback(async () => {
     if (connected) await disconnect();
     await logout().catch(() => clearAuth());
-    setAuth(null); setTableId(""); setLogs([]); autoConnectedRef.current = false;
+    setAuth(null); setTableId(""); setBranchName(""); setLogs([]); autoConnectedRef.current = false;
     workbookIdentityRef.current = null;
   }, [connected, disconnect]);
 
+  if (authBootstrapping) return (
+    <div style={containerStyle}>
+      <div style={{ ...cardStyle, marginTop: 30 }}>
+        <div style={labelStyle}>SIGNED BRANCH</div>
+        <h2 style={{ margin: "8px 0" }}>Opening your workspace</h2>
+        <p style={{ color: "#8fa4af", fontSize: 11, lineHeight: 1.6 }}>
+          Verifying the workbook identity and restoring its branch session.
+        </p>
+      </div>
+    </div>
+  );
   if (!auth?.token) return <AuthPanel onAuthenticated={setAuth} />;
   const summary = staged || {
     changeCount: dirty ? "?" : 0,
@@ -1196,11 +1312,31 @@ export default function TaskpaneUI() {
       {!connected ? <button style={buttonStyle} disabled={busy || !tableId} onClick={() => connect()}>{busy ? "Connecting..." : "Open repository workspace"}</button> : <>
         {workspaceClosed ? <div style={{ ...cardStyle, borderColor: "#b9862d", background: "#2a2114" }}><div style={{ ...labelStyle, color: "#f4ba62" }}>Workspace merged</div><div style={{ color: "#e9d7b5", fontSize: 11, lineHeight: 1.55 }}>This signed working copy is closed. Download latest main or create a new workspace in Git Walk.</div></div> : null}
         {divergence ? <div style={{ ...cardStyle, padding: 10, display: "flex", justifyContent: "space-between", color: "#9bafb8", fontSize: 10 }}><span><b style={{ color: "#75ead0" }}>{divergence.ahead}</b> ahead</span><span><b style={{ color: "#f4ba62" }}>{divergence.behind}</b> behind main</span></div> : null}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#172632", boxShadow: "none" }} disabled={busy || workspaceClosed} onClick={reviewChanges}>Review changes</button>
-          <button style={{ ...buttonStyle, color: "#071716", background: "linear-gradient(135deg,#66c4ff,#49a8e8)" }} disabled={busy || workspaceClosed} onClick={() => pullLatest(false)}>Pull branch</button>
+        <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#172632", boxShadow: "none" }} disabled={busy || workspaceClosed} onClick={reviewChanges}>Review local changes</button>
+        <div style={{ ...cardStyle, padding: 11 }}>
+          <div style={labelStyle}>Pull data from</div>
+          <select
+            style={{ ...inputStyle, appearance: "auto", cursor: "pointer" }}
+            value={pullSource}
+            disabled={busy || workspaceClosed}
+            onChange={(event) => setPullSource(event.target.value)}
+          >
+            <option value="main">Protected main{divergence?.target_branch_name ? ` / ${divergence.target_branch_name}` : ""}</option>
+            <option value="branch">My branch / {branchName || divergence?.source_branch_name || workbookIdentityRef.current?.branch_id || "signed workspace"}</option>
+          </select>
+          <div style={{ color: "#718792", fontSize: 9, lineHeight: 1.5, marginTop: 7 }}>
+            {pullSource === "main"
+              ? "Reconcile protected main into your branch, then refresh this workbook."
+              : "Refresh this workbook from your personal branch without touching main."}
+          </div>
+          <button
+            style={{ ...buttonStyle, marginTop: 10, color: "#071716", background: "linear-gradient(135deg,#66c4ff,#49a8e8)" }}
+            disabled={busy || workspaceClosed}
+            onClick={() => (pullSource === "main" ? syncMain() : pullLatest(false))}
+          >
+            {pullSource === "main" ? "Pull from protected main" : "Pull from my branch"}
+          </button>
         </div>
-        <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#263245", boxShadow: "none" }} disabled={busy || workspaceClosed} onClick={syncMain}>Sync with protected main</button>
         <div style={cardStyle}>
           <div style={labelStyle}>Commit message</div>
           <input style={inputStyle} value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder="Describe this data change" maxLength={300} />

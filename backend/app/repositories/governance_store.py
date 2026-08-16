@@ -15,10 +15,117 @@ from .merge_store import branch_context
 
 def _decode(row) -> dict[str, Any]:
     item = {key.lower(): row[key] for key in row.keys()}
-    for key in ("event_payload", "tags_json", "details_json", "metadata_json"):
+    for key in (
+        "event_payload", "tags_json", "details_json", "metadata_json",
+        "old_value", "new_value",
+    ):
         if item.get(key):
             item[key.removesuffix("_json")] = json.loads(item.pop(key))
     return item
+
+
+def workbook_change_activity(
+    branch_id: str,
+    sheet_id: str | None = None,
+    operation: str | None = None,
+    sort: str = "desc",
+    limit: int = 1000,
+) -> dict[str, Any]:
+    """Return only committed workbook mutations, never unchanged imported cells."""
+    where = ["X.BRANCH_ID=?"]
+    params: list[Any] = [branch_id]
+    if sheet_id:
+        where.append("X.SHEET_ID=?")
+        params.append(sheet_id)
+    if operation:
+        where.append("X.OPERATION_TYPE=?")
+        params.append(operation.strip().upper())
+    direction = "ASC" if sort.lower() == "asc" else "DESC"
+    params.append(max(1, min(limit, 5000)))
+    conn = _get_connection()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT X.*,C.MESSAGE,C.AUTHOR_USER_ID,C.AUTHOR_EMAIL,C.COMMIT_HASH,
+                   C.CREATED_AT AS COMMIT_CREATED_AT,
+                   S.SHEET_NAME,SC.COLUMN_NAME,SR.ROW_POSITION,SC.COLUMN_POSITION,
+                   M.MERGE_REQUEST_ID
+            FROM COMMIT_CHANGES X
+            JOIN COMMITS C ON C.COMMIT_ID=X.COMMIT_ID
+            LEFT JOIN BRANCH_SHEETS S
+              ON S.BRANCH_ID=X.BRANCH_ID AND S.SHEET_ID=X.SHEET_ID
+            LEFT JOIN SHEET_COLUMNS SC
+              ON SC.BRANCH_ID=X.BRANCH_ID AND SC.SHEET_ID=X.SHEET_ID
+             AND SC.COLUMN_ID=X.COLUMN_ID
+            LEFT JOIN SHEET_ROWS SR
+              ON SR.BRANCH_ID=X.BRANCH_ID AND SR.SHEET_ID=X.SHEET_ID
+             AND SR.ROW_ID=X.ROW_ID
+            LEFT JOIN MERGE_REQUESTS M ON M.MERGE_COMMIT_ID=C.COMMIT_ID
+            WHERE {' AND '.join(where)}
+            ORDER BY C.CREATED_AT {direction},X.CHANGE_ID {direction}
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        events = [_decode(row) for row in rows]
+        for event in events:
+            event["occurred_at"] = event.pop("commit_created_at")
+            event["action"] = (
+                "created" if event["operation_type"].endswith("INSERT")
+                or event["operation_type"].endswith("CREATE")
+                else "deleted" if event["operation_type"].endswith("DELETE")
+                else "updated"
+            )
+        read_rows = conn.execute(
+            f"""
+            SELECT A.EVENT_ID,A.ACTOR_USER_ID,U.EMAIL AS AUTHOR_EMAIL,
+                   A.EVENT_PAYLOAD,A.CREATED_AT,A.COMMIT_ID,A.MERGE_REQUEST_ID
+            FROM AUDIT_EVENTS A
+            LEFT JOIN APP_USERS U ON U.USER_ID=A.ACTOR_USER_ID
+            WHERE A.BRANCH_ID=? AND A.EVENT_TYPE='CELL_READ'
+            ORDER BY A.CREATED_AT {direction}
+            LIMIT ?
+            """,
+            (branch_id, max(1, min(limit, 5000))),
+        ).fetchall()
+        for row in read_rows:
+            payload = json.loads(row["EVENT_PAYLOAD"] or "{}")
+            if sheet_id and payload.get("sheet_id") != sheet_id:
+                continue
+            if operation and operation.strip().upper() != "CELL_READ":
+                continue
+            events.append({
+                "change_id": row["EVENT_ID"],
+                "operation_type": "CELL_READ",
+                "action": "read",
+                "sheet_id": payload.get("sheet_id"),
+                "sheet_name": payload.get("sheet_name"),
+                "row_id": payload.get("row_id"),
+                "column_id": payload.get("column_id"),
+                "column_name": payload.get("column_name"),
+                "row_position": payload.get("row_position"),
+                "column_position": payload.get("column_position"),
+                "old_value": None,
+                "new_value": payload.get("value"),
+                "author_user_id": row["ACTOR_USER_ID"],
+                "author_email": row["AUTHOR_EMAIL"],
+                "commit_id": row["COMMIT_ID"],
+                "merge_request_id": row["MERGE_REQUEST_ID"],
+                "occurred_at": row["CREATED_AT"],
+            })
+        events.sort(
+            key=lambda item: item.get("occurred_at") or "",
+            reverse=direction == "DESC",
+        )
+        events = events[: max(1, min(limit, 5000))]
+        return {
+            "branch_id": branch_id,
+            "events": events,
+            "sort": direction.lower(),
+            "event_count": len(events),
+        }
+    finally:
+        conn.close()
 
 
 def repository_id_for_table(table_id: str) -> str | None:

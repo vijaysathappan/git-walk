@@ -167,6 +167,12 @@ class Stage3WorkflowTests(unittest.TestCase):
         self.assertEqual("SRH", database.read_cell("QUEUE_BOARD_STAGE3", "TEAM", 1))
 
     def test_sync_main_preserves_non_conflicting_branch_work(self):
+        divergence = merge_service.branch_divergence(
+            self.copy["branch_id"], self.main_branch_id, self.maker
+        )
+        self.assertEqual(self.copy["branch_name"], divergence["source_branch_name"])
+        self.assertEqual("main", divergence["target_branch_name"])
+
         self._commit_cell(
             self.copy["branch_id"], self.copy["table_id"], "TEAM", "SRH", self.maker
         )
@@ -180,6 +186,44 @@ class Stage3WorkflowTests(unittest.TestCase):
         self.assertEqual("SRH", database.read_cell(self.copy["table_id"], "TEAM", 1))
         self.assertEqual(99, database.read_cell(self.copy["table_id"], "SCORE", 1))
         self.assertEqual(2, len(get_commit(result["commit_id"])["parents"]))
+
+    def test_commit_discards_noop_cell_updates(self):
+        snapshot = database.get_table_snapshot(self.copy["table_id"])
+        sheet = snapshot["semantic"]["sheets"][0]
+        row = sheet["rows"][0]
+        columns = {item["name"]: item for item in sheet["columns"]}
+
+        result = commit_semantic_delta(
+            table_id=self.copy["table_id"],
+            repository_id=self.copy["repository_id"],
+            branch_id=self.copy["branch_id"],
+            expected_head_commit_id=snapshot["head_commit_id"],
+            base_version=snapshot["version"],
+            changes=[
+                {
+                    "operation_type": "CELL_VALUE_UPDATE",
+                    "sheet_id": sheet["sheet_id"],
+                    "row_id": row["row_id"],
+                    "column_id": columns["TEAM"]["column_id"],
+                    "new_value": "KKR",
+                },
+                {
+                    "operation_type": "CELL_VALUE_UPDATE",
+                    "sheet_id": sheet["sheet_id"],
+                    "row_id": row["row_id"],
+                    "column_id": columns["SCORE"]["column_id"],
+                    "new_value": 15,
+                },
+            ],
+            user_id=self.owner["user_id"],
+            user_email=self.owner["email"],
+            message="Keep only the effective score change",
+        )
+
+        self.assertEqual(1, result["change_count"])
+        changes = get_commit(result["commit_id"])["changes"]
+        self.assertEqual(1, len(changes))
+        self.assertEqual(columns["SCORE"]["column_id"], changes[0]["column_id"])
 
 
 if __name__ == "__main__":

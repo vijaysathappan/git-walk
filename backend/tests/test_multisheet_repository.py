@@ -7,6 +7,8 @@ from openpyxl import load_workbook
 
 from app import database
 from app.repositories.commit_store import commit_semantic_delta
+from app.repositories.commit_store import branch_change_timeline
+from app.repositories.governance_store import workbook_change_activity
 from app.services.workbook_service import _write_branch_xlsx
 
 
@@ -53,6 +55,64 @@ class MultiSheetRepositoryTests(unittest.TestCase):
 
     def _snapshot(self):
         return database.get_table_snapshot(self.copy["table_id"])
+
+    def test_signed_checkout_can_resume_or_create_a_new_branch(self):
+        authenticated = database.authenticate_working_copy_identity(
+            self.copy["table_id"], self.copy["repository_id"],
+            self.copy["branch_id"], self.copy["working_copy_id"],
+            self.copy["base_commit_id"], self.copy["issued_at"],
+            self.copy["signature"],
+        )
+        self.assertEqual(self.owner["user_id"], authenticated["user_id"])
+
+        options = database.working_copy_checkout_options(
+            "QUEUE_BOARD_MULTI", self.owner["user_id"]
+        )
+        self.assertTrue(options["can_edit"])
+        self.assertEqual(self.copy["branch_id"], options["branches"][0]["branch_id"])
+
+        resumed = database.create_working_copy(
+            "QUEUE_BOARD_MULTI", self.owner["user_id"], self.owner["email"],
+            branch_mode="continue", branch_id=self.copy["branch_id"],
+        )
+        created = database.create_working_copy(
+            "QUEUE_BOARD_MULTI", self.owner["user_id"], self.owner["email"],
+            branch_mode="new",
+        )
+        self.assertEqual(self.copy["branch_id"], resumed["branch_id"])
+        self.assertNotEqual(self.copy["branch_id"], created["branch_id"])
+
+    def test_activity_and_merge_timeline_include_only_committed_mutations(self):
+        snapshot = self._snapshot()
+        sheet = snapshot["semantic"]["sheets"][0]
+        row = sheet["rows"][0]
+        column = next(item for item in sheet["columns"] if item["name"] == "AMOUNT")
+        result = commit_semantic_delta(
+            table_id=self.copy["table_id"],
+            repository_id=self.copy["repository_id"],
+            branch_id=self.copy["branch_id"],
+            expected_head_commit_id=snapshot["head_commit_id"],
+            base_version=snapshot["version"],
+            changes=[{
+                "operation_type": "CELL_VALUE_UPDATE",
+                "sheet_id": sheet["sheet_id"],
+                "row_id": row["row_id"],
+                "column_id": column["column_id"],
+                "new_value": 25,
+            }],
+            user_id=self.owner["user_id"],
+            user_email=self.owner["email"],
+            message="Adjust amount",
+        )
+
+        activity = workbook_change_activity(self.copy["branch_id"])
+        self.assertEqual(1, activity["event_count"])
+        self.assertEqual("updated", activity["events"][0]["action"])
+        timeline = branch_change_timeline(
+            self.copy["branch_id"], result["commit_id"], self.copy["base_commit_id"]
+        )
+        self.assertEqual(["CELL_VALUE_UPDATE"], [item["operation_type"] for item in timeline])
+        self.assertEqual("Adjust amount", timeline[0]["commit_message"])
 
     def test_secondary_sheet_commit_and_complete_export(self):
         snapshot = self._snapshot()

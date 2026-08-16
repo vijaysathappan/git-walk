@@ -12,10 +12,12 @@ from ..repositories.governance_store import (
     row_history,
     verify_audit_integrity,
     workbook_blame,
+    workbook_change_activity,
 )
 from ..repositories.merge_store import branch_context, repository_role
 from ..security import Principal, current_principal
 from ..config import settings
+from ..observability import record_audit_event
 
 
 router = APIRouter(prefix="/api/v1", tags=["governance"])
@@ -111,6 +113,19 @@ async def blame(
     return workbook_blame(branch_id, sheet_id, limit)
 
 
+@router.get("/branches/{branch_id}/change-activity")
+async def change_activity(
+    branch_id: str,
+    sheet_id: str | None = None,
+    operation: str | None = None,
+    sort: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=1000, ge=1, le=5000),
+    principal: Principal = Depends(current_principal),
+):
+    _branch_access(branch_id, principal)
+    return workbook_change_activity(branch_id, sheet_id, operation, sort, limit)
+
+
 @router.get("/branches/{branch_id}/rows/{sheet_id}/{row_id}/history")
 async def branch_row_history(
     branch_id: str, sheet_id: str, row_id: str,
@@ -125,8 +140,22 @@ async def trace_cell(
     branch_id: str, sheet_id: str, row_id: str, column_id: str,
     principal: Principal = Depends(current_principal),
 ):
-    _branch_access(branch_id, principal)
+    branch = _branch_access(branch_id, principal)
     try:
-        return cell_traceability(branch_id, sheet_id, row_id, column_id)
+        result = cell_traceability(branch_id, sheet_id, row_id, column_id)
+        record_audit_event(
+            "CELL_READ", actor_user_id=principal.user_id,
+            repository_id=branch["repository_id"], branch_id=branch_id,
+            commit_id=result.get("last_commit_id"),
+            payload={
+                "sheet_id": sheet_id, "sheet_name": result.get("sheet_name"),
+                "row_id": row_id, "column_id": column_id,
+                "column_name": result.get("column_name"),
+                "row_position": result.get("row_position"),
+                "column_position": result.get("column_position"),
+                "value": result.get("formula") or result.get("value"),
+            },
+        )
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

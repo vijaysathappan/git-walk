@@ -22,6 +22,7 @@ class OpenXmlInjectorTests(unittest.TestCase):
                 metadata={
                     "repository_id": "REP_TEST",
                     "branch_id": "BR_TEST",
+                    "branch_name": "users/test/revenue-model",
                     "working_copy_id": "WC_TEST",
                     "base_commit_id": "CMT_TEST",
                     "issued_at": "2026-08-10T00:00:00+00:00",
@@ -50,6 +51,10 @@ class OpenXmlInjectorTests(unittest.TestCase):
             self.assertEqual(
                 '"BR_TEST"',
                 configured_workbook.defined_names["_GITWALK_BRANCH_ID"].attr_text,
+            )
+            self.assertEqual(
+                '"users/test/revenue-model"',
+                configured_workbook.defined_names["_GITWALK_BRANCH_NAME"].attr_text,
             )
             configured_workbook.close()
 

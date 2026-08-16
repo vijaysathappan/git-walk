@@ -17,10 +17,11 @@ from ..database import (
     list_user_working_copies,
     move_repository,
     repository_name_available,
+    working_copy_checkout_options,
     user_can_access_branch,
     user_can_work_on_repository,
 )
-from ..schemas import CategoryCreateRequest, RepositoryCategoryRequest
+from ..schemas import CategoryCreateRequest, RepositoryCategoryRequest, WorkingCopyRequest
 from ..security import Principal, current_principal
 from ..repositories.merge_store import branch_context
 from ..services.workbook_service import export_branch_workbook, issue_branch_workbook
@@ -191,13 +192,17 @@ async def remove_branch(
 @router.post("/repositories/{table_id}/work-on-workbook")
 async def work_on_workbook(
     table_id: str,
+    payload: WorkingCopyRequest,
     principal: Principal = Depends(current_principal),
 ):
     normalized = table_id.strip().upper()
     if not user_can_work_on_repository(normalized, principal.user_id):
         raise HTTPException(status_code=403, detail="Editor access is required to create a branch")
     try:
-        result = issue_branch_workbook(normalized, principal.user_id, principal.email)
+        result = issue_branch_workbook(
+            normalized, principal.user_id, principal.email,
+            branch_mode=payload.mode, branch_id=payload.branch_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     response = FileResponse(
@@ -224,6 +229,19 @@ async def work_on_workbook(
         payload={"purpose": "working_copy"},
     )
     return response
+
+
+@router.get("/repositories/{table_id}/checkout-options")
+async def checkout_options(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return working_copy_checkout_options(
+            table_id.strip().upper(), principal.user_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/working-copies/mine")

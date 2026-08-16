@@ -29,6 +29,7 @@ TABLE_ID_DEFINED_NAME = "_EXCEL_SQLITE_SYNC_TABLE_ID"
 WORKBOOK_METADATA_NAMES = {
     "repository_id": "_GITWALK_REPOSITORY_ID",
     "branch_id": "_GITWALK_BRANCH_ID",
+    "branch_name": "_GITWALK_BRANCH_NAME",
     "working_copy_id": "_GITWALK_WORKING_COPY_ID",
     "base_commit_id": "_GITWALK_BASE_COMMIT_ID",
     "issued_at": "_GITWALK_ISSUED_AT",

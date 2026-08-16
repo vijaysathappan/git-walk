@@ -96,6 +96,16 @@ class LoginVerifyRequest(LoginRequest):
     code: str = Field(..., min_length=6, max_length=6)
 
 
+class WorkbookAuthRequest(BaseModel):
+    table_id: str = Field(..., min_length=8, max_length=80)
+    repository_id: str = Field(..., min_length=4, max_length=80)
+    branch_id: str = Field(..., min_length=4, max_length=80)
+    working_copy_id: str = Field(..., min_length=4, max_length=80)
+    base_commit_id: str = Field(..., min_length=4, max_length=80)
+    issued_at: str = Field(..., min_length=10, max_length=80)
+    signature: str = Field(..., min_length=32, max_length=128)
+
+
 class BulkCellChange(BaseModel):
     row_id: int = Field(..., ge=1)
     column_name: str
@@ -167,6 +177,11 @@ class CategoryCreateRequest(BaseModel):
 
 class RepositoryCategoryRequest(BaseModel):
     category_id: str = Field(..., min_length=4, max_length=64)
+
+
+class WorkingCopyRequest(BaseModel):
+    mode: str = Field(default="continue", pattern="^(continue|new)$")
+    branch_id: str | None = Field(default=None, min_length=4, max_length=80)
 
 
 class RollbackRequest(BaseModel):

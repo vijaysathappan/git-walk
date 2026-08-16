@@ -83,6 +83,21 @@ export async function verifyLoginCode(email, code) {
   return auth;
 }
 
+export async function authenticateWorkbook(identity) {
+  const response = await fetch(`${API_BASE}/auth/workbook`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(identity),
+  });
+  if (!response.ok) {
+    const parsed = await parseError(response);
+    throw new Error(typeof parsed.detail === "object" ? parsed.detail.message : parsed.detail);
+  }
+  const auth = await response.json();
+  storeAuth(auth);
+  return auth;
+}
+
 export async function getProfile() {
   return (await apiFetch("/auth/me")).json();
 }
@@ -292,9 +307,15 @@ export async function moveRepositoryToCategory(tableId, categoryId) {
   ).json();
 }
 
-export async function workOnWorkbook(tableId) {
+export async function getCheckoutOptions(tableId) {
+  return (await apiFetch(`/repositories/${tableId}/checkout-options`)).json();
+}
+
+export async function workOnWorkbook(tableId, mode = "continue", branchId = null) {
   const response = await apiFetch(`/repositories/${tableId}/work-on-workbook`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode, branch_id: branchId }),
   });
   const blob = await response.blob();
   const disposition = response.headers.get("Content-Disposition") || "";
@@ -484,6 +505,16 @@ export async function getWorkbookBlame(branchId, sheetId = "", limit = 5000) {
   const query = new URLSearchParams({ limit: String(limit) });
   if (sheetId) query.set("sheet_id", sheetId);
   return (await apiFetch(`/branches/${branchId}/blame?${query}`)).json();
+}
+
+export async function getWorkbookChangeActivity(branchId, options = {}) {
+  const query = new URLSearchParams({
+    sort: options.sort || "desc",
+    limit: String(options.limit || 1000),
+  });
+  if (options.sheetId) query.set("sheet_id", options.sheetId);
+  if (options.operation) query.set("operation", options.operation);
+  return (await apiFetch(`/branches/${branchId}/change-activity?${query}`)).json();
 }
 
 export async function getRowHistory(branchId, sheetId, rowId) {

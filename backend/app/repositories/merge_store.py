@@ -95,7 +95,9 @@ def ahead_behind(source_branch_id: str, target_branch_id: str) -> dict[str, Any]
     target_ancestors = ancestors(target["head_commit_id"])
     return {
         "source_branch_id": source_branch_id,
+        "source_branch_name": source["branch_name"],
         "target_branch_id": target_branch_id,
+        "target_branch_name": target["branch_name"],
         "merge_base_commit_id": base,
         "ahead": source_ancestors.get(base, 0),
         "behind": target_ancestors.get(base, 0),

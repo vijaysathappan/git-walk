@@ -9,6 +9,7 @@ from typing import Any
 
 from ..database import DB_PATH, _get_connection, _risk_score, _values_match, validate_identifier
 from ..excel.diff_engine import apply_deltas
+from ..excel.values import normalize_excel_value, values_semantically_equal
 from ..excel.identity import (
     column_letter,
     ensure_branch_identities,
@@ -208,11 +209,7 @@ def commit_semantic_delta(
     now = _utcnow()
     commit_id = stable_id("CMT")
     version = base_version + 1
-    risk_inputs = [
-        {"row_id": index + 1, "column_name": change.get("operation_type", "CHANGE")}
-        for index, change in enumerate(normalized)
-    ]
-    risk = _risk_score(risk_inputs)
+    risk = 0
     try:
         conn.execute("BEGIN IMMEDIATE")
         context = _branch_context(conn, table_id, branch_id)
@@ -439,9 +436,15 @@ def commit_semantic_delta(
                 if operation == "CELL_VALUE_UPDATE":
                     current = conn.execute(f'SELECT "{column["COLUMN_NAME"]}" FROM "{physical_table}" WHERE ROW_ID=?', (row["PHYSICAL_ROW_ID"],)).fetchone()[0]
                     change["old_value"] = current
-                    new_value = change.get("new_value")
-                    if not _values_match(current, new_value):
-                        conn.execute(f'UPDATE "{physical_table}" SET "{column["COLUMN_NAME"]}"=? WHERE ROW_ID=?', (new_value, row["PHYSICAL_ROW_ID"]))
+                    new_value = normalize_excel_value(
+                        change.get("new_value"),
+                        reference=current,
+                        data_type=column["DATA_TYPE"],
+                    )
+                    change["new_value"] = new_value
+                    if values_semantically_equal(current, new_value):
+                        continue
+                    conn.execute(f'UPDATE "{physical_table}" SET "{column["COLUMN_NAME"]}"=? WHERE ROW_ID=?', (new_value, row["PHYSICAL_ROW_ID"]))
                     _audit(conn, commit_id, version, physical_table, row["PHYSICAL_ROW_ID"], column["COLUMN_NAME"], current, new_value, user_id, user_email, message, risk, now, "UPDATED")
                     changed_cells += 1
                 else:
@@ -457,6 +460,18 @@ def commit_semantic_delta(
                     if operation == "CELL_FORMULA_UPDATE": formula_changes += 1
                     else: changed_cells += 1
             stored_changes.append(change)
+
+        if not stored_changes:
+            raise ValueError("There are no effective workbook changes to commit")
+        risk_inputs = [
+            {"row_id": index + 1, "column_name": change.get("operation_type", "CHANGE")}
+            for index, change in enumerate(stored_changes)
+        ]
+        risk = _risk_score(risk_inputs)
+        conn.execute(
+            "UPDATE AUDIT_COMMITS SET RISK_SCORE=? WHERE BATCH_ID=?",
+            (risk, commit_id),
+        )
 
         active_sheets = conn.execute(
             "SELECT SHEET_ID FROM BRANCH_SHEETS WHERE BRANCH_ID=? AND STATUS='ACTIVE'",
@@ -543,6 +558,15 @@ def _change_rows(conn, commit_id: str) -> list[dict[str, Any]]:
     return output
 
 
+def _is_effective_change(change: dict[str, Any]) -> bool:
+    return not (
+        change["operation_type"] == "CELL_VALUE_UPDATE"
+        and values_semantically_equal(
+            change.get("old_value"), change.get("new_value")
+        )
+    )
+
+
 def reconstruct_branch(branch_id: str, commit_id: str | None = None) -> dict[str, Any]:
     conn = _get_connection()
     try:
@@ -573,19 +597,39 @@ def list_branch_commits(branch_id: str, limit: int = 100) -> list[dict[str, Any]
     try:
         rows = conn.execute(
             """
-            SELECT C.*, P.PARENT_COMMIT_ID,
-                   SUM(CASE WHEN X.OPERATION_TYPE LIKE 'CELL_%' THEN 1 ELSE 0 END) AS CELL_CHANGES,
-                   SUM(CASE WHEN X.OPERATION_TYPE='CELL_FORMULA_UPDATE' THEN 1 ELSE 0 END) AS FORMULA_CHANGES,
-                   SUM(CASE WHEN X.OPERATION_TYPE LIKE 'ROW_%' THEN 1 ELSE 0 END) AS ROW_CHANGES,
-                   SUM(CASE WHEN X.OPERATION_TYPE LIKE 'COLUMN_%' THEN 1 ELSE 0 END) AS COLUMN_CHANGES,
-                   COUNT(DISTINCT X.SHEET_ID) AS CHANGED_SHEETS
+            SELECT C.*, P.PARENT_COMMIT_ID
             FROM COMMITS C LEFT JOIN COMMIT_PARENTS P ON P.COMMIT_ID=C.COMMIT_ID AND P.PARENT_ORDER=0
-            LEFT JOIN COMMIT_CHANGES X ON X.COMMIT_ID=C.COMMIT_ID
-            WHERE C.BRANCH_ID=? GROUP BY C.COMMIT_ID ORDER BY C.CREATED_AT DESC LIMIT ?
+            WHERE C.BRANCH_ID=? ORDER BY C.CREATED_AT DESC LIMIT ?
             """,
             (branch_id, max(1, min(limit, 500))),
         ).fetchall()
-        return [{key.lower(): row[key] for key in row.keys()} for row in rows]
+        output = []
+        for row in rows:
+            item = {key.lower(): row[key] for key in row.keys()}
+            changes = [
+                change for change in _change_rows(conn, item["commit_id"])
+                if _is_effective_change(change)
+            ]
+            item.update({
+                "change_count": len(changes),
+                "cell_changes": sum(
+                    change["operation_type"].startswith("CELL_") for change in changes
+                ),
+                "formula_changes": sum(
+                    change["operation_type"] == "CELL_FORMULA_UPDATE" for change in changes
+                ),
+                "row_changes": sum(
+                    change["operation_type"].startswith("ROW_") for change in changes
+                ),
+                "column_changes": sum(
+                    change["operation_type"].startswith("COLUMN_") for change in changes
+                ),
+                "changed_sheets": len({
+                    change.get("sheet_id") for change in changes if change.get("sheet_id")
+                }),
+            })
+            output.append(item)
+        return output
     finally:
         conn.close()
 
@@ -596,9 +640,61 @@ def get_commit(commit_id: str) -> dict[str, Any] | None:
         row = conn.execute("SELECT * FROM COMMITS WHERE COMMIT_ID=?", (commit_id,)).fetchone()
         if not row: return None
         result = {key.lower(): row[key] for key in row.keys()}
-        result["changes"] = _change_rows(conn, commit_id)
+        result["changes"] = [
+            change for change in _change_rows(conn, commit_id)
+            if _is_effective_change(change)
+        ]
+        result["change_count"] = len(result["changes"])
         result["parents"] = [item[0] for item in conn.execute("SELECT PARENT_COMMIT_ID FROM COMMIT_PARENTS WHERE COMMIT_ID=? ORDER BY PARENT_ORDER", (commit_id,)).fetchall()]
         return result
+    finally:
+        conn.close()
+
+
+def branch_change_timeline(
+    branch_id: str, head_commit_id: str, base_commit_id: str
+) -> list[dict[str, Any]]:
+    """Return source-branch operations from the merge base in commit order."""
+    conn = _get_connection()
+    try:
+        commit_ids = []
+        cursor = head_commit_id
+        seen = set()
+        while cursor and cursor != base_commit_id and cursor not in seen:
+            seen.add(cursor)
+            commit = conn.execute(
+                "SELECT BRANCH_ID FROM COMMITS WHERE COMMIT_ID=?", (cursor,)
+            ).fetchone()
+            if not commit or commit["BRANCH_ID"] != branch_id:
+                break
+            commit_ids.append(cursor)
+            parent = conn.execute(
+                """
+                SELECT PARENT_COMMIT_ID FROM COMMIT_PARENTS
+                WHERE COMMIT_ID=? AND PARENT_ORDER=0
+                """,
+                (cursor,),
+            ).fetchone()
+            cursor = parent[0] if parent else None
+        timeline = []
+        for commit_id in reversed(commit_ids):
+            commit = conn.execute(
+                "SELECT * FROM COMMITS WHERE COMMIT_ID=?", (commit_id,)
+            ).fetchone()
+            for sequence, change in enumerate(_change_rows(conn, commit_id), start=1):
+                if not _is_effective_change(change):
+                    continue
+                timeline.append({
+                    **change,
+                    "sequence": len(timeline) + 1,
+                    "commit_sequence": sequence,
+                    "commit_id": commit_id,
+                    "commit_message": commit["MESSAGE"],
+                    "author_user_id": commit["AUTHOR_USER_ID"],
+                    "author_email": commit["AUTHOR_EMAIL"],
+                    "occurred_at": commit["CREATED_AT"],
+                })
+        return timeline
     finally:
         conn.close()
 
@@ -621,7 +717,8 @@ def get_cell_history(branch_id: str, sheet_id: str, row_id: str, column_id: str,
             item = {key.lower(): row[key] for key in row.keys()}
             item["old_value"] = _decode(item["old_value"])
             item["new_value"] = _decode(item["new_value"])
-            output.append(item)
+            if _is_effective_change(item):
+                output.append(item)
         return output
     finally:
         conn.close()
@@ -630,19 +727,35 @@ def get_cell_history(branch_id: str, sheet_id: str, row_id: str, column_id: str,
 def branch_metrics(branch_id: str) -> dict[str, Any]:
     conn = _get_connection()
     try:
-        row = conn.execute(
+        commits = conn.execute(
             """
-            SELECT COUNT(DISTINCT C.COMMIT_ID) AS COMMITS,
-                   COUNT(X.CHANGE_ID) AS CHANGES,
-                   COUNT(DISTINCT X.SHEET_ID) AS CHANGED_SHEETS,
-                   COUNT(DISTINCT CASE WHEN X.ROW_ID IS NOT NULL THEN X.ROW_ID END) AS CHANGED_ROWS,
-                   SUM(CASE WHEN X.OPERATION_TYPE LIKE 'CELL_%' THEN 1 ELSE 0 END) AS CHANGED_CELLS,
-                   SUM(CASE WHEN X.OPERATION_TYPE='CELL_FORMULA_UPDATE' THEN 1 ELSE 0 END) AS FORMULA_CHANGES
-            FROM COMMITS C LEFT JOIN COMMIT_CHANGES X ON X.COMMIT_ID=C.COMMIT_ID
+            SELECT C.COMMIT_ID FROM COMMITS C
             WHERE C.BRANCH_ID=? AND C.STATUS!='CHECKPOINT'
             """,
             (branch_id,),
-        ).fetchone()
-        return {key.lower(): (row[key] or 0) for key in row.keys()}
+        ).fetchall()
+        changes = []
+        for commit in commits:
+            changes.extend(
+                change for change in _change_rows(conn, commit["COMMIT_ID"])
+                if _is_effective_change(change)
+            )
+        return {
+            "commits": len(commits),
+            "changes": len(changes),
+            "changed_sheets": len({
+                change.get("sheet_id") for change in changes if change.get("sheet_id")
+            }),
+            "changed_rows": len({
+                (change.get("sheet_id"), change.get("row_id"))
+                for change in changes if change.get("row_id")
+            }),
+            "changed_cells": sum(
+                change["operation_type"].startswith("CELL_") for change in changes
+            ),
+            "formula_changes": sum(
+                change["operation_type"] == "CELL_FORMULA_UPDATE" for change in changes
+            ),
+        }
     finally:
         conn.close()

@@ -4,6 +4,8 @@ import copy
 import json
 from typing import Any
 
+from .values import values_semantically_equal
+
 
 def _json_value(value: Any) -> str | None:
     return None if value is None else json.dumps(value, default=str, separators=(",", ":"))
@@ -81,7 +83,7 @@ def semantic_diff(before: dict[str, Any], after: dict[str, Any]) -> list[dict[st
             for column_id in set(old_row.get("values", {})) | set(row.get("values", {})):
                 old_value = old_row.get("values", {}).get(column_id)
                 new_value = row.get("values", {}).get(column_id)
-                if old_value != new_value:
+                if not values_semantically_equal(old_value, new_value):
                     changes.append({"operation_type": "CELL_VALUE_UPDATE", "sheet_id": sheet_id, "row_id": row_id, "column_id": column_id, "old_value": old_value, "new_value": new_value})
                 old_formula = old_row.get("formulas", {}).get(column_id)
                 new_formula = row.get("formulas", {}).get(column_id)
