@@ -167,6 +167,12 @@ def initialize_ai_schema(conn: sqlite3.Connection, now: str) -> None:
         """
     )
     models = settings.openrouter_models or [settings.openrouter_model]
+    conn.execute(
+        """UPDATE AI_MODELS SET ENABLED=0,UPDATED_AT=?
+           WHERE PROVIDER='OPENROUTER'
+             AND (LOWER(MODEL_SLUG) NOT LIKE 'nvidia/%' OR LOWER(MODEL_SLUG) NOT LIKE '%:free')""",
+        (now,),
+    )
     for index, slug in enumerate(dict.fromkeys(models)):
         role = "REASONING" if index == 0 else "FAST"
         model_id = _stable("AIM", slug)
@@ -176,6 +182,11 @@ def initialize_ai_schema(conn: sqlite3.Connection, now: str) -> None:
             (model_id, "OPENROUTER", slug, slug, role,
              json.dumps(["CHAT", "TOOLS", role], sort_keys=True), int(role == "REASONING"), index + 1, now, now),
         )
+    conn.execute(
+        """UPDATE AI_MODEL_POLICIES SET MODEL_ID=NULL,UPDATED_AT=?
+           WHERE MODEL_ID IN (SELECT MODEL_ID FROM AI_MODELS WHERE ENABLED=0)""",
+        (now,),
+    )
     prompt_key = "GROUNDED_ENTERPRISE_COPILOT"; template_id = _stable("AIPT", prompt_key); version_id = _stable("AIPV", f"{prompt_key}:1.0")
     system_prompt = (
         "You are Git Walk's governed enterprise copilot. Deterministic evidence is authoritative. "

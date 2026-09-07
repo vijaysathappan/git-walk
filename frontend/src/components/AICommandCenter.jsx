@@ -34,10 +34,18 @@ function safeJson(value, fallback) {
   try { return typeof value === "string" ? JSON.parse(value) : value ?? fallback; } catch { return fallback; }
 }
 
+function modelLabel(slug) {
+  return String(slug || "")
+    .replace(/^nvidia\//, "")
+    .replace(/:free$/, "")
+    .replaceAll("-", " ");
+}
+
 export default function AICommandCenter({ repositoryId, onError }) {
   const [view, setView] = useState("copilot");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [failure, setFailure] = useState(null);
   const [models, setModels] = useState({ configured: false, models: [] });
   const [admin, setAdmin] = useState(null);
   const [usage, setUsage] = useState(null);
@@ -54,6 +62,7 @@ export default function AICommandCenter({ repositoryId, onError }) {
   const [actionTarget, setActionTarget] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
+  const [editingProvider, setEditingProvider] = useState(false);
   const [policyFeature, setPolicyFeature] = useState("ENTERPRISE_COPILOT");
   const [policyModelId, setPolicyModelId] = useState("");
 
@@ -63,8 +72,9 @@ export default function AICommandCenter({ repositoryId, onError }) {
       getAIAgentRuns(), getAIEvaluations(), getAIConversations(),
     ]);
     if (requests[0].status === "fulfilled") {
+      const catalog = requests[0].value.models || [];
       setModels(requests[0].value);
-      setModel((current) => current || requests[0].value.default_model || requests[0].value.models?.[0] || "");
+      setModel((current) => catalog.includes(current) ? current : requests[0].value.default_model || catalog[0] || "");
     }
     if (requests[1].status === "fulfilled") setAdmin(requests[1].value);
     if (requests[2].status === "fulfilled") setUsage(requests[2].value);
@@ -77,9 +87,13 @@ export default function AICommandCenter({ repositoryId, onError }) {
   useEffect(() => { refresh().catch((error) => onError?.(error.message)); }, []);
 
   const perform = async (work, success) => {
-    setBusy(true); setNotice("");
+    setBusy(true); setNotice(""); setFailure(null);
     try { const result = await work(); if (success) setNotice(success(result)); await refresh(); return result; }
-    catch (error) { onError?.(error.message); return null; }
+    catch (error) {
+      setFailure({ code: error.code || `HTTP_${error.status || "ERROR"}`, message: error.message });
+      onError?.(error.message);
+      return null;
+    }
     finally { setBusy(false); }
   };
 
@@ -94,8 +108,15 @@ export default function AICommandCenter({ repositoryId, onError }) {
 
   const connect = async (event) => {
     event.preventDefault();
-    const result = await perform(() => saveAIConfig(apiKey.trim(), model.trim()), () => "Provider credential encrypted and connected.");
-    if (result) setApiKey("");
+    const result = await perform(
+      () => saveAIConfig(apiKey.trim(), model.trim()),
+      (value) => value.replaced ? "OpenRouter token replaced and routing updated." : "OpenRouter token encrypted and connected.",
+    );
+    if (result) {
+      setApiKey("");
+      setEditingProvider(false);
+      setModel(result.default_model);
+    }
   };
 
   const scan = () => perform(() => scanAIControls(repositoryId || null), (result) => `${result.generated} governed control signal(s) refreshed.`);
@@ -107,6 +128,7 @@ export default function AICommandCenter({ repositoryId, onError }) {
     const result = await perform(() => runAIAgent({
       agent_key: agentKey, goal: agentGoal, repository_id: repositoryId || null,
       resource_type: repositoryId ? "REPOSITORY" : "ORGANIZATION", resource_id: repositoryId || null,
+      model: model || null,
       requested_action: requestedAction,
     }), (value) => value.status === "COMPLETED" ? "Agent investigation completed without write actions." : "Agent is waiting for explicit action confirmation.");
     if (result) setView("agents");
@@ -152,6 +174,7 @@ export default function AICommandCenter({ repositoryId, onError }) {
       <button className="ai-refresh" onClick={() => refresh()} disabled={busy}>Refresh signals</button>
     </nav>
     {notice ? <div className="ai-notice">{notice}</div> : null}
+    {failure ? <div className="ai-command-error"><div><strong>{failure.code.replaceAll("_", " ")}</strong><span>{failure.message}</span></div><button onClick={() => setFailure(null)}>Dismiss</button></div> : null}
 
     <section className="ai-signal-grid">
       <article><span>Grounded requests</span><strong>{usage?.requests || 0}</strong><small>{usage?.average_grounding ? `${Math.round(usage.average_grounding * 100)}% average grounding` : "Evidence required"}</small></article>
@@ -162,15 +185,15 @@ export default function AICommandCenter({ repositoryId, onError }) {
 
     {view === "copilot" ? <div className="ai-copilot-layout">
       <section className="ai-surface ai-conversation">
-        <header><div><p className="eyebrow">CONTEXTUAL COPILOT</p><h3>Grounded enterprise reasoning</h3></div><span className={models.configured ? "ai-state connected" : "ai-state"}>{models.configured ? `Connected ${models.masked_key || ""}` : "Provider required"}</span></header>
+        <header><div><p className="eyebrow">CONTEXTUAL COPILOT</p><h3>Grounded enterprise reasoning</h3></div><div className="ai-provider-status"><span className={models.configured ? "ai-state connected" : "ai-state"}>{models.configured ? `OpenRouter ${models.masked_key || ""}` : "Provider required"}</span>{models.configured ? <button type="button" onClick={() => setEditingProvider(true)}>Replace token</button> : null}</div></header>
         <div className="ai-prompt-deck">{prompts.map(([label, prompt]) => <button key={label} onClick={() => setQuestion(prompt)}><span>{label}</span><small>{prompt}</small></button>)}</div>
         <textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about a repository, control, incident, dependency, or decision..." />
-        <footer><select value={model} onChange={(event) => setModel(event.target.value)}>{(models.models || []).map((item) => <option key={item}>{item}</option>)}</select><button onClick={ask} disabled={busy || !models.configured || question.trim().length < 3}>{busy ? "Grounding answer..." : "Ask with evidence"}</button></footer>
-        {!models.configured ? <form className="ai-provider-inline" onSubmit={connect}><div><strong>Connect OpenRouter</strong><small>The key is encrypted and scoped to your account.</small></div><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-or-v1-..." required /><input value={model} onChange={(event) => setModel(event.target.value)} placeholder="provider/model" required /><button disabled={busy}>Connect</button></form> : null}
+        <footer><select aria-label="Free NVIDIA model" value={model} onChange={(event) => setModel(event.target.value)}>{(models.models || []).map((item) => <option key={item} value={item}>NVIDIA {modelLabel(item)} / free</option>)}</select><button onClick={ask} disabled={busy || !models.configured || !model || question.trim().length < 3}>{busy ? "Grounding answer..." : "Ask with evidence"}</button></footer>
+        {!models.configured || editingProvider ? <form className="ai-provider-inline" onSubmit={connect}><div><strong>{models.configured ? "Replace OpenRouter token" : "Connect OpenRouter"}</strong><small>The token is encrypted, write-only, and scoped to your account.</small></div><label><span>New API token</span><input type="password" autoComplete="new-password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-or-v1-..." required /></label><label><span>Free NVIDIA model</span><select value={model} onChange={(event) => setModel(event.target.value)} required>{(models.models || []).map((item) => <option key={item} value={item}>{modelLabel(item)}</option>)}</select></label><div className="ai-provider-actions"><button disabled={busy || !model}>{models.configured ? "Replace securely" : "Connect"}</button>{models.configured ? <button type="button" className="secondary" onClick={() => { setEditingProvider(false); setApiKey(""); }}>Cancel</button> : null}</div><small className="ai-free-notice">Zero-price NVIDIA routes only. Free endpoints can be rate limited and provider-logged; do not submit confidential data unless your OpenRouter policy permits it.</small></form> : null}
       </section>
       <aside className="ai-surface ai-answer">
         <header><p className="eyebrow">ANSWER / PROVENANCE</p>{answer ? <span style={{ "--confidence": `${Math.round(answer.confidence * 100)}%` }}>{Math.round(answer.confidence * 100)}%</span> : null}</header>
-        {answer ? <><h3>{answer.insufficient_evidence ? "Evidence is incomplete" : "Grounded response"}</h3><p>{answer.answer}</p><div className="ai-evidence-list">{answer.evidence_bundle?.map((item) => <article key={`${item.type}:${item.id}`}><span>{item.type}</span><strong>{item.title}</strong><code>{item.id}</code></article>)}</div>{answer.warnings?.map((warning) => <small className="ai-warning" key={warning}>{warning}</small>)}</> : <div className="ai-empty"><strong>No synthetic certainty</strong><p>Answers appear here only after authorized evidence retrieval and structured-output validation.</p><span>{conversations.length} saved conversation(s)</span></div>}
+        {answer ? <><div className="ai-answer-runtime"><span>TOKENS CONSUMED<strong>{((answer.usage?.input_tokens || 0) + (answer.usage?.output_tokens || 0) + (answer.usage?.reasoning_tokens || 0)).toLocaleString()}</strong></span><span>LATENCY<strong>{answer.latency_ms >= 1000 ? `${(answer.latency_ms / 1000).toFixed(1)} S` : `${Math.round(answer.latency_ms || 0)} MS`}</strong></span><span>DELIVERY<strong>{answer.cache_hit ? "CACHE HIT" : "LIVE RESPONSE"}</strong></span></div><h3>{answer.insufficient_evidence ? "Evidence is incomplete" : "Grounded response"}</h3><p>{answer.answer}</p><div className="ai-evidence-list">{answer.evidence_bundle?.map((item) => <article key={`${item.type}:${item.id}`}><span>{item.type}</span><strong>{item.title}</strong><code>{item.id}</code></article>)}</div>{answer.warnings?.map((warning) => <small className="ai-warning" key={warning}>{warning}</small>)}</> : <div className="ai-empty"><strong>No synthetic certainty</strong><p>Answers appear here only after authorized evidence retrieval and structured-output validation.</p><span>{conversations.length} saved conversation(s)</span></div>}
       </aside>
     </div> : null}
 

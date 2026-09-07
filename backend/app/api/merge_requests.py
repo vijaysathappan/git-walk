@@ -161,7 +161,7 @@ async def merge_request_merge(
     principal: Principal = Depends(current_principal),
 ):
     try:
-        return merge_service.merge(merge_request_id, _actor(principal))
+        return merge_service.merge(merge_request_id, _actor(principal), delete_source_branch=True)
     except (
         PermissionError, ValueError, MergeConflictError, MergeHeadChangedError
     ) as exc:

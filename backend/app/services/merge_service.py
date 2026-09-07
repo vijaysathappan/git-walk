@@ -29,6 +29,7 @@ from ..repositories.merge_store import (
 )
 from ..observability import metric_timer, record_audit_event, record_metric
 from ..access_control.engine import authorization_engine, branch_resource, repository_resource
+from .branch_lifecycle_manager import BranchLifecycleManager
 
 
 class MergeConflictError(RuntimeError):
@@ -276,7 +277,7 @@ class MergeService:
         )
         return self.get_request(merge_request_id, actor)
 
-    def merge(self, merge_request_id: str, actor: MergeActor) -> dict[str, Any]:
+    def merge(self, merge_request_id: str, actor: MergeActor, delete_source_branch: bool = False) -> dict[str, Any]:
         request = self.get_request(merge_request_id, actor)
         authorization_engine.require(actor.user_id, "merge_request.merge", repository_resource(request["repository_id"]))
         if request["status"] != "APPROVED":
@@ -312,18 +313,30 @@ class MergeService:
         mark_merged(
             merge_request_id, source["branch_id"], result["commit_id"], actor.user_id
         )
+        cleanup_result = None
+        if delete_source_branch:
+            cleanup_result = BranchLifecycleManager.cleanup_merged_branch(
+                branch_id=source["branch_id"], actor_user_id=actor.user_id
+            )
         record_audit_event(
             "MERGE_COMPLETED", actor_user_id=actor.user_id,
             repository_id=target["repository_id"], branch_id=target["branch_id"],
             commit_id=result["commit_id"], merge_request_id=merge_request_id,
-            payload={"source_branch_id": source["branch_id"], "change_count": len(changes)},
+            payload={"source_branch_id": source["branch_id"], "change_count": len(changes), "cleanup": cleanup_result},
         )
         record_audit_event(
             "WORKING_COPY_REVOKED", actor_user_id="USR_SYSTEM", actor_type="SYSTEM",
             repository_id=target["repository_id"], branch_id=source["branch_id"],
             merge_request_id=merge_request_id,
         )
-        return {**result, "merge_request_id": merge_request_id, "source_branch_status": "MERGED", "working_copy_status": "REVOKED"}
+        return {
+            **result,
+            "merge_request_id": merge_request_id,
+            "source_branch_id": source["branch_id"],
+            "source_branch_status": "DELETED" if delete_source_branch else "MERGED",
+            "working_copy_status": "REVOKED",
+            "cleanup": cleanup_result,
+        }
 
     def sync_branch(self, branch_id: str, actor: MergeActor) -> dict[str, Any]:
         source = branch_context(branch_id)

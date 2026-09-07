@@ -12,6 +12,7 @@ import os
 import uuid
 import hashlib
 import hmac
+import secrets
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ def initialize_product_schema() -> None:
                 EMAIL TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 DISPLAY_NAME TEXT,
                 ROLE TEXT NOT NULL DEFAULT 'member',
+                PASSWORD_HASH TEXT,
                 CREATED_AT TEXT NOT NULL,
                 LAST_LOGIN_AT TEXT NOT NULL
             );
@@ -174,14 +176,21 @@ def initialize_product_schema() -> None:
                 BRANCH_NAME TEXT NOT NULL, BRANCH_TYPE TEXT NOT NULL CHECK(BRANCH_TYPE IN ('MAIN','USER')),
                 CREATED_BY TEXT NOT NULL, BASE_COMMIT_ID TEXT, HEAD_COMMIT_ID TEXT,
                 STATUS TEXT NOT NULL DEFAULT 'ACTIVE', CREATED_AT TEXT NOT NULL, UPDATED_AT TEXT NOT NULL,
-                MERGED_AT TEXT, ARCHIVED_AT TEXT, UNIQUE(REPOSITORY_ID, BRANCH_NAME)
+                MERGED_AT TEXT, ARCHIVED_AT TEXT, LOCAL_DOWNLOAD_PATH TEXT, UNIQUE(REPOSITORY_ID, BRANCH_NAME)
             );
 
             CREATE TABLE IF NOT EXISTS WORKING_COPIES (
                 WORKING_COPY_ID TEXT PRIMARY KEY, REPOSITORY_ID TEXT NOT NULL, BRANCH_ID TEXT NOT NULL,
                 USER_ID TEXT NOT NULL, BASE_COMMIT_ID TEXT, GENERATED_AT TEXT NOT NULL, LAST_SEEN_AT TEXT NOT NULL,
                 STATUS TEXT NOT NULL DEFAULT 'ACTIVE', WORKBOOK_FINGERPRINT TEXT NOT NULL,
-                ISSUED_AT TEXT NOT NULL, SIGNATURE TEXT NOT NULL
+                ISSUED_AT TEXT NOT NULL, SIGNATURE TEXT NOT NULL, LOCAL_FILE_PATH TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS SYSTEM_SETTINGS (
+                SETTING_KEY TEXT PRIMARY KEY,
+                SETTING_VALUE TEXT NOT NULL,
+                UPDATED_AT TEXT NOT NULL,
+                UPDATED_BY TEXT
             );
 
             CREATE TABLE IF NOT EXISTS SHEET_ROWS (
@@ -1022,6 +1031,21 @@ def initialize_product_schema() -> None:
         for column, definition in commit_migrations.items():
             if column not in commit_columns:
                 conn.execute(f"ALTER TABLE COMMITS ADD COLUMN {column} {definition}")
+        branch_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info('BRANCHES')")
+        }
+        if "LOCAL_DOWNLOAD_PATH" not in branch_columns:
+            conn.execute("ALTER TABLE BRANCHES ADD COLUMN LOCAL_DOWNLOAD_PATH TEXT")
+        working_copy_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info('WORKING_COPIES')")
+        }
+        if "LOCAL_FILE_PATH" not in working_copy_columns:
+            conn.execute("ALTER TABLE WORKING_COPIES ADD COLUMN LOCAL_FILE_PATH TEXT")
+        user_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info('APP_USERS')")
+        }
+        if "PASSWORD_HASH" not in user_columns:
+            conn.execute("ALTER TABLE APP_USERS ADD COLUMN PASSWORD_HASH TEXT")
         now = _utcnow()
         conn.execute("INSERT OR IGNORE INTO CATEGORIES VALUES ('CAT_HOME', NULL, 'Home', 'All workbook repositories', 0, 'ACTIVE', ?, ?)", (now, now))
         conn.execute("INSERT OR IGNORE INTO CATEGORIES VALUES ('CAT_UNSORTED', 'CAT_HOME', 'Unsorted', 'New workbook repositories', 100, 'ACTIVE', ?, ?)", (now, now))
@@ -2521,7 +2545,7 @@ def delete_branch(branch_id: str, user_id: str) -> dict[str, Any]:
             """
             SELECT B.*, M.ROLE FROM BRANCHES B
             JOIN REPOSITORY_MEMBERS M ON M.REPOSITORY_ID=B.REPOSITORY_ID
-            WHERE B.BRANCH_ID=? AND B.STATUS='ACTIVE' AND M.USER_ID=?
+            WHERE B.BRANCH_ID=? AND B.STATUS IN ('ACTIVE', 'MERGED') AND M.USER_ID=?
             """,
             (branch_id, user_id),
         ).fetchone()
@@ -2546,6 +2570,246 @@ def delete_branch(branch_id: str, user_id: str) -> dict[str, Any]:
         )
         conn.commit()
         return {"branch_id": branch_id, "status": "DELETED", "working_copy_status": "REVOKED"}
+    finally:
+        conn.close()
+
+
+def get_system_setting(key: str, default: str | None = None) -> str | None:
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT SETTING_VALUE FROM SYSTEM_SETTINGS WHERE SETTING_KEY=?",
+            (key,),
+        ).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def set_system_setting(key: str, value: str, user_id: str = "USR_SYSTEM") -> None:
+    conn = _get_connection()
+    now = _utcnow()
+    try:
+        conn.execute(
+            """
+            INSERT INTO SYSTEM_SETTINGS (SETTING_KEY, SETTING_VALUE, UPDATED_AT, UPDATED_BY)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(SETTING_KEY) DO UPDATE SET
+                SETTING_VALUE=excluded.SETTING_VALUE,
+                UPDATED_AT=excluded.UPDATED_AT,
+                UPDATED_BY=excluded.UPDATED_BY
+            """,
+            (key, value, now, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_branch_local_path(branch_id: str, local_path: str) -> None:
+    conn = _get_connection()
+    now = _utcnow()
+    try:
+        conn.execute(
+            "UPDATE BRANCHES SET LOCAL_DOWNLOAD_PATH=?, UPDATED_AT=? WHERE BRANCH_ID=?",
+            (local_path, now, branch_id),
+        )
+        conn.execute(
+            "UPDATE WORKING_COPIES SET LOCAL_FILE_PATH=?, LAST_SEEN_AT=? WHERE BRANCH_ID=? AND STATUS='ACTIVE'",
+            (local_path, now, branch_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_working_copy_local_path(working_copy_id: str, local_file_path: str) -> None:
+    conn = _get_connection()
+    now = _utcnow()
+    try:
+        conn.execute(
+            "UPDATE WORKING_COPIES SET LOCAL_FILE_PATH=?, LAST_SEEN_AT=? WHERE WORKING_COPY_ID=?",
+            (local_file_path, now, working_copy_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _normalize_path(raw_path: str | None) -> str:
+    if not raw_path:
+        return ""
+    import urllib.parse
+    cleaned = urllib.parse.unquote(str(raw_path).strip())
+    if cleaned.lower().startswith("file:///"):
+        cleaned = cleaned[8:]
+    elif cleaned.lower().startswith("file://"):
+        cleaned = cleaned[7:]
+    cleaned = cleaned.replace("/", "\\")
+    while len(cleaned) >= 3 and cleaned[0] == "\\" and cleaned[2] == ":":
+        cleaned = cleaned[1:]
+    return cleaned.rstrip("\\").lower()
+
+
+def hash_password(password: str, salt: str | None = None) -> str:
+    if not salt:
+        salt = secrets.token_hex(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return f"{salt}:{key.hex()}"
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    if not hashed or ":" not in hashed:
+        return False
+    salt, expected_hex = hashed.split(":", 1)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return hmac.compare_digest(key.hex(), expected_hex)
+
+
+def set_user_password(user_id_or_email: str, password: str) -> dict[str, Any]:
+    conn = _get_connection()
+    try:
+        normalized = user_id_or_email.strip()
+        row = conn.execute(
+            "SELECT * FROM APP_USERS WHERE USER_ID=? OR LOWER(EMAIL)=LOWER(?)",
+            (normalized, normalized),
+        ).fetchone()
+        if not row:
+            raise ValueError("User not found.")
+        hashed = hash_password(password)
+        conn.execute("UPDATE APP_USERS SET PASSWORD_HASH=? WHERE USER_ID=?", (hashed, row["USER_ID"]))
+        conn.commit()
+        return {key.lower(): row[key] for key in row.keys()}
+    finally:
+        conn.close()
+
+
+def verify_user_credentials(user_id_or_email: str, password: str) -> dict[str, Any] | None:
+    conn = _get_connection()
+    try:
+        normalized = user_id_or_email.strip()
+        row = conn.execute(
+            "SELECT * FROM APP_USERS WHERE USER_ID=? OR LOWER(EMAIL)=LOWER(?)",
+            (normalized, normalized),
+        ).fetchone()
+        if not row:
+            return None
+        pwd_hash = row["PASSWORD_HASH"] if "PASSWORD_HASH" in row.keys() else None
+        if not pwd_hash:
+            if password:
+                new_hash = hash_password(password)
+                conn.execute("UPDATE APP_USERS SET PASSWORD_HASH=? WHERE USER_ID=?", (new_hash, row["USER_ID"]))
+                conn.commit()
+                return {key.lower(): row[key] for key in row.keys()}
+            return None
+        if not verify_password(password, pwd_hash):
+            return None
+        return {key.lower(): row[key] for key in row.keys()}
+    finally:
+        conn.close()
+
+
+def verify_workbook_access(
+    repository_id: str,
+    branch_id: str,
+    working_copy_id: str,
+    email: str,
+    code: str | None = None,
+    password: str | None = None,
+    current_file_path: str = "",
+) -> dict[str, Any]:
+    """Verify file path, OTP verification code (or password), and repository role before allowing workbook data load."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT W.*, B.DATA_TABLE_ID, B.LOCAL_DOWNLOAD_PATH, B.STATUS AS BRANCH_STATUS,
+                   R.STATUS AS REPOSITORY_STATUS
+            FROM WORKING_COPIES W
+            JOIN BRANCHES B ON B.BRANCH_ID=W.BRANCH_ID
+            JOIN WORKBOOK_REPOSITORIES R ON R.REPOSITORY_ID=W.REPOSITORY_ID
+            WHERE W.WORKING_COPY_ID=?
+            """,
+            (working_copy_id,),
+        ).fetchone()
+        if not row:
+            raise PermissionError("Working copy is not registered.")
+        if repository_id and row["REPOSITORY_ID"] != repository_id:
+            raise PermissionError("Workbook repository mismatch.")
+        if branch_id and row["BRANCH_ID"] != branch_id:
+            raise PermissionError("Workbook branch mismatch.")
+        if row["STATUS"] in ("REVOKED", "CLOSED") or row["BRANCH_STATUS"] in ("DELETED", "MERGED"):
+            raise PermissionError("This working copy or branch was merged or closed. Create a new branch in Git Walk.")
+        if row["STATUS"] != "ACTIVE" or row["BRANCH_STATUS"] != "ACTIVE":
+            raise PermissionError("Working copy or branch is no longer active.")
+        if row["REPOSITORY_STATUS"] != "ACTIVE":
+            raise PermissionError("Workbook repository is no longer active.")
+
+        # 1. Path verification
+        recorded_path = row["LOCAL_FILE_PATH"] or row["LOCAL_DOWNLOAD_PATH"]
+        if recorded_path:
+            norm_recorded = _normalize_path(recorded_path)
+            norm_current = _normalize_path(current_file_path)
+            if not norm_current or norm_recorded != norm_current:
+                raise PermissionError(
+                    f"FILE_PATH_MISMATCH: Current workbook path '{current_file_path}' does not match "
+                    f"authorized download path '{recorded_path}'. Data loading blocked."
+                )
+
+        # 2. Authentication: verify OTP code or password
+        from .security import hash_login_code, create_session_token
+        normalized_email = email.strip().lower()
+        if "@" not in normalized_email:
+            user_row = conn.execute(
+                "SELECT EMAIL FROM APP_USERS WHERE USER_ID=? OR LOWER(EMAIL)=LOWER(?)",
+                (normalized_email.upper(), normalized_email),
+            ).fetchone()
+            if user_row:
+                normalized_email = user_row["EMAIL"].lower()
+
+        if code:
+            code_hash = hash_login_code(normalized_email, code.strip())
+            if not consume_login_code(normalized_email, code_hash):
+                raise PermissionError("INVALID_CODE: Invalid or expired verification code.")
+            user = get_or_create_user(normalized_email)
+        elif password:
+            user = verify_user_credentials(normalized_email, password)
+            if not user:
+                raise PermissionError("INVALID_CREDENTIALS: User ID or password is incorrect.")
+        else:
+            raise PermissionError("AUTHENTICATION_REQUIRED: Verification code is required.")
+
+        token = create_session_token(user["user_id"], user["email"])
+
+        # 3. Role check on repository
+        member = conn.execute(
+            """
+            SELECT ROLE FROM REPOSITORY_MEMBERS
+            WHERE REPOSITORY_ID=? AND USER_ID=?
+            """,
+            (row["REPOSITORY_ID"], user["user_id"]),
+        ).fetchone()
+        if not member:
+            raise PermissionError("NO_REPOSITORY_ACCESS: You are not a member of this repository.")
+        role = member["ROLE"]
+        if role not in ("owner", "editor"):
+            raise PermissionError(
+                f"INSUFFICIENT_ROLE: Your role is '{role}'. You must be an editor or owner to work on this repository."
+            )
+
+        now = _utcnow()
+        conn.execute("UPDATE WORKING_COPIES SET LAST_SEEN_AT=? WHERE WORKING_COPY_ID=?", (now, working_copy_id))
+        conn.commit()
+
+        return {
+            "user": user,
+            "token": token,
+            "role": role,
+            "table_id": row["DATA_TABLE_ID"],
+            "repository_id": row["REPOSITORY_ID"],
+            "branch_id": row["BRANCH_ID"],
+            "working_copy_id": working_copy_id,
+        }
     finally:
         conn.close()
 

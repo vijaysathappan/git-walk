@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from app import database
+from app.ai.catalog import NVIDIA_FREE_MODEL_DEFAULTS, free_nvidia_chat_models
 from app.ai.gateway import AIGateway
 from app.ai.provider import AIProviderError, LLMProvider, ProviderResult
 from app.ai.service import AIService
@@ -15,15 +16,22 @@ from app.secret_store import encrypt_secret
 class FakeProvider(LLMProvider):
     provider_name = "OPENROUTER"
 
-    def __init__(self, evidence_id: str, invalid_first: bool = False):
+    def __init__(self, evidence_id: str, invalid_first: bool = False, plain_output: bool = False):
         self.evidence_id = evidence_id
         self.invalid_first = invalid_first
+        self.plain_output = plain_output
         self.calls = 0
+        self.last_model = None
+        self.last_response_schema = None
 
     async def complete(self, **kwargs) -> ProviderResult:
         self.calls += 1
+        self.last_model = kwargs.get("model")
+        self.last_response_schema = kwargs.get("response_schema")
         if self.invalid_first and self.calls == 1:
             return ProviderResult("not-json", 12, 3)
+        if self.plain_output:
+            return ProviderResult("A cautious advisory answer without structured citations.", 20, 8)
         content = json.dumps({
             "answer": "The repository evidence supports a controlled review.",
             "evidence": [
@@ -64,8 +72,8 @@ class Stage5AIPlatformTests(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
 
-    def service(self, invalid_first: bool = False):
-        provider = FakeProvider(self.repository["repository_id"], invalid_first)
+    def service(self, invalid_first: bool = False, plain_output: bool = False):
+        provider = FakeProvider(self.repository["repository_id"], invalid_first, plain_output)
         return AIService(AIGateway({"OPENROUTER": provider})), provider
 
     async def test_grounded_chat_repairs_output_filters_citations_and_records_usage(self):
@@ -76,9 +84,12 @@ class Stage5AIPlatformTests(unittest.IsolatedAsyncioTestCase):
             "resource_type": "REPOSITORY", "resource_id": self.repository["repository_id"],
         })
         self.assertEqual(2, provider.calls)
+        self.assertIsNotNone(provider.last_response_schema)
         self.assertEqual([self.repository["repository_id"]], [item["id"] for item in result["evidence"]])
         self.assertTrue(any("unverified" in warning for warning in result["warnings"]))
         self.assertGreater(result["confidence"], 0)
+        self.assertGreaterEqual(result["latency_ms"], 0)
+        self.assertEqual(170, sum(result["usage"].values()))
         conversation = service.conversations(self.organization_id, self.owner["user_id"], result["conversation_id"])
         self.assertEqual(["USER", "ASSISTANT"], [message["role"] for message in conversation["messages"]])
         usage = service.usage(self.organization_id, self.owner["user_id"])
@@ -94,6 +105,61 @@ class Stage5AIPlatformTests(unittest.IsolatedAsyncioTestCase):
                 "question": "Read a repository I cannot access", "repository_id": self.repository["repository_id"],
             })
         self.assertEqual(0, provider.calls)
+
+    async def test_selected_free_nvidia_model_is_used_and_paid_model_is_blocked(self):
+        service, provider = self.service()
+        selected = NVIDIA_FREE_MODEL_DEFAULTS[1]
+        result = await service.chat(self.organization_id, self.owner["user_id"], {
+            "question": "Use the selected model for this grounded response",
+            "model": selected,
+        })
+        self.assertEqual(selected, provider.last_model)
+        self.assertEqual(selected, result["model"])
+        self.assertIsNone(provider.last_response_schema)
+
+        with self.assertRaises(AIProviderError) as raised:
+            await service.chat(self.organization_id, self.owner["user_id"], {
+                "question": "A paid route must never reach the provider",
+                "model": "openai/gpt-4.1-mini",
+            })
+        self.assertEqual("AI_MODEL_NOT_ALLOWED", raised.exception.code)
+        self.assertEqual(1, provider.calls)
+
+    def test_catalog_keeps_only_zero_price_nvidia_text_models(self):
+        payload = {"data": [
+            {"id": NVIDIA_FREE_MODEL_DEFAULTS[0], "pricing": {"prompt": "0", "completion": "0"},
+             "architecture": {"output_modalities": ["text"]}},
+            {"id": "nvidia/paid-model", "pricing": {"prompt": "0.1", "completion": "0.1"},
+             "architecture": {"output_modalities": ["text"]}},
+            {"id": "openai/not-nvidia:free", "pricing": {"prompt": "0", "completion": "0"},
+             "architecture": {"output_modalities": ["text"]}},
+            {"id": "nvidia/embedding:free", "pricing": {"prompt": "0", "completion": "0"},
+             "architecture": {"output_modalities": ["embeddings"]}},
+        ]}
+        self.assertEqual([NVIDIA_FREE_MODEL_DEFAULTS[0]], free_nvidia_chat_models(payload))
+
+    async def test_unstructured_free_model_response_returns_safe_advisory(self):
+        service, provider = self.service(plain_output=True)
+        result = await service.chat(self.organization_id, self.owner["user_id"], {
+            "question": "Return a useful answer even when the free model ignores JSON",
+        })
+        self.assertEqual(3, provider.calls)
+        self.assertTrue(result["insufficient_evidence"])
+        self.assertEqual(0, result["confidence"])
+        self.assertIn("cautious advisory", result["answer"])
+        self.assertTrue(any("unstructured" in warning for warning in result["warnings"]))
+
+    async def test_cached_answer_reports_delivery_latency_without_new_tokens(self):
+        service, provider = self.service()
+        payload = {"question": "Cache this governed answer and return it again"}
+        live = await service.chat(self.organization_id, self.owner["user_id"], payload)
+        cached = await service.chat(self.organization_id, self.owner["user_id"], payload)
+        self.assertFalse(live["cache_hit"])
+        self.assertTrue(cached["cache_hit"])
+        self.assertEqual(1, provider.calls)
+        self.assertEqual(170, sum(live["usage"].values()))
+        self.assertEqual(0, sum(cached["usage"].values()))
+        self.assertGreaterEqual(cached["latency_ms"], 0)
 
     async def test_quota_blocks_provider_and_agent_tools_are_audited(self):
         service, provider = self.service()

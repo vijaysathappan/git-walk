@@ -110,6 +110,8 @@ import {
   uploadAndProvision,
   verifyLoginCode,
   workOnWorkbook,
+  getEucStorageSetting,
+  saveEucStorageSetting,
 } from "./services/api";
 import "./styles.css";
 
@@ -806,7 +808,7 @@ export default function App() {
   const [activeUsers, setActiveUsers] = useState([]);
   const [browserClientId] = useState(() => getClientId("browser"));
   const [aiApiKey, setAiApiKey] = useState("");
-  const [aiConfigModel, setAiConfigModel] = useState("openai/gpt-4.1-mini");
+  const [aiConfigModel, setAiConfigModel] = useState("");
   const [showAISetup, setShowAISetup] = useState(false);
   const [categories, setCategories] = useState([]);
   const [repository, setRepository] = useState(null);
@@ -857,6 +859,31 @@ export default function App() {
   const [eucSearch, setEucSearch] = useState("");
   const [eucBusy, setEucBusy] = useState(false);
   const [eucSection, setEucSection] = useState("overview");
+
+  // Local EUC Excel download directory state (C: or D: drive)
+  const [eucDownloadDir, setEucDownloadDir] = useState(() => localStorage.getItem("gitwalk:euc_download_dir") || "");
+  const [showFolderModal, setShowFolderModal] = useState(false);
+  const [pendingCheckout, setPendingCheckout] = useState(null);
+  const [folderModalInput, setFolderModalInput] = useState("");
+  const [folderModalError, setFolderModalError] = useState("");
+  const [folderSettingsInput, setFolderSettingsInput] = useState("");
+  const [folderSettingsMsg, setFolderSettingsMsg] = useState("");
+  const [folderSettingsBusy, setFolderSettingsBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  const isValidDrive = (path) => /^[cCdD]:[/\\]/.test(path?.trim());
+
+  useEffect(() => {
+    getEucStorageSetting()
+      .then((res) => {
+        if (res?.local_download_dir) {
+          setEucDownloadDir(res.local_download_dir);
+          setFolderSettingsInput(res.local_download_dir);
+          localStorage.setItem("gitwalk:euc_download_dir", res.local_download_dir);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const viewTableId = selectedBranchTable || selectedTable;
   const selectedBranch = branches.find((branch) => branch.data_table_id === viewTableId) || null;
@@ -930,7 +957,7 @@ export default function App() {
     getAIModels().then((models) => {
       setAiModels(models);
       setAiModel(models.default_model || models.models[0] || "");
-      setAiConfigModel(models.default_model || "openai/gpt-4.1-mini");
+      setAiConfigModel(models.default_model || models.models[0] || "");
       setShowAISetup(!models.configured);
     }).catch(() => {});
   }, [auth]);
@@ -1258,16 +1285,27 @@ export default function App() {
     }
   };
 
-  const issueWorkingCopy = async (mode, branchId = null) => {
+  const issueWorkingCopy = async (mode, branchId = null, overrideDir = null) => {
     if (!selectedTable) return;
+    const targetDir = overrideDir || eucDownloadDir;
+    if (!targetDir || !isValidDrive(targetDir)) {
+      setPendingCheckout({ mode, branchId });
+      setFolderModalInput(targetDir || "C:\\GitWalk_Workbooks");
+      setFolderModalError("");
+      setShowFolderModal(true);
+      return;
+    }
     setWorkingCopyBusy(true);
     setError("");
     try {
-      await workOnWorkbook(selectedTable, mode, branchId);
+      const result = await workOnWorkbook(selectedTable, mode, branchId, targetDir);
       setCheckoutPrompt(null);
       await loadFoundation();
-      const result = await getRepositoryBranches(selectedTable);
-      setBranches(result.branches || []);
+      const branchRes = await getRepositoryBranches(selectedTable);
+      setBranches(branchRes.branches || []);
+      if (result?.localSavedPath) {
+        setNotice(`Workbook downloaded and saved to: ${result.localSavedPath}`);
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -1277,6 +1315,13 @@ export default function App() {
 
   const handleWorkOnWorkbook = async () => {
     if (!selectedTable || !selectedDataset?.can_edit) return;
+    if (!eucDownloadDir || !isValidDrive(eucDownloadDir)) {
+      setPendingCheckout({ mode: "start" });
+      setFolderModalInput("C:\\GitWalk_Workbooks");
+      setFolderModalError("");
+      setShowFolderModal(true);
+      return;
+    }
     setWorkingCopyBusy(true);
     setError("");
     try {
@@ -1290,6 +1335,60 @@ export default function App() {
     } catch (err) {
       setError(err.message);
       setWorkingCopyBusy(false);
+    }
+  };
+
+  const handleConfirmFolderModal = async (event) => {
+    event.preventDefault();
+    const input = folderModalInput.trim();
+    if (!isValidDrive(input)) {
+      setFolderModalError("Path must be located on C: or D: drive (e.g. C:\\... or D:\\...).");
+      return;
+    }
+    try {
+      await saveEucStorageSetting(input);
+      setEucDownloadDir(input);
+      setFolderSettingsInput(input);
+      localStorage.setItem("gitwalk:euc_download_dir", input);
+      setShowFolderModal(false);
+
+      if (pendingCheckout) {
+        const { mode, branchId } = pendingCheckout;
+        setPendingCheckout(null);
+        if (mode === "start") {
+          const options = await getCheckoutOptions(selectedTable);
+          if (options.branches?.length) {
+            setCheckoutPrompt(options);
+          } else {
+            await issueWorkingCopy("new", null, input);
+          }
+        } else {
+          await issueWorkingCopy(mode, branchId, input);
+        }
+      }
+    } catch (err) {
+      setFolderModalError(err.message);
+    }
+  };
+
+  const handleSaveEucStorageSettings = async (event) => {
+    event.preventDefault();
+    const input = folderSettingsInput.trim();
+    if (!isValidDrive(input)) {
+      setFolderSettingsMsg("Error: Directory must reside on C: or D: drive.");
+      return;
+    }
+    setFolderSettingsBusy(true);
+    setFolderSettingsMsg("");
+    try {
+      const res = await saveEucStorageSetting(input);
+      setEucDownloadDir(input);
+      localStorage.setItem("gitwalk:euc_download_dir", input);
+      setFolderSettingsMsg(`Directory saved! Local path: ${res.local_download_dir}`);
+    } catch (err) {
+      setFolderSettingsMsg(`Failed: ${err.message}`);
+    } finally {
+      setFolderSettingsBusy(false);
     }
   };
 
@@ -1354,14 +1453,18 @@ export default function App() {
 
   const handleMergeRequest = async () => {
     if (!window.confirm("Merge this approved branch into protected main?")) return;
-    setMergeBusy(true); setError("");
+    setMergeBusy(true); setError(""); setNotice("");
     try {
-      await mergeMergeRequest(mergeRequestDetail.merge_request_id);
+      const mergeResult = await mergeMergeRequest(mergeRequestDetail.merge_request_id);
       setSelectedBranchTable("");
       await Promise.all([refresh(), loadFoundation(), loadMergeRequests()]);
       const branchResult = await getRepositoryBranches(selectedTable);
       setBranches(branchResult.branches || []);
       setMergeRequestDetail(await getMergeRequest(mergeRequestDetail.merge_request_id));
+      const cleanupMsg = mergeResult?.cleanup?.message
+        ? ` ${mergeResult.cleanup.message}`
+        : " Local EUC Excel file deleted and branch removed from database.";
+      setNotice(`Branch merged into main successfully!${cleanupMsg}`);
     } catch (err) { setError(err.message); } finally { setMergeBusy(false); }
   };
 
@@ -1447,6 +1550,7 @@ export default function App() {
       const models = await getAIModels();
       setAiModels(models);
       setAiModel(models.default_model || aiConfigModel.trim());
+      setAiConfigModel(models.default_model || models.models[0] || "");
       setAiApiKey("");
       setShowAISetup(false);
     } catch (err) {
@@ -1462,6 +1566,7 @@ export default function App() {
       await clearAIConfig();
       const models = await getAIModels();
       setAiModels(models);
+      setAiConfigModel(models.default_model || models.models[0] || "");
       setShowAISetup(true);
     } catch (err) {
       setError(err.message);
@@ -1582,6 +1687,46 @@ export default function App() {
         </header>
 
         {error ? <div className="error-banner global"><span>{error}</span><button onClick={() => setError("")}>Dismiss</button></div> : null}
+        {notice ? <div className="notice-banner global"><span>{notice}</span><button onClick={() => setNotice("")}>Dismiss</button></div> : null}
+
+        {showFolderModal ? (
+          <div className="checkout-backdrop" role="presentation">
+            <section className="checkout-dialog folder-modal-dialog" role="dialog" aria-modal="true">
+              <button className="checkout-close" onClick={() => { setShowFolderModal(false); setPendingCheckout(null); }}>Close</button>
+              <p className="eyebrow">LOCAL EUC STORAGE</p>
+              <h2>Select Download Location</h2>
+              <p className="muted">
+                Please specify the local directory on <strong>C:</strong> or <strong>D:</strong> drive where your Excel workbook will be downloaded and tracked.
+                If the folder does not exist, it will be created automatically.
+              </p>
+              <form onSubmit={handleConfirmFolderModal}>
+                <label>
+                  <span>Directory Path (Must begin with C:\ or D:\)</span>
+                  <input
+                    type="text"
+                    value={folderModalInput}
+                    onChange={(event) => {
+                      setFolderModalInput(event.target.value);
+                      setFolderModalError("");
+                    }}
+                    placeholder="e.g. C:\GitWalk_Workbooks or D:\EUC_Files"
+                    autoFocus
+                    required
+                  />
+                </label>
+                {folderModalError ? <p className="form-error-inline">{folderModalError}</p> : null}
+                <div className="modal-actions-strip">
+                  <button type="button" className="secondary-button" onClick={() => { setShowFolderModal(false); setPendingCheckout(null); }}>
+                    Cancel
+                  </button>
+                  <button type="submit" className="primary-button">
+                    Save & Open in Excel
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
+        ) : null}
 
         {checkoutPrompt ? <div className="checkout-backdrop" role="presentation"><section className="checkout-dialog" role="dialog" aria-modal="true" aria-labelledby="checkout-title"><button className="checkout-close" onClick={() => setCheckoutPrompt(null)}>Close</button><p className="eyebrow">SIGNED WORKING COPY</p><h2 id="checkout-title">Resume a branch or start clean?</h2><p className="muted">A fresh Excel file will be generated either way. Resume keeps the selected branch history; new branch clones protected main.</p><div className="checkout-branch-list">{checkoutPrompt.branches.map((branch) => <button key={branch.branch_id} onClick={() => issueWorkingCopy("continue", branch.branch_id)} disabled={workingCopyBusy}><span><strong>{branch.branch_name}</strong><small>Last opened {branch.last_opened_at ? new Date(branch.last_opened_at).toLocaleString() : "not recorded"}</small></span><b>Resume</b></button>)}</div><button className="primary-button checkout-new" onClick={() => issueWorkingCopy("new")} disabled={workingCopyBusy}>{workingCopyBusy ? "Preparing workbook..." : "Create a new personal branch"}</button></section></div> : null}
 
@@ -1852,6 +1997,37 @@ export default function App() {
               <label>Business area<select value={repository?.category_id || "CAT_UNSORTED"} onChange={(event) => changeBusinessArea(event.target.value)}>{categories.filter((category) => category.category_id !== "CAT_HOME").map((category) => <option key={category.category_id} value={category.category_id}>{category.name}</option>)}</select></label>
               <form className="category-form" onSubmit={addBusinessArea}><select value={categoryParent} onChange={(event) => setCategoryParent(event.target.value)}>{categories.map((category) => <option key={category.category_id} value={category.category_id}>Under {category.name}</option>)}</select><input value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder="New business area" required /><button className="secondary-button">Create area</button></form>
             </section>
+            <section className="panel wide euc-storage-settings">
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">LOCAL EUC WORKBOOK STORAGE</p>
+                  <h2>Download & Working Copy Directory</h2>
+                  <p className="muted">Specify the local directory on C: or D: drive where branch workbooks are downloaded, saved, and lifecycle-managed. The folder will be automatically created if it does not exist.</p>
+                </div>
+                <span className={`pill ${eucDownloadDir ? "ready" : "pending"}`}>{eucDownloadDir ? "Configured" : "Not configured"}</span>
+              </div>
+              <form className="euc-storage-form" onSubmit={handleSaveEucStorageSettings}>
+                <label>
+                  <span>Local Directory Path (Strictly C: or D: drive)</span>
+                  <input
+                    value={folderSettingsInput}
+                    onChange={(event) => {
+                      setFolderSettingsInput(event.target.value);
+                      setFolderSettingsMsg("");
+                    }}
+                    placeholder="e.g. C:\GitWalk_Workbooks or D:\EUC_Files"
+                    required
+                  />
+                </label>
+                <div className="euc-storage-actions">
+                  <button className="primary-button" disabled={folderSettingsBusy}>
+                    {folderSettingsBusy ? "Validating & Saving..." : "Save Storage Directory"}
+                  </button>
+                  {eucDownloadDir ? <button type="button" className="secondary-button" onClick={() => setFolderSettingsInput(eucDownloadDir)}>Reset</button> : null}
+                  {folderSettingsMsg ? <span className="settings-feedback">{folderSettingsMsg}</span> : null}
+                </div>
+              </form>
+            </section>
             <section className="panel wide settings-sheets"><p className="eyebrow">STABLE SHEET IDs</p><h2>Repository worksheets</h2><div>{(repository?.sheets || []).map((sheet) => <article key={sheet.sheet_id}><span>{sheet.sheet_order + 1}</span><strong>{sheet.sheet_name}</strong><code>{sheet.sheet_id}</code></article>)}</div></section>
             <section className="panel wide security-posture"><div className="panel-header"><div><p className="eyebrow">SECURITY POSTURE / {securityPosture?.environment || "LOADING"}</p><h2>Production controls</h2></div><span className="pill ready">{Object.values(securityPosture?.controls || {}).filter(Boolean).length} enforced</span></div><div className="control-grid">{Object.entries(securityPosture?.controls || {}).map(([name, enabled]) => <article key={name} className={enabled ? "enabled" : "disabled"}><i>{enabled ? "ON" : "OFF"}</i><strong>{name.replaceAll("_", " ")}</strong></article>)}</div><div className="limit-strip"><span>Upload {Math.round((securityPosture?.upload_limits?.bytes || 0) / 1048576)} MB</span><span>{securityPosture?.upload_limits?.rows || 0} rows</span><span>{securityPosture?.upload_limits?.columns || 0} columns</span><span>{securityPosture?.upload_limits?.sheets || 0} sheets</span><span>{securityPosture?.upload_limits?.timeout_seconds || 0}s processing budget</span></div></section>
             {repository?.capabilities?.delete_repository ? <section className="panel wide danger-zone"><div><p className="eyebrow">OWNER / DANGER ZONE</p><h2>Delete repository</h2><p className="muted">Removes the repository from active work and revokes every signed branch checkout. Immutable audit evidence is retained.</p></div><button className="danger-button" onClick={handleDeleteRepository}>Delete {repository.repository_name}</button></section> : null}
@@ -1985,7 +2161,8 @@ export default function App() {
               <form className="ai-setup" onSubmit={configureAI}>
                 <div className="secret-heading"><div><strong>Connect your OpenRouter account</strong><span>Your key is encrypted before it is stored.</span></div><span className="security-chip">User scoped</span></div>
                 <label>OpenRouter API key<input type="password" value={aiApiKey} onChange={(event) => setAiApiKey(event.target.value)} placeholder="sk-or-v1-..." autoComplete="off" required /></label>
-                <label>Default model<input value={aiConfigModel} onChange={(event) => setAiConfigModel(event.target.value)} placeholder="provider/model" required /></label>
+                <label>Free NVIDIA model<select value={aiConfigModel} onChange={(event) => setAiConfigModel(event.target.value)} required>{aiModels.models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+                <small className="ai-privacy-note">Zero-price NVIDIA routes only. Free endpoints may be rate limited and provider-logged.</small>
                 <button className="primary-button" disabled={aiBusy}>{aiBusy ? "Saving securely..." : "Save and connect"}</button>
               </form>
             ) : (

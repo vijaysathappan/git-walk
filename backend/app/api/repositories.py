@@ -21,11 +21,15 @@ from ..database import (
     working_copy_checkout_options,
     user_can_access_branch,
     user_can_work_on_repository,
+    get_system_setting,
+    set_system_setting,
+    update_branch_local_path,
 )
-from ..schemas import BranchCreateRequest, CategoryCreateRequest, RepositoryCategoryRequest, WorkingCopyRequest
+from ..schemas import BranchCreateRequest, CategoryCreateRequest, RepositoryCategoryRequest, WorkingCopyRequest, EucStorageSettingsRequest
 from ..security import Principal, current_principal
 from ..repositories.merge_store import branch_context
 from ..services.workbook_service import export_branch_workbook, issue_branch_workbook
+from ..services.branch_lifecycle_manager import validate_storage_drive
 from ..observability import record_audit_event
 
 
@@ -213,6 +217,44 @@ async def remove_branch(
     return result
 
 
+@router.get("/settings/euc-storage")
+async def get_euc_storage_setting(_principal: Principal = Depends(current_principal)):
+    stored_dir = get_system_setting("euc_download_dir", "")
+    exists = False
+    if stored_dir:
+        try:
+            p = validate_storage_drive(stored_dir)
+            exists = p.exists() and p.is_dir()
+        except Exception:
+            exists = False
+    return {
+        "local_download_dir": stored_dir or "",
+        "exists": exists,
+    }
+
+
+@router.post("/settings/euc-storage")
+async def save_euc_storage_setting(
+    payload: EucStorageSettingsRequest,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        valid_dir = validate_storage_drive(payload.local_download_dir)
+        valid_dir.mkdir(parents=True, exist_ok=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed creating directory: {exc}") from exc
+
+    set_system_setting("euc_download_dir", str(valid_dir), principal.user_id)
+    return {
+        "status": "SAVED",
+        "local_download_dir": str(valid_dir),
+        "exists": True,
+        "message": f"EUC download folder set to: {valid_dir}",
+    }
+
+
 @router.post("/repositories/{table_id}/work-on-workbook")
 async def work_on_workbook(
     table_id: str,
@@ -222,17 +264,41 @@ async def work_on_workbook(
     normalized = table_id.strip().upper()
     if not user_can_work_on_repository(normalized, principal.user_id):
         raise HTTPException(status_code=403, detail="Editor access is required to create a branch")
+
+    target_dir_str = payload.local_download_dir or get_system_setting("euc_download_dir")
+    local_saved_file: Path | None = None
+    if target_dir_str:
+        try:
+            local_target_dir = validate_storage_drive(target_dir_str)
+            local_target_dir.mkdir(parents=True, exist_ok=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed accessing local directory: {exc}") from exc
+    else:
+        local_target_dir = None
+
     try:
         result = issue_branch_workbook(
             normalized, principal.user_id, principal.email,
             branch_mode=payload.mode, branch_id=payload.branch_id,
+            local_target_dir=str(local_target_dir) if local_target_dir else None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    filename = f"gitwalk_{result['branch_name'].replace('/', '_')}.xlsx"
+    local_saved_file = None
+
+    if local_target_dir:
+        local_saved_file = Path(result.get("local_file_path") or (local_target_dir / filename))
+        shutil.copy2(result["path"], local_saved_file)
+        update_branch_local_path(result["branch_id"], str(local_saved_file))
+
     response = FileResponse(
         result["path"],
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"gitwalk_{result['branch_name'].replace('/', '_')}.xlsx",
+        filename=filename,
         background=BackgroundTask(shutil.rmtree, Path(result["path"]).parent, True),
     )
     response.headers["X-Table-ID"] = normalized
@@ -240,17 +306,20 @@ async def work_on_workbook(
     response.headers["X-Repository-ID"] = result["repository_id"]
     response.headers["X-Branch-ID"] = result["branch_id"]
     response.headers["X-Working-Copy-ID"] = result["working_copy_id"]
+    if local_saved_file:
+        response.headers["X-Local-Path"] = str(local_saved_file)
+
     record_audit_event(
         "WORKING_COPY_CREATED", actor_user_id=principal.user_id,
         repository_id=result["repository_id"], branch_id=result["branch_id"],
         working_copy_id=result["working_copy_id"],
-        payload={"branch_name": result["branch_name"]},
+        payload={"branch_name": result["branch_name"], "local_path": str(local_saved_file) if local_saved_file else None},
     )
     record_audit_event(
         "WORKBOOK_DOWNLOADED", actor_user_id=principal.user_id,
         repository_id=result["repository_id"], branch_id=result["branch_id"],
         working_copy_id=result["working_copy_id"],
-        payload={"purpose": "working_copy"},
+        payload={"purpose": "working_copy", "local_path": str(local_saved_file) if local_saved_file else None},
     )
     return response
 

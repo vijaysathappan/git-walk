@@ -16,7 +16,6 @@ import shutil
 import sqlite3
 import tempfile
 import urllib.error
-import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -66,6 +65,8 @@ from .database import (
     user_can_edit_table,
     validate_working_copy,
     validate_identifier,
+    verify_workbook_access,
+    set_user_password,
     working_copy_required,
 )
 from .api.repositories import router as repositories_router
@@ -78,6 +79,11 @@ from .api.administration import router as administration_router
 from .api.integrations import router as integrations_router
 from .api.ai_platform import router as ai_platform_router
 from .access_control.service import primary_organization
+from .ai.catalog import (
+    NVIDIA_FREE_MODEL_DEFAULTS,
+    fetch_free_nvidia_models,
+    is_free_nvidia_model_id,
+)
 from .ai.service import ai_service
 from .schemas import (
     AIConfigRequest,
@@ -88,6 +94,8 @@ from .schemas import (
     LoginRequest,
     LoginVerifyRequest,
     WorkbookAuthRequest,
+    WorkbookVerifyRequest,
+    SetPasswordRequest,
     PresenceRequest,
     RollbackRequest,
     SyncRequest,
@@ -342,20 +350,6 @@ def _ai_credentials(principal: Principal) -> tuple[str, str, bool]:
     return settings.openrouter_api_key, settings.openrouter_model, False
 
 
-def _openrouter_models(api_key: str) -> list[str]:
-    request = urllib.request.Request(
-        "https://openrouter.ai/api/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-        method="GET",
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    return sorted(
-        item["id"] for item in payload.get("data", [])
-        if isinstance(item, dict) and item.get("id")
-    )
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Endpoints
 # ═══════════════════════════════════════════════════════════════════════════
@@ -416,6 +410,63 @@ async def authenticate_workbook(payload: WorkbookAuthRequest):
         working_copy_id=payload.working_copy_id,
     )
     return {"token": token, "user": user}
+
+
+@app.post("/api/v1/auth/workbook-verify")
+async def verify_workbook(payload: WorkbookVerifyRequest):
+    try:
+        access_result = verify_workbook_access(
+            repository_id=payload.repository_id,
+            branch_id=payload.branch_id,
+            working_copy_id=payload.working_copy_id,
+            email=payload.email,
+            code=payload.code,
+            current_file_path=payload.current_file_path,
+        )
+    except PermissionError as exc:
+        reason = str(exc)
+        status_code = 403 if "FILE_PATH_MISMATCH" in reason or "INSUFFICIENT_ROLE" in reason else 401
+        record_security_event(
+            "WORKBOOK_VERIFY_REJECTED",
+            details={
+                "working_copy_id": payload.working_copy_id,
+                "current_file_path": payload.current_file_path,
+                "email": payload.email,
+                "reason": reason,
+            },
+        )
+        raise HTTPException(status_code=status_code, detail=reason) from exc
+
+    user = access_result["user"]
+    token = access_result["token"]
+    table_id = access_result["table_id"]
+    snapshot = get_table_snapshot(table_id)
+
+    record_audit_event(
+        "WORKBOOK_VERIFIED_AND_LOADED",
+        actor_user_id=user["user_id"],
+        repository_id=payload.repository_id,
+        branch_id=payload.branch_id,
+        working_copy_id=payload.working_copy_id,
+        payload={"local_file_path": payload.current_file_path, "role": access_result["role"]},
+    )
+    return {
+        "success": True,
+        "token": token,
+        "user": user,
+        "role": access_result["role"],
+        "table_id": table_id,
+        "snapshot": snapshot,
+    }
+
+
+@app.post("/api/v1/auth/set-password")
+async def handle_set_password(payload: SetPasswordRequest):
+    try:
+        user = set_user_password(payload.user_id_or_email, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "password_set", "user_id": user["user_id"], "email": user["email"]}
 
 
 @app.get("/api/v1/auth/me")
@@ -1023,18 +1074,25 @@ async def export_dataset(
 @app.get("/api/v1/ai/models")
 async def ai_models(principal: Principal = Depends(current_principal)):
     api_key, model, user_configured = _ai_credentials(principal)
-    models = settings.openrouter_models
-    if api_key:
-        try:
-            models = _openrouter_models(api_key)
-        except Exception:
-            models = list(dict.fromkeys([model, *settings.openrouter_models]))
+    models = list(settings.openrouter_models or NVIDIA_FREE_MODEL_DEFAULTS)
+    try:
+        live_models = fetch_free_nvidia_models(api_key or None)
+        if live_models:
+            models = live_models
+    except Exception:
+        pass
+    models = list(dict.fromkeys(item for item in models if is_free_nvidia_model_id(item)))
+    selected_model = model if model in models else (models[0] if models else None)
     return {
         "configured": bool(api_key),
         "user_configured": user_configured,
         "masked_key": f"...{api_key[-4:]}" if api_key else None,
-        "default_model": model,
+        "default_model": selected_model,
         "models": models,
+        "provider": "OPENROUTER",
+        "catalog": "NVIDIA_FREE",
+        "free_only": True,
+        "requires_model_update": bool(model and model != selected_model),
     }
 
 
@@ -1047,20 +1105,52 @@ async def save_ai_config(
     model = payload.model.strip()
     if not api_key.startswith("sk-or-"):
         raise HTTPException(status_code=400, detail="Enter a valid OpenRouter API key.")
-    if not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
-        raise HTTPException(status_code=400, detail="Invalid OpenRouter model identifier.")
+    if not is_free_nvidia_model_id(model):
+        raise HTTPException(
+            status_code=400,
+            detail="Select a free NVIDIA OpenRouter model from the approved catalogue.",
+        )
+    try:
+        available_models = fetch_free_nvidia_models(api_key)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise HTTPException(status_code=400, detail="OpenRouter rejected this API key.") from exc
+        raise HTTPException(status_code=503, detail="OpenRouter model validation is temporarily unavailable.") from exc
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="OpenRouter model validation is temporarily unavailable.") from exc
+    if model not in available_models:
+        raise HTTPException(
+            status_code=400,
+            detail="That model is not currently published by OpenRouter as a zero-price NVIDIA text model.",
+        )
+    replacing = get_user_ai_settings(principal.user_id) is not None
     save_user_ai_settings(principal.user_id, encrypt_secret(api_key), model)
+    record_audit_event(
+        "AI_PROVIDER_CREDENTIAL_REPLACED" if replacing else "AI_PROVIDER_CREDENTIAL_CONNECTED",
+        actor_user_id=principal.user_id,
+        payload={"provider": "OPENROUTER", "model": model, "free_only": True},
+    )
     return {
         "configured": True,
         "user_configured": True,
         "masked_key": f"...{api_key[-4:]}",
         "default_model": model,
+        "models": available_models,
+        "provider": "OPENROUTER",
+        "catalog": "NVIDIA_FREE",
+        "free_only": True,
+        "replaced": replacing,
     }
 
 
 @app.delete("/api/v1/ai/config")
 async def clear_ai_config(principal: Principal = Depends(current_principal)):
     delete_user_ai_settings(principal.user_id)
+    record_audit_event(
+        "AI_PROVIDER_CREDENTIAL_DISCONNECTED",
+        actor_user_id=principal.user_id,
+        payload={"provider": "OPENROUTER"},
+    )
     return {"configured": bool(settings.openrouter_api_key)}
 
 

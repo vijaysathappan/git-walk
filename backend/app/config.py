@@ -1,6 +1,8 @@
 """Environment-backed application settings."""
 
 import os
+
+from .ai.catalog import NVIDIA_FREE_MODEL_DEFAULTS, is_free_nvidia_model_id
 import secrets
 from pathlib import Path
 
@@ -151,12 +153,20 @@ class Settings:
     )
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
     openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
-    openrouter_model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
+    openrouter_model = os.getenv(
+        "OPENROUTER_MODEL", NVIDIA_FREE_MODEL_DEFAULTS[0]
+    ).strip()
     openrouter_models = [
         item.strip()
-        for item in os.getenv("OPENROUTER_MODELS", openrouter_model).split(",")
-        if item.strip()
+        for item in os.getenv(
+            "OPENROUTER_MODELS", ",".join(NVIDIA_FREE_MODEL_DEFAULTS)
+        ).split(",")
+        if is_free_nvidia_model_id(item)
     ]
+    if not is_free_nvidia_model_id(openrouter_model):
+        openrouter_model = NVIDIA_FREE_MODEL_DEFAULTS[0]
+    if openrouter_model not in openrouter_models:
+        openrouter_models.insert(0, openrouter_model)
 
 
 settings = Settings()

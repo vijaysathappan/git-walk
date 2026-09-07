@@ -50,6 +50,7 @@ class AgentRunRequest(BaseModel):
     resource_id: str | None = Field(default=None, max_length=160)
     repository_id: str | None = Field(default=None, max_length=100)
     node_id: str | None = Field(default=None, max_length=100)
+    model: str | None = Field(default=None, max_length=240)
     requested_action: dict[str, Any] | None = None
 
 

@@ -106,6 +106,20 @@ class WorkbookAuthRequest(BaseModel):
     signature: str = Field(..., min_length=32, max_length=128)
 
 
+class WorkbookVerifyRequest(BaseModel):
+    repository_id: str = Field(..., min_length=4, max_length=80)
+    branch_id: str = Field(..., min_length=4, max_length=80)
+    working_copy_id: str = Field(..., min_length=4, max_length=80)
+    email: str = Field(..., min_length=3, max_length=120)
+    code: str = Field(..., min_length=6, max_length=6)
+    current_file_path: str = Field(..., min_length=1, max_length=500)
+
+
+class SetPasswordRequest(BaseModel):
+    user_id_or_email: str = Field(..., min_length=3, max_length=120)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
 class BulkCellChange(BaseModel):
     row_id: int = Field(..., ge=1)
     column_name: str
@@ -182,6 +196,11 @@ class RepositoryCategoryRequest(BaseModel):
 class WorkingCopyRequest(BaseModel):
     mode: str = Field(default="continue", pattern="^(continue|new)$")
     branch_id: str | None = Field(default=None, min_length=4, max_length=80)
+    local_download_dir: str | None = Field(default=None, max_length=500)
+
+
+class EucStorageSettingsRequest(BaseModel):
+    local_download_dir: str = Field(..., min_length=2, max_length=500)
 
 
 class BranchCreateRequest(BaseModel):

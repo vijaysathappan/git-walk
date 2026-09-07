@@ -36,6 +36,8 @@ WORKBOOK_METADATA_NAMES = {
     "base_commit_id": "_GITWALK_BASE_COMMIT_ID",
     "issued_at": "_GITWALK_ISSUED_AT",
     "signature": "_GITWALK_SIGNATURE",
+    "local_file_path": "_GITWALK_LOCAL_FILE_PATH",
+    "required_role": "_GITWALK_REQUIRED_ROLE",
 }
 
 # Register all namespaces so ET doesn't mangle prefixes

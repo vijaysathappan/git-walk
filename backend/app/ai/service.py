@@ -13,6 +13,7 @@ from ..access_control.engine import ResourceContext, authorization_engine
 from ..integrations.service import integration_service
 from ..observability import record_audit_event
 from ..services.semantic_ledger_service import ledger_for_connection
+from .catalog import is_free_nvidia_model_id
 from .gateway import AIGateway, StructuredOutputService, ai_gateway
 from .retrieval import INJECTION_PATTERNS, evidence_retriever
 
@@ -180,6 +181,7 @@ class AIService:
         try:
             step = self._record_agent_step(run_id, 1, "PLAN", "COMPLETED", "Classified the goal and selected only registered tools") ; steps.append(step)
             chat_result = await self.chat(organization_id, user_id, {"question": payload["goal"], "feature": "AGENT_INVESTIGATION",
+                                                                   "model": payload.get("model"),
                                                                       "repository_id": payload.get("repository_id"), "node_id": payload.get("node_id"),
                                                                       "resource_type": payload.get("resource_type", "ORGANIZATION"), "resource_id": payload.get("resource_id")})
             tool_names = {
@@ -374,7 +376,10 @@ class AIService:
         try:
             self._ensure_settings(conn, organization_id, user_id); conn.commit()
             settings_row = conn.execute("SELECT * FROM AI_ORGANIZATION_SETTINGS WHERE ORGANIZATION_ID=?", (organization_id,)).fetchone()
-            models = [_row(row) for row in conn.execute("SELECT * FROM AI_MODELS ORDER BY PRIORITY")]
+            models = [
+                _row(row) for row in conn.execute("SELECT * FROM AI_MODELS ORDER BY PRIORITY")
+                if is_free_nvidia_model_id(row["MODEL_SLUG"])
+            ]
             policies = [_row(row) for row in conn.execute("SELECT * FROM AI_MODEL_POLICIES WHERE ORGANIZATION_ID=? ORDER BY FEATURE", (organization_id,))]
             agents = [_row(row) for row in conn.execute("SELECT * FROM AI_AGENTS ORDER BY NAME")]
             tools = [_row(row) for row in conn.execute("SELECT * FROM AI_TOOLS ORDER BY RISK_LEVEL,TOOL_NAME")]
@@ -404,8 +409,15 @@ class AIService:
         self._require(user_id, "ai.admin", organization_id); conn = database._get_connection(); now = database._utcnow()
         try:
             model_id = payload.get("model_id") or None
-            if model_id and not conn.execute("SELECT 1 FROM AI_MODELS WHERE MODEL_ID=? AND ENABLED=1", (model_id,)).fetchone():
-                raise KeyError("Enabled AI model does not exist")
+            if model_id:
+                model = conn.execute(
+                    "SELECT MODEL_SLUG FROM AI_MODELS WHERE MODEL_ID=? AND ENABLED=1",
+                    (model_id,),
+                ).fetchone()
+                if not model:
+                    raise KeyError("Enabled AI model does not exist")
+                if not is_free_nvidia_model_id(model["MODEL_SLUG"]):
+                    raise PermissionError("Only free NVIDIA OpenRouter models may be assigned to AI policies")
             classifications = [str(item).upper() for item in payload.get("allowed_classifications", ["PUBLIC", "INTERNAL"])]
             conn.execute(
                 """INSERT INTO AI_MODEL_POLICIES

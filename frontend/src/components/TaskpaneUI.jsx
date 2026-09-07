@@ -15,6 +15,8 @@ import {
   requestLoginCode,
   syncBranchWithMain,
   verifyLoginCode,
+  verifyWorkbookAccess,
+  setUserPassword,
 } from "../services/api";
 
 const TABLE_ID_DEFINED_NAME = "_EXCEL_SQLITE_SYNC_TABLE_ID";
@@ -26,9 +28,31 @@ const WORKBOOK_METADATA_NAMES = {
   base_commit_id: "_GITWALK_BASE_COMMIT_ID",
   issued_at: "_GITWALK_ISSUED_AT",
   signature: "_GITWALK_SIGNATURE",
+  local_file_path: "_GITWALK_LOCAL_FILE_PATH",
+  required_role: "_GITWALK_REQUIRED_ROLE",
 };
 const ROW_ID_HEADER = "__GITWALK_ROW_ID";
 const LEGACY_ROW_ID_HEADER = "__LIVESYNC_ROW_ID";
+
+function normalizeFilePath(rawPath) {
+  if (!rawPath || typeof rawPath !== "string") return "";
+  let decoded = "";
+  try {
+    decoded = decodeURIComponent(rawPath.trim());
+  } catch {
+    decoded = rawPath.trim();
+  }
+  if (decoded.toLowerCase().startsWith("file:///")) {
+    decoded = decoded.slice(8);
+  } else if (decoded.toLowerCase().startsWith("file://")) {
+    decoded = decoded.slice(7);
+  }
+  decoded = decoded.replace(/\//g, "\\");
+  while (decoded.length >= 3 && decoded[0] === "\\" && decoded[2] === ":") {
+    decoded = decoded.slice(1);
+  }
+  return decoded.replace(/\\+$/, "").toLowerCase();
+}
 
 function clientStableId(prefix) {
   const random = globalThis.crypto?.randomUUID?.().replace(/-/g, "").toUpperCase()
@@ -686,6 +710,159 @@ const buttonStyle = {
   cursor: "pointer", boxShadow: "0 4px 14px rgba(35,134,54,.18)",
 };
 
+function PathBlockedPanel({ expectedPath, currentPath }) {
+  return (
+    <div style={containerStyle}>
+      <div style={{ marginTop: 25 }}>
+        <div style={{ color: "#f85149", fontSize: 10, fontWeight: 800, letterSpacing: ".14em" }}>
+          SECURITY ACCESS BLOCKED
+        </div>
+        <h1 style={{ margin: "8px 0", fontSize: 23, color: "#ff8b82" }}>Unauthorized Location</h1>
+        <p style={{ color: "#c9d1d9", fontSize: 11, lineHeight: 1.6 }}>
+          This workbook cannot load server data because its current file location does not match the authorized path injected during download.
+        </p>
+      </div>
+      <div style={{ ...cardStyle, borderColor: "#f85149", background: "rgba(248,81,73,0.08)", marginTop: 14 }}>
+        <div style={{ ...labelStyle, color: "#ff8b82" }}>Authorized Download Location</div>
+        <div style={{ color: "#75ead0", fontSize: 10, fontFamily: "Consolas, monospace", wordBreak: "break-all", marginBottom: 12 }}>
+          {expectedPath || "Not specified"}
+        </div>
+
+        <div style={{ ...labelStyle, color: "#ff8b82" }}>Current Open Location</div>
+        <div style={{ color: "#ffaaa3", fontSize: 10, fontFamily: "Consolas, monospace", wordBreak: "break-all" }}>
+          {currentPath || "Copied / moved outside authorized directory"}
+        </div>
+      </div>
+
+      <div style={{ ...cardStyle, marginTop: 12 }}>
+        <div style={{ ...labelStyle, color: "#e3b341" }}>Copy & Leak Protection</div>
+        <p style={{ color: "#8fa4af", fontSize: 11, lineHeight: 1.6, margin: 0 }}>
+          To prevent unauthorized copies and leakage of EUC data, this workbook is cryptographically locked to its registered download folder. Please open the workbook from:
+        </p>
+        <div style={{ color: "#58a6ff", fontSize: 10, fontFamily: "Consolas, monospace", marginTop: 8, wordBreak: "break-all" }}>
+          {expectedPath}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WorkbookVerificationPanel({ embeddedInfo, onVerifiedAndLoaded }) {
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [note, setNote] = useState("");
+
+  const submit = async (e) => {
+    if (e) e.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      if (!sent) {
+        const result = await requestLoginCode(email.trim());
+        setSent(true);
+        setNote(result.dev_otp ? `Local code: ${result.dev_otp}` : "Check your email for the 6-digit code.");
+        if (result.dev_otp) setCode(result.dev_otp);
+      } else {
+        const currentDocPath = (typeof Office !== "undefined" && Office?.context?.document?.url)
+          ? Office.context.document.url
+          : (embeddedInfo.local_file_path || "");
+        const result = await verifyWorkbookAccess({
+          repository_id: embeddedInfo.repository_id,
+          branch_id: embeddedInfo.branch_id,
+          working_copy_id: embeddedInfo.working_copy_id,
+          email: email.trim(),
+          code: code.trim(),
+          current_file_path: currentDocPath,
+        });
+        await onVerifiedAndLoaded(result);
+      }
+    } catch (err) {
+      setError(err.message || "Verification failed. Check your code and role.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={containerStyle}>
+      <div style={{ marginTop: 20 }}>
+        <div style={{ color: "#58a6ff", fontSize: 10, fontWeight: 800, letterSpacing: ".14em" }}>
+          GIT WALK / ACCESS VERIFICATION
+        </div>
+        <h1 style={{ margin: "6px 0", fontSize: 22 }}>Verify Identity & Role</h1>
+        <p style={{ color: "#8fa4af", fontSize: 11, lineHeight: 1.5 }}>
+          Authorized location verified. Authenticate via verification code to confirm your role and load branch data.
+        </p>
+      </div>
+
+      <div style={{ ...cardStyle, background: "#15222e", borderColor: "#1f4a6e", marginBottom: 12, padding: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#75ead0", fontSize: 10, fontWeight: 700 }}>
+          <span>✓</span> Path Verified on Authorized Drive
+        </div>
+        <div style={{ color: "#8fa4af", fontSize: 9, marginTop: 4, wordBreak: "break-all", fontFamily: "Consolas, monospace" }}>
+          {embeddedInfo.local_file_path}
+        </div>
+        <div style={{ marginTop: 6, display: "flex", justifyContent: "space-between", fontSize: 10, color: "#8fa4af" }}>
+          <span>Branch: <strong style={{ color: "#fff" }}>{embeddedInfo.branch_name || embeddedInfo.branch_id}</strong></span>
+        </div>
+      </div>
+
+      <form onSubmit={submit} style={{ ...cardStyle, display: "grid", gap: 11 }}>
+        <div>
+          <div style={labelStyle}>Work email</div>
+          <input
+            style={inputStyle}
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="name@company.com"
+            disabled={sent || busy}
+            autoFocus
+          />
+        </div>
+        {sent ? (
+          <div>
+            <div style={labelStyle}>6-digit verification code</div>
+            <input
+              style={inputStyle}
+              value={code}
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              placeholder="123456"
+              disabled={busy}
+              autoFocus
+            />
+          </div>
+        ) : null}
+        {note ? <div style={{ color: "#75ead0", fontSize: 11 }}>{note}</div> : null}
+        {error ? (
+          <div style={{ color: "#ff8b82", fontSize: 11, background: "rgba(248,81,73,0.1)", border: "1px solid rgba(248,81,73,0.3)", padding: "8px 10px", borderRadius: 4, lineHeight: 1.4 }}>
+            {error}
+          </div>
+        ) : null}
+        <button
+          style={{ ...buttonStyle, marginTop: 4 }}
+          disabled={busy || !email.trim() || (sent && code.length !== 6)}
+          type="submit"
+        >
+          {busy ? "Working..." : sent ? "Verify & Load Data" : "Email me a code"}
+        </button>
+        {sent ? (
+          <button
+            type="button"
+            style={{ background: "transparent", border: 0, color: "#58a6ff", fontSize: 11, cursor: "pointer", textAlign: "center", padding: "4px 0" }}
+            onClick={() => { setSent(false); setCode(""); setError(""); setNote(""); }}
+          >
+            Use a different email
+          </button>
+        ) : null}
+      </form>
+    </div>
+  );
+}
+
 function AuthPanel({ onAuthenticated }) {
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
@@ -729,6 +906,10 @@ function AuthPanel({ onAuthenticated }) {
 export default function TaskpaneUI() {
   const [auth, setAuth] = useState(getStoredAuth());
   const [authBootstrapping, setAuthBootstrapping] = useState(true);
+  const [embeddedInfo, setEmbeddedInfo] = useState(null);
+  const [pathBlocked, setPathBlocked] = useState(false);
+  const [pathDetails, setPathDetails] = useState({ expected: "", current: "" });
+  const [workbookVerified, setWorkbookVerified] = useState(false);
   const [tableId, setTableId] = useState("");
   const [connected, setConnected] = useState(false);
   const [syncStatus, setSyncStatus] = useState("idle");
@@ -1240,24 +1421,69 @@ export default function TaskpaneUI() {
     (async () => {
       try {
         const embedded = await getEmbeddedIdentity();
-        if (!embedded?.working_copy_id || !embedded?.signature) return;
+        if (!embedded?.working_copy_id) {
+          setAuthBootstrapping(false);
+          return;
+        }
+        setEmbeddedInfo(embedded);
         setBranchName(embedded.branch_name || "");
         workbookIdentityRef.current = Object.fromEntries(
           Object.entries(embedded).filter(([key]) => key !== "table_id" && key !== "branch_name")
         );
-        setAuth(await authenticateWorkbook(Object.fromEntries(
-          Object.entries(embedded).filter(([key]) => key !== "branch_name")
-        )));
+
+        // Path Verification check:
+        if (embedded.local_file_path) {
+          const docUrl = (typeof Office !== "undefined" && Office?.context?.document?.url)
+            ? Office.context.document.url
+            : "";
+          const expected = normalizeFilePath(embedded.local_file_path);
+          const current = normalizeFilePath(docUrl);
+          if (!current || expected !== current) {
+            setPathBlocked(true);
+            setPathDetails({
+              expected: embedded.local_file_path,
+              current: docUrl || "Unknown location (file outside authorized directory)",
+            });
+            addLog(`Security Alert: Workbook path mismatch. Expected: ${embedded.local_file_path}, Current: ${docUrl}`, true);
+            setAuthBootstrapping(false);
+            return;
+          }
+          addLog(`Path verification passed for authorized location.`);
+        }
       } catch (err) {
-        addLog(`Signed workbook login unavailable: ${err.message}`, true);
+        addLog(`Workbook initialization check failed: ${err.message}`, true);
       } finally {
         setAuthBootstrapping(false);
       }
     })();
   }, [addLog, getEmbeddedIdentity]);
 
+  const handleVerifiedAndLoaded = useCallback(async (result) => {
+    setBusy(true);
+    try {
+      setAuth({ token: result.token, user: result.user });
+      setWorkbookVerified(true);
+      setTableId(result.table_id);
+      addLog(`Verified role '${result.role}' for ${result.user.email}.`);
+      if (result.snapshot) {
+        addLog("Loading branch dataset into workbook...");
+        await writeSnapshot(result.snapshot);
+        baselineRef.current = result.snapshot;
+        await saveBaseVersion(result.snapshot.version, result.table_id, result.snapshot.head_commit_id);
+        setBaseVersion(result.snapshot.version);
+      }
+      await connect(result.table_id);
+      addLog("Branch data loaded and synchronized. Ready to edit.");
+    } catch (err) {
+      addLog(`Failed loading branch data: ${err.message}`, true);
+    } finally {
+      setBusy(false);
+    }
+  }, [addLog, connect, saveBaseVersion, writeSnapshot]);
+
   useEffect(() => {
     if (!auth || autoConnectedRef.current) return;
+    if (embeddedInfo?.working_copy_id && !workbookVerified) return;
     autoConnectedRef.current = true;
     (async () => {
       const embedded = await getEmbeddedIdentity();
@@ -1269,26 +1495,50 @@ export default function TaskpaneUI() {
       if (embedded?.table_id || saved) await connect(embedded?.table_id || saved);
       else addLog("No embedded Table ID found. Enter it once to connect.");
     })();
-  }, [addLog, auth, connect, getEmbeddedIdentity]);
+  }, [addLog, auth, connect, embeddedInfo, getEmbeddedIdentity, workbookVerified]);
 
   const signOut = useCallback(async () => {
     if (connected) await disconnect();
     await logout().catch(() => clearAuth());
-    setAuth(null); setTableId(""); setBranchName(""); setLogs([]); autoConnectedRef.current = false;
+    setAuth(null);
+    setWorkbookVerified(false);
+    setTableId("");
+    setBranchName("");
+    setLogs([]);
+    autoConnectedRef.current = false;
     workbookIdentityRef.current = null;
   }, [connected, disconnect]);
+
+  if (pathBlocked) {
+    return (
+      <PathBlockedPanel
+        expectedPath={pathDetails.expected}
+        currentPath={pathDetails.current}
+      />
+    );
+  }
 
   if (authBootstrapping) return (
     <div style={containerStyle}>
       <div style={{ ...cardStyle, marginTop: 30 }}>
         <div style={labelStyle}>SIGNED BRANCH</div>
-        <h2 style={{ margin: "8px 0" }}>Opening your workspace</h2>
+        <h2 style={{ margin: "8px 0" }}>Verifying location & branch</h2>
         <p style={{ color: "#8fa4af", fontSize: 11, lineHeight: 1.6 }}>
-          Verifying the workbook identity and restoring its branch session.
+          Checking file path authorization and loading workspace...
         </p>
       </div>
     </div>
   );
+
+  if (embeddedInfo?.working_copy_id && !workbookVerified) {
+    return (
+      <WorkbookVerificationPanel
+        embeddedInfo={embeddedInfo}
+        onVerifiedAndLoaded={handleVerifiedAndLoaded}
+      />
+    );
+  }
+
   if (!auth?.token) return <AuthPanel onAuthenticated={setAuth} />;
   const summary = staged || {
     changeCount: dirty ? "?" : 0,

@@ -17,6 +17,7 @@ from .. import database
 from ..config import settings
 from ..secret_store import decrypt_secret
 from ..services.semantic_ledger_service import ledger_for_connection
+from .catalog import is_free_nvidia_model_id, supports_structured_output
 from .provider import AIProviderError, LLMProvider, ProviderResult, providers
 
 
@@ -45,6 +46,39 @@ class GroundedAnswer(BaseModel):
     warnings: list[str] = Field(default_factory=list, max_length=20)
 
 
+GROUNDED_ANSWER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "answer": {"type": "string"},
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"type": {"type": "string"}, "id": {"type": "string"}},
+                "required": ["type", "id"],
+            },
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "insufficient_evidence": {"type": "boolean"},
+        "recommended_actions": {
+            "type": "array",
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"}, "rationale": {"type": "string"},
+                    "action_type": {"type": "string"},
+                    "risk_level": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+                },
+                "required": ["title", "rationale", "action_type", "risk_level"],
+            },
+        },
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["answer", "evidence", "confidence", "insufficient_evidence", "recommended_actions", "warnings"],
+}
+
+
 class StructuredOutputService:
     @staticmethod
     def parse(raw: str) -> GroundedAnswer:
@@ -58,6 +92,18 @@ class StructuredOutputService:
             if start >= 0 and end > start:
                 return GroundedAnswer.model_validate_json(candidate[start:end + 1])
             raise
+
+    @staticmethod
+    def safe_fallback(raw: str) -> GroundedAnswer | None:
+        candidate = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE).strip()
+        candidate = re.sub(r"^```(?:json|markdown)?\s*|\s*```$", "", candidate, flags=re.IGNORECASE).strip()
+        if not candidate:
+            return None
+        return GroundedAnswer(
+            answer=candidate[:12000], evidence=[], confidence=0,
+            insufficient_evidence=True, recommended_actions=[],
+            warnings=["The free model returned an unstructured answer. Treat it as advisory until evidence citations are available."],
+        )
 
 
 @dataclass(frozen=True)
@@ -98,6 +144,11 @@ class AIGateway:
             if classification.upper() not in policy_classifications:
                 raise PermissionError(f"The {feature} model policy excludes {classification} data")
         user_key, user_model = self.credentials(user_id); model_slug = requested_model or user_model
+        if model_slug and not is_free_nvidia_model_id(model_slug):
+            raise AIProviderError(
+                "AI_MODEL_NOT_ALLOWED",
+                "Git Walk only permits free NVIDIA OpenRouter models.",
+            )
         if policy and policy["MODEL_ID"]:
             model = conn.execute("SELECT * FROM AI_MODELS WHERE MODEL_ID=? AND ENABLED=1", (policy["MODEL_ID"],)).fetchone()
             if requested_model and model and requested_model != model["MODEL_SLUG"]:
@@ -114,6 +165,11 @@ class AIGateway:
             model = conn.execute("SELECT * FROM AI_MODELS WHERE MODEL_ROLE=? AND ENABLED=1 ORDER BY PRIORITY LIMIT 1", (role,)).fetchone()
             if not model: model = conn.execute("SELECT * FROM AI_MODELS WHERE ENABLED=1 ORDER BY PRIORITY LIMIT 1").fetchone()
         if not model: raise AIProviderError("AI_MODEL_UNAVAILABLE", "No enabled AI model satisfies this request")
+        if not is_free_nvidia_model_id(model["MODEL_SLUG"]):
+            raise AIProviderError(
+                "AI_MODEL_NOT_ALLOWED",
+                "The active route is not a free NVIDIA OpenRouter model.",
+            )
         if policy and model["MODEL_ROLE"] != policy["MODEL_ROLE"]:
             raise PermissionError("The selected model does not satisfy the active feature capability policy")
         if policy and not policy["ALLOW_EXTERNAL"] and model["PROVIDER"] != "LOCAL":
@@ -139,6 +195,7 @@ class AIGateway:
     async def generate(self, *, organization_id: str, user_id: str, feature: str, question: str,
                        evidence: list[dict[str, Any]], context_hash: str, conversation_id: str | None = None,
                        requested_model: str | None = None, classification: str = "INTERNAL") -> dict[str, Any]:
+        request_started = time.perf_counter()
         conn = database._get_connection(); now = database._utcnow(); request_id = _id("AIRQ")
         try:
             self.enforce_quota(conn, organization_id, user_id)
@@ -154,10 +211,15 @@ class AIGateway:
                              (request_id, item["type"], item["id"], item.get("source_hash"), item.get("freshness_at"), item.get("classification", "INTERNAL"), ordinal))
             if cached:
                 answer = ledger_for_connection(conn).objects.get(conn, cached["RESPONSE_OBJECT_HASH"])
+                cache_latency = (time.perf_counter() - request_started) * 1000
                 conn.execute("UPDATE AI_RESPONSE_CACHE SET LAST_HIT_AT=?,HIT_COUNT=HIT_COUNT+1 WHERE CACHE_KEY=?", (now, cache_key))
-                conn.execute("UPDATE AI_REQUESTS SET STATUS='COMPLETED',CACHE_HIT=1,RETRIEVAL_HITS=?,OUTPUT_VALID=1,GROUNDING_CONFIDENCE=?,COMPLETED_AT=? WHERE AI_REQUEST_ID=?",
-                             (len(evidence), answer.get("confidence", 0), now, request_id)); conn.commit()
-                return {**answer, "ai_request_id": request_id, "model": route.model_slug, "cache_hit": True}
+                conn.execute("UPDATE AI_REQUESTS SET STATUS='COMPLETED',CACHE_HIT=1,LATENCY_MS=?,RETRIEVAL_HITS=?,OUTPUT_VALID=1,GROUNDING_CONFIDENCE=?,COMPLETED_AT=? WHERE AI_REQUEST_ID=?",
+                             (cache_latency, len(evidence), answer.get("confidence", 0), now, request_id)); conn.commit()
+                return {
+                    **answer, "ai_request_id": request_id, "model": route.model_slug,
+                    "cache_hit": True, "latency_ms": round(cache_latency, 2),
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0},
+                }
             conn.commit()
         finally: conn.close()
         api_key, _ = self.credentials(user_id); provider = self.providers.get(route.provider)
@@ -169,7 +231,11 @@ class AIGateway:
         for attempt in range(3):
             try:
                 provider_result = await provider.complete(api_key=api_key, model=route.model_slug, messages=messages,
-                                                          temperature=route.temperature, max_tokens=route.max_output_tokens)
+                                                          temperature=route.temperature, max_tokens=route.max_output_tokens,
+                                                          response_schema=(
+                                                              GROUNDED_ANSWER_SCHEMA
+                                                              if supports_structured_output(route.model_slug) else None
+                                                          ))
                 parsed = StructuredOutputService.parse(provider_result.content); error = None; break
             except (ValidationError, json.JSONDecodeError) as exc:
                 error = exc
@@ -178,6 +244,10 @@ class AIGateway:
             except AIProviderError as exc:
                 error = exc
                 if not exc.transient or attempt == 2: break
+        if not parsed and provider_result:
+            parsed = StructuredOutputService.safe_fallback(provider_result.content)
+            if parsed:
+                error = None
         latency = (time.perf_counter() - started) * 1000; conn = database._get_connection(); completed = database._utcnow()
         try:
             if not parsed or not provider_result:
@@ -207,6 +277,7 @@ class AIGateway:
                           provider_result.output_tokens, provider_result.reasoning_tokens, completed))
             conn.commit()
             return {**answer, "ai_request_id": request_id, "model": route.model_slug, "cache_hit": False,
+                    "latency_ms": round(latency, 2),
                     "usage": {"input_tokens": provider_result.input_tokens, "output_tokens": provider_result.output_tokens, "reasoning_tokens": provider_result.reasoning_tokens}}
         finally: conn.close()
 

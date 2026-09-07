@@ -13,7 +13,7 @@ from ..excel.identity import semantic_snapshot
 from ..openxml_injector import inject_taskpane_manifest
 
 
-def _write_branch_xlsx(table_id: str, destination: Path) -> None:
+def _write_branch_xlsx(table_id: str, destination: Path, include_data: bool = True) -> None:
     conn = _get_connection()
     try:
         snapshot = semantic_snapshot(conn, table_id)
@@ -37,26 +37,32 @@ def _write_branch_xlsx(table_id: str, destination: Path) -> None:
             cell = sheet.cell(row=1, column=column_index, value=column["name"])
             cell.fill = PatternFill("solid", fgColor="161B22")
             cell.font = Font(color="FFFFFF", bold=True)
-        rows = sorted(semantic_sheet.get("rows", []), key=lambda item: item["position"])
-        for row_index, row in enumerate(rows, 2):
-            for column_index, column in enumerate(columns, 1):
-                column_id = column["column_id"]
-                value = row.get("formulas", {}).get(column_id)
-                if value is None:
-                    value = row.get("values", {}).get(column_id)
-                sheet.cell(row=row_index, column=column_index, value=value)
-        if columns and rows:
-            table = Table(
-                displayName=f"GitWalkData{sheet_index + 1}", ref=sheet.dimensions
-            )
-            table.tableStyleInfo = TableStyleInfo(
-                name="TableStyleMedium2",
-                showFirstColumn=False,
-                showLastColumn=False,
-                showRowStripes=True,
-                showColumnStripes=False,
-            )
-            sheet.add_table(table)
+        if include_data:
+            rows = sorted(semantic_sheet.get("rows", []), key=lambda item: item["position"])
+            for row_index, row in enumerate(rows, 2):
+                for column_index, column in enumerate(columns, 1):
+                    column_id = column["column_id"]
+                    value = row.get("formulas", {}).get(column_id)
+                    if value is None:
+                        value = row.get("values", {}).get(column_id)
+                    sheet.cell(row=row_index, column=column_index, value=value)
+            if columns and rows:
+                table = Table(
+                    displayName=f"GitWalkData{sheet_index + 1}", ref=sheet.dimensions
+                )
+                table.tableStyleInfo = TableStyleInfo(
+                    name="TableStyleMedium2",
+                    showFirstColumn=False,
+                    showLastColumn=False,
+                    showRowStripes=True,
+                    showColumnStripes=False,
+                )
+                sheet.add_table(table)
+        else:
+            if columns:
+                msg = "[LOCKED] Verify Path & Sign In via Git Walk Taskpane to load data"
+                placeholder = sheet.cell(row=2, column=1, value=msg)
+                placeholder.font = Font(italic=True, color="58A6FF")
         sheet.freeze_panes = "A2"
     if not workbook.worksheets:
         workbook.create_sheet("Sheet1")
@@ -70,19 +76,27 @@ def issue_branch_workbook(
     source_workbook: str | None = None,
     branch_mode: str = "continue",
     branch_id: str | None = None,
+    local_file_path: str | None = None,
+    local_target_dir: str | None = None,
 ) -> dict:
     """Create/reuse a personal branch and return a signed branch workbook."""
     identity = create_working_copy(
         main_table_id, user_id, user_email, branch_mode=branch_mode,
         branch_id=branch_id,
     )
+    if not local_file_path and local_target_dir:
+        filename = f"gitwalk_{identity['branch_name'].replace('/', '_')}.xlsx"
+        local_file_path = str(Path(local_target_dir) / filename)
+    if local_file_path:
+        identity["local_file_path"] = local_file_path
+        identity["required_role"] = "editor"
     directory = Path(tempfile.mkdtemp(prefix="gitwalk_working_copy_"))
     raw_path = directory / "branch.xlsx"
     output_path = directory / f"gitwalk_{identity['branch_id']}.xlsx"
     if source_workbook:
         raw_path.write_bytes(Path(source_workbook).read_bytes())
     else:
-        _write_branch_xlsx(identity["table_id"], raw_path)
+        _write_branch_xlsx(identity["table_id"], raw_path, include_data=False)
     inject_taskpane_manifest(
         input_xlsx_path=str(raw_path),
         output_xlsx_path=str(output_path),

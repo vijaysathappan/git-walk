@@ -50,6 +50,7 @@ async function apiFetch(path, options = {}) {
     const error = new Error(message);
     error.status = response.status;
     error.detail = parsed.detail;
+    error.code = typeof parsed.detail === "object" ? parsed.detail.code : null;
     throw error;
   }
   return response;
@@ -96,6 +97,39 @@ export async function authenticateWorkbook(identity) {
   const auth = await response.json();
   storeAuth(auth);
   return auth;
+}
+
+export async function verifyWorkbookAccess(payload) {
+  const response = await fetch(`${API_BASE}/auth/workbook-verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const parsed = await parseError(response);
+    const err = new Error(typeof parsed.detail === "object" ? parsed.detail.message : parsed.detail);
+    err.status = response.status;
+    err.detail = parsed.detail;
+    throw err;
+  }
+  const result = await response.json();
+  if (result.token) {
+    storeAuth({ token: result.token, user: result.user });
+  }
+  return result;
+}
+
+export async function setUserPassword(userIdOrEmail, password) {
+  const response = await fetch(`${API_BASE}/auth/set-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id_or_email: userIdOrEmail, password }),
+  });
+  if (!response.ok) {
+    const parsed = await parseError(response);
+    throw new Error(typeof parsed.detail === "object" ? parsed.detail.message : parsed.detail);
+  }
+  return response.json();
 }
 
 export async function getProfile() {
@@ -370,15 +404,34 @@ export async function getCheckoutOptions(tableId) {
   return (await apiFetch(`/repositories/${tableId}/checkout-options`)).json();
 }
 
-export async function workOnWorkbook(tableId, mode = "continue", branchId = null) {
+export async function getEucStorageSetting() {
+  return (await apiFetch("/settings/euc-storage")).json();
+}
+
+export async function saveEucStorageSetting(localDownloadDir) {
+  return (
+    await apiFetch("/settings/euc-storage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ local_download_dir: localDownloadDir }),
+    })
+  ).json();
+}
+
+export async function workOnWorkbook(tableId, mode = "continue", branchId = null, localDownloadDir = null) {
+  const payload = { mode, branch_id: branchId };
+  if (localDownloadDir) {
+    payload.local_download_dir = localDownloadDir;
+  }
   const response = await apiFetch(`/repositories/${tableId}/work-on-workbook`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode, branch_id: branchId }),
+    body: JSON.stringify(payload),
   });
   const blob = await response.blob();
   const disposition = response.headers.get("Content-Disposition") || "";
   const filenameMatch = disposition.match(/filename="?(.+?)"?$/);
+  const localSavedPath = response.headers.get("X-Local-Path");
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -391,6 +444,7 @@ export async function workOnWorkbook(tableId, mode = "continue", branchId = null
     repositoryId: response.headers.get("X-Repository-ID"),
     branchId: response.headers.get("X-Branch-ID"),
     workingCopyId: response.headers.get("X-Working-Copy-ID"),
+    localSavedPath,
   };
 }
 
