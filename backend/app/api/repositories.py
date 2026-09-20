@@ -1,0 +1,475 @@
+"""Stage 1 category, repository, branch, and working-copy routes."""
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+import shutil
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+from ..database import (
+    create_category,
+    create_semantic_branch,
+    delete_branch,
+    delete_repository,
+    get_branch_protection,
+    get_branch_sheet_page,
+    get_repository,
+    get_repository_organization_id,
+    list_categories,
+    list_repository_branches,
+    list_repository_devices,
+    list_user_working_copies,
+    move_repository,
+    repository_activity_matrix,
+    repository_activity_overview,
+    repository_name_available,
+    set_device_trust_status,
+    update_branch_protection,
+    working_copy_checkout_options,
+    user_can_access_branch,
+    user_can_work_on_repository,
+    get_system_setting,
+    set_system_setting,
+    update_branch_local_path,
+)
+from ..schemas import BranchCreateRequest, CategoryCreateRequest, RepositoryCategoryRequest, WorkingCopyRequest, EucStorageSettingsRequest
+
+
+class BranchProtectionRequest(BaseModel):
+    allow_direct_commits: bool = False
+    required_approvals: int = Field(default=1, ge=0, le=10)
+    require_validation: bool = True
+from ..security import Principal, current_principal
+from ..repositories.merge_store import branch_context
+from ..services.workbook_service import export_branch_workbook, issue_branch_workbook
+from ..services.branch_lifecycle_manager import validate_storage_drive
+from ..observability import record_audit_event
+
+
+router = APIRouter(prefix="/api/v1", tags=["repositories"])
+
+
+@router.get("/categories")
+async def categories(_principal: Principal = Depends(current_principal)):
+    return {"categories": list_categories()}
+
+
+@router.get("/repositories/name-availability")
+async def repository_availability(
+    name: str = Query(min_length=1, max_length=120),
+    _principal: Principal = Depends(current_principal),
+):
+    return repository_name_available(name)
+
+
+@router.post("/categories")
+async def add_category(
+    payload: CategoryCreateRequest,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        result = create_category(payload.name, payload.description, payload.parent_category_id)
+        record_audit_event(
+            "CATEGORY_CREATED", actor_user_id=principal.user_id,
+            payload={"category_id": result["category_id"], "name": result["name"]},
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/repositories/{table_id}")
+async def repository_detail(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    return repository
+
+
+def _require_repository_owner(table_id: str, principal: Principal):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    if repository.get("repository_role") != "owner":
+        raise HTTPException(status_code=403, detail="Only the repository owner can view this")
+    return repository
+
+
+@router.get("/repositories/{table_id}/branch-protection")
+async def branch_protection(table_id: str, principal: Principal = Depends(current_principal)):
+    repository = _require_repository_owner(table_id, principal)
+    default_branch_id = repository.get("default_branch_id")
+    if not default_branch_id:
+        raise HTTPException(status_code=404, detail="Repository has no default branch")
+    rule = get_branch_protection(repository["repository_id"], default_branch_id)
+    return {"branch_id": default_branch_id, "rule": rule or {
+        "allow_direct_commits": False, "required_approvals": 1, "require_validation": True,
+    }}
+
+
+@router.put("/repositories/{table_id}/branch-protection")
+async def update_branch_protection_route(
+    table_id: str, payload: BranchProtectionRequest, principal: Principal = Depends(current_principal),
+):
+    repository = _require_repository_owner(table_id, principal)
+    default_branch_id = repository.get("default_branch_id")
+    if not default_branch_id:
+        raise HTTPException(status_code=404, detail="Repository has no default branch")
+    organization_id = get_repository_organization_id(repository["repository_id"])
+    rule = update_branch_protection(
+        repository["repository_id"], default_branch_id, organization_id,
+        payload.allow_direct_commits, payload.required_approvals, payload.require_validation, principal.user_id,
+    )
+    record_audit_event(
+        "BRANCH_PROTECTION_UPDATED", actor_user_id=principal.user_id,
+        repository_id=repository["repository_id"], branch_id=default_branch_id,
+        payload={"allow_direct_commits": payload.allow_direct_commits, "required_approvals": payload.required_approvals,
+                 "require_validation": payload.require_validation},
+    )
+    return {"branch_id": default_branch_id, "rule": rule}
+
+
+@router.get("/repositories/{table_id}/devices")
+async def repository_devices(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    repository = _require_repository_owner(table_id, principal)
+    return {"devices": list_repository_devices(repository["repository_id"])}
+
+
+@router.post("/repositories/{table_id}/devices/{fingerprint_id}/trust")
+async def trust_repository_device(
+    table_id: str,
+    fingerprint_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    _require_repository_owner(table_id, principal)
+    try:
+        device = set_device_trust_status(fingerprint_id, "TRUSTED")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    record_audit_event(
+        "DEVICE_TRUSTED", actor_user_id=principal.user_id,
+        payload={"fingerprint_id": fingerprint_id, "device_user_id": device["user_id"]},
+    )
+    return device
+
+
+@router.post("/repositories/{table_id}/devices/{fingerprint_id}/block")
+async def block_repository_device(
+    table_id: str,
+    fingerprint_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    _require_repository_owner(table_id, principal)
+    try:
+        device = set_device_trust_status(fingerprint_id, "BLOCKED")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    record_audit_event(
+        "DEVICE_BLOCKED", actor_user_id=principal.user_id,
+        payload={"fingerprint_id": fingerprint_id, "device_user_id": device["user_id"]},
+    )
+    return device
+
+
+@router.get("/repositories/{table_id}/activity")
+async def repository_activity(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    try:
+        return {"activity": repository_activity_overview(repository["repository_id"])}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/repositories/{table_id}/activity/matrix")
+async def repository_activity_matrix_route(
+    table_id: str,
+    days: int = Query(default=14, ge=1, le=60),
+    principal: Principal = Depends(current_principal),
+):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    try:
+        return repository_activity_matrix(repository["repository_id"], days)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.patch("/repositories/{table_id}/category")
+async def repository_category(
+    table_id: str,
+    payload: RepositoryCategoryRequest,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        result = move_repository(
+            table_id.strip().upper(), payload.category_id, principal.user_id
+        )
+        record_audit_event(
+            "REPOSITORY_UPDATED", actor_user_id=principal.user_id,
+            repository_id=result["repository_id"],
+            payload={"category_id": payload.category_id},
+        )
+        return result
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/repositories/{table_id}/branches")
+async def repository_branches(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    return {"branches": list_repository_branches(table_id.strip().upper(), principal.user_id)}
+
+
+@router.post("/repositories/{table_id}/branches", status_code=201)
+async def create_branch_pointer(
+    table_id: str,
+    payload: BranchCreateRequest,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        result = create_semantic_branch(
+            table_id.strip().upper(), payload.name, payload.from_commit_id, principal.user_id
+        )
+        record_audit_event(
+            "BRANCH_CREATED", actor_user_id=principal.user_id,
+            repository_id=get_repository(table_id.strip().upper(), principal.user_id)["repository_id"],
+            branch_id=result["branch_id"], payload={"base_commit_id": result["base_commit_id"],
+                                                     "storage_bytes_added": 0},
+        )
+        return result
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/repositories/{table_id}/branches/{branch_id}/sheets/{sheet_id}/records")
+async def repository_sheet_records(
+    table_id: str,
+    branch_id: str,
+    sheet_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return get_branch_sheet_page(
+            table_id.strip().upper(), branch_id, sheet_id,
+            principal.user_id, limit, offset,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/repositories/{table_id}/branches/{branch_id}/download")
+async def download_repository_branch(
+    table_id: str,
+    branch_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    normalized = table_id.strip().upper()
+    repository = get_repository(normalized, principal.user_id)
+    branch = branch_context(branch_id)
+    if (
+        not repository or not branch
+        or branch["repository_id"] != repository["repository_id"]
+        or not user_can_access_branch(branch_id, principal.user_id)
+    ):
+        raise HTTPException(status_code=404, detail="Branch does not exist or is not accessible")
+    result = export_branch_workbook(
+        branch["data_table_id"], branch_id, branch["branch_name"]
+    )
+    record_audit_event(
+        "WORKBOOK_DOWNLOADED", actor_user_id=principal.user_id,
+        repository_id=branch["repository_id"], branch_id=branch_id,
+        payload={"purpose": "complete_branch_export"},
+    )
+    return FileResponse(
+        result["path"],
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{branch['branch_name'].replace('/', '_')}.xlsx",
+        background=BackgroundTask(shutil.rmtree, Path(result["path"]).parent, True),
+    )
+
+
+@router.delete("/repositories/{table_id}")
+async def remove_repository(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        # delete_repository() now runs the full permanent-deletion pipeline
+        # (export -> email -> notify -> hard delete) and already records
+        # its own REPOSITORY_PURGED audit event — see
+        # services/repository_purge_service.py — so no separate audit call
+        # is needed here.
+        result = delete_repository(table_id.strip().upper(), principal.user_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return result
+
+
+@router.delete("/branches/{branch_id}")
+async def remove_branch(
+    branch_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    context = branch_context(branch_id)
+    try:
+        result = delete_branch(branch_id, principal.user_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    record_audit_event(
+        "BRANCH_DELETED", actor_user_id=principal.user_id,
+        repository_id=context["repository_id"] if context else None,
+        branch_id=branch_id, payload={"working_copy_status": "REVOKED"},
+    )
+    return result
+
+
+@router.get("/settings/euc-storage")
+async def get_euc_storage_setting(_principal: Principal = Depends(current_principal)):
+    stored_dir = get_system_setting("euc_download_dir", "")
+    exists = False
+    if stored_dir:
+        try:
+            p = validate_storage_drive(stored_dir)
+            exists = p.exists() and p.is_dir()
+        except Exception:
+            exists = False
+    return {
+        "local_download_dir": stored_dir or "",
+        "exists": exists,
+    }
+
+
+@router.post("/settings/euc-storage")
+async def save_euc_storage_setting(
+    payload: EucStorageSettingsRequest,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        valid_dir = validate_storage_drive(payload.local_download_dir)
+        valid_dir.mkdir(parents=True, exist_ok=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed creating directory: {exc}") from exc
+
+    set_system_setting("euc_download_dir", str(valid_dir), principal.user_id)
+    return {
+        "status": "SAVED",
+        "local_download_dir": str(valid_dir),
+        "exists": True,
+        "message": f"EUC download folder set to: {valid_dir}",
+    }
+
+
+@router.post("/repositories/{table_id}/work-on-workbook")
+async def work_on_workbook(
+    table_id: str,
+    payload: WorkingCopyRequest,
+    principal: Principal = Depends(current_principal),
+):
+    normalized = table_id.strip().upper()
+    if not user_can_work_on_repository(normalized, principal.user_id):
+        raise HTTPException(status_code=403, detail="Editor access is required to create a branch")
+
+    target_dir_str = payload.local_download_dir or get_system_setting("euc_download_dir")
+    local_saved_file: Path | None = None
+    if target_dir_str:
+        try:
+            local_target_dir = validate_storage_drive(target_dir_str)
+            local_target_dir.mkdir(parents=True, exist_ok=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed accessing local directory: {exc}") from exc
+    else:
+        local_target_dir = None
+
+    try:
+        result = issue_branch_workbook(
+            normalized, principal.user_id, principal.email,
+            branch_mode=payload.mode, branch_id=payload.branch_id,
+            local_target_dir=str(local_target_dir) if local_target_dir else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    filename = f"gitwalk_{result['branch_name'].replace('/', '_')}.xlsx"
+    local_saved_file = None
+
+    if local_target_dir:
+        local_saved_file = Path(result.get("local_file_path") or (local_target_dir / filename))
+        shutil.copy2(result["path"], local_saved_file)
+        update_branch_local_path(result["branch_id"], str(local_saved_file))
+
+    response = FileResponse(
+        result["path"],
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+        background=BackgroundTask(shutil.rmtree, Path(result["path"]).parent, True),
+    )
+    response.headers["X-Table-ID"] = normalized
+    response.headers["X-Branch-Table-ID"] = result["table_id"]
+    response.headers["X-Repository-ID"] = result["repository_id"]
+    response.headers["X-Branch-ID"] = result["branch_id"]
+    response.headers["X-Working-Copy-ID"] = result["working_copy_id"]
+    if local_saved_file:
+        response.headers["X-Local-Path"] = str(local_saved_file)
+
+    record_audit_event(
+        "WORKING_COPY_CREATED", actor_user_id=principal.user_id,
+        repository_id=result["repository_id"], branch_id=result["branch_id"],
+        working_copy_id=result["working_copy_id"],
+        payload={"branch_name": result["branch_name"], "local_path": str(local_saved_file) if local_saved_file else None},
+    )
+    record_audit_event(
+        "WORKBOOK_DOWNLOADED", actor_user_id=principal.user_id,
+        repository_id=result["repository_id"], branch_id=result["branch_id"],
+        working_copy_id=result["working_copy_id"],
+        payload={"purpose": "working_copy", "local_path": str(local_saved_file) if local_saved_file else None},
+    )
+    return response
+
+
+@router.get("/repositories/{table_id}/checkout-options")
+async def checkout_options(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return working_copy_checkout_options(
+            table_id.strip().upper(), principal.user_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/working-copies/mine")
+async def my_working_copies(principal: Principal = Depends(current_principal)):
+    return {"working_copies": list_user_working_copies(principal.user_id)}

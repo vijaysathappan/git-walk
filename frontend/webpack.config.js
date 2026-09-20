@@ -14,6 +14,8 @@ const devCerts = require("office-addin-dev-certs");
  */
 module.exports = async (env, argv) => {
   const isProd = argv.mode === "production";
+  const officeAddinUrl = (process.env.OFFICE_ADDIN_URL || "https://localhost:3000").replace(/\/$/, "");
+  const apiBaseUrl = (process.env.API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
   const httpsOptions = isProd
     ? undefined
     : await devCerts.getHttpsServerOptions(365, ["127.0.0.1", "localhost"]);
@@ -75,7 +77,13 @@ module.exports = async (env, argv) => {
       // Copy manifest.xml to dist
       new CopyWebpackPlugin({
         patterns: [
-          { from: "public/manifest.xml", to: "manifest.xml" },
+          {
+            from: "public/manifest.xml",
+            to: "manifest.xml",
+            transform(content) {
+              return Buffer.from(content.toString().replaceAll("https://localhost:3000", officeAddinUrl));
+            },
+          },
         ],
       }),
     ],
@@ -95,7 +103,7 @@ module.exports = async (env, argv) => {
       proxy: [
         {
           context: ["/api"],
-          target: "http://localhost:8000",
+          target: apiBaseUrl,
           changeOrigin: true,
           secure: false,
         },

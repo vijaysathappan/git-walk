@@ -51,8 +51,8 @@ $lines = @(
     "SESSION_HOURS=24"
     "OTP_MINUTES=10"
     "OPENROUTER_API_KEY=$openRouterKey"
-    "OPENROUTER_MODEL=openai/gpt-4.1-mini"
-    "OPENROUTER_MODELS=openai/gpt-4.1-mini"
+    "OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free"
+    "OPENROUTER_MODELS=nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3-ultra-550b-a55b:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,nvidia/nemotron-nano-9b-v2:free"
 )
 
 [IO.File]::WriteAllLines($envPath, $lines, [Text.UTF8Encoding]::new($false))

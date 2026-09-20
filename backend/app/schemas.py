@@ -32,6 +32,12 @@ class SyncRequest(BaseModel):
     )
     source: str = "excel"
     commit_message: str | None = None
+    repository_id: str | None = None
+    branch_id: str | None = None
+    working_copy_id: str | None = None
+    base_commit_id: str | None = None
+    issued_at: str | None = None
+    signature: str | None = None
 
 
 class SyncResponse(BaseModel):
@@ -58,10 +64,6 @@ class SyncResponse(BaseModel):
         ...,
         description="True when this request changed the stored value",
     )
-    database_path: str = Field(
-        ...,
-        description="Canonical SQLite file updated by the backend",
-    )
 
 
 class CellValueResponse(BaseModel):
@@ -71,7 +73,6 @@ class CellValueResponse(BaseModel):
     row_id: int
     column_name: str
     value: str | int | float | bool | None = None
-    database_path: str
 
 
 class UploadResponse(BaseModel):
@@ -88,6 +89,40 @@ class LoginRequest(BaseModel):
 
 class LoginVerifyRequest(LoginRequest):
     code: str = Field(..., min_length=6, max_length=6)
+    machine_id: str | None = Field(default=None, max_length=200)
+
+
+class WorkbookAuthRequest(BaseModel):
+    table_id: str = Field(..., min_length=8, max_length=80)
+    repository_id: str = Field(..., min_length=4, max_length=80)
+    branch_id: str = Field(..., min_length=4, max_length=80)
+    working_copy_id: str = Field(..., min_length=4, max_length=80)
+    base_commit_id: str = Field(..., min_length=4, max_length=80)
+    issued_at: str = Field(..., min_length=10, max_length=80)
+    signature: str = Field(..., min_length=32, max_length=128)
+    machine_id: str | None = Field(default=None, max_length=200)
+
+
+class WorkbookVerifyRequest(BaseModel):
+    repository_id: str = Field(..., min_length=4, max_length=80)
+    branch_id: str = Field(..., min_length=4, max_length=80)
+    working_copy_id: str = Field(..., min_length=4, max_length=80)
+    email: str = Field(..., min_length=3, max_length=120)
+    code: str = Field(..., min_length=6, max_length=6)
+    current_file_path: str = Field(..., min_length=1, max_length=500)
+    machine_id: str | None = Field(default=None, max_length=200)
+
+
+class SetPasswordRequest(BaseModel):
+    user_id_or_email: str = Field(..., min_length=3, max_length=120)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class SanitizeLocalRequest(BaseModel):
+    working_copy_id: str | None = None
+    file_path: str | None = None
+    table_id: str | None = None
+    force: bool = False
 
 
 class BulkCellChange(BaseModel):
@@ -101,6 +136,36 @@ class BulkSyncRequest(BaseModel):
     changes: list[BulkCellChange] = Field(..., min_length=1, max_length=5000)
     source: str = "excel"
     commit_message: str | None = Field(default=None, max_length=300)
+    repository_id: str | None = None
+    branch_id: str | None = None
+    working_copy_id: str | None = None
+    base_commit_id: str | None = None
+    issued_at: str | None = None
+    signature: str | None = None
+
+
+class SemanticChange(BaseModel):
+    operation_type: str = Field(..., min_length=3, max_length=40)
+    sheet_id: str | None = None
+    row_id: str | None = None
+    column_id: str | None = None
+    previous_row_position: int | None = Field(default=None, ge=0)
+    new_row_position: int | None = Field(default=None, ge=0)
+    previous_column_position: int | None = Field(default=None, ge=0)
+    new_column_position: int | None = Field(default=None, ge=0)
+    previous_cell_reference: str | None = None
+    new_cell_reference: str | None = None
+    old_value: Any = None
+    new_value: Any = None
+    old_formula: str | None = None
+    new_formula: str | None = None
+    old_data_type: str | None = None
+    new_data_type: str | None = None
+    old_style_hash: str | None = None
+    new_style_hash: str | None = None
+    old_comment: str | None = None
+    new_comment: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkbookCommitRequest(BaseModel):
@@ -113,6 +178,39 @@ class WorkbookCommitRequest(BaseModel):
     delete_columns: list[str] = Field(default_factory=list, max_length=100)
     source: str = "excel_commit"
     commit_message: str = Field(..., min_length=1, max_length=300)
+    repository_id: str | None = None
+    branch_id: str | None = None
+    working_copy_id: str | None = None
+    base_commit_id: str | None = None
+    issued_at: str | None = None
+    signature: str | None = None
+    expected_head_commit_id: str | None = None
+    semantic_changes: list[SemanticChange] = Field(default_factory=list, max_length=10000)
+
+
+class CategoryCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
+    parent_category_id: str | None = Field(default="CAT_HOME", max_length=64)
+
+
+class RepositoryCategoryRequest(BaseModel):
+    category_id: str = Field(..., min_length=4, max_length=64)
+
+
+class WorkingCopyRequest(BaseModel):
+    mode: str = Field(default="continue", pattern="^(continue|new)$")
+    branch_id: str | None = Field(default=None, min_length=4, max_length=80)
+    local_download_dir: str | None = Field(default=None, max_length=500)
+
+
+class EucStorageSettingsRequest(BaseModel):
+    local_download_dir: str = Field(..., min_length=2, max_length=500)
+
+
+class BranchCreateRequest(BaseModel):
+    name: str = Field(..., min_length=3, max_length=255)
+    from_commit_id: str | None = Field(default=None, min_length=4, max_length=100)
 
 
 class RollbackRequest(BaseModel):
@@ -129,10 +227,13 @@ class PresenceRequest(BaseModel):
     client_id: str = Field(..., min_length=8, max_length=100)
     surface: str = Field(..., pattern="^(browser|excel)$")
     activity: str = Field(default="viewing", pattern="^(viewing|editing|idle)$")
+    status: str = Field(default="ONLINE", pattern="^(ONLINE|NEED_HELP)$")
 
 
 class AIInsightRequest(BaseModel):
     table_id: str | None = None
+    branch_id: str | None = None
+    merge_request_id: str | None = None
     model: str | None = None
     question: str = Field(..., min_length=3, max_length=1000)
 
@@ -140,3 +241,20 @@ class AIInsightRequest(BaseModel):
 class AIConfigRequest(BaseModel):
     api_key: str = Field(..., min_length=10, max_length=500)
     model: str = Field(..., min_length=3, max_length=200)
+
+
+class MergeRequestCreate(BaseModel):
+    source_branch_id: str = Field(..., min_length=4, max_length=80)
+    target_branch_id: str = Field(..., min_length=4, max_length=80)
+    title: str = Field(..., min_length=3, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class ConflictResolutionRequest(BaseModel):
+    resolution_type: str = Field(pattern="^(KEEP_MAIN|ACCEPT_BRANCH|CUSTOM)$")
+    custom_value: Any = None
+
+
+class MergeReviewRequest(BaseModel):
+    decision: str = Field(pattern="^(APPROVED|REJECTED)$")
+    comment: str | None = Field(default=None, max_length=1000)

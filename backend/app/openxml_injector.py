@@ -9,7 +9,6 @@ a side-panel (taskpane) automatically loads the React sync UI.
 import os
 import shutil
 import tempfile
-import uuid
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -26,6 +25,21 @@ NS = {
 }
 
 TABLE_ID_DEFINED_NAME = "_EXCEL_SQLITE_SYNC_TABLE_ID"
+# This must stay identical to frontend/public/manifest.xml. Office resolves an
+# embedded task pane by manifest ID; a per-workbook UUID can never be resolved.
+OFFICE_ADDIN_ID = "e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b"
+WORKBOOK_METADATA_NAMES = {
+    "repository_id": "_GITWALK_REPOSITORY_ID",
+    "branch_id": "_GITWALK_BRANCH_ID",
+    "branch_name": "_GITWALK_BRANCH_NAME",
+    "working_copy_id": "_GITWALK_WORKING_COPY_ID",
+    "base_commit_id": "_GITWALK_BASE_COMMIT_ID",
+    "issued_at": "_GITWALK_ISSUED_AT",
+    "signature": "_GITWALK_SIGNATURE",
+    "local_file_path": "_GITWALK_LOCAL_FILE_PATH",
+    "required_role": "_GITWALK_REQUIRED_ROLE",
+    "assigned_email": "_GITWALK_ASSIGNED_EMAIL",
+}
 
 # Register all namespaces so ET doesn't mangle prefixes
 for prefix, uri in NS.items():
@@ -40,6 +54,7 @@ def inject_taskpane_manifest(
     output_xlsx_path: str,
     manifest_url: str = "https://localhost:3000/taskpane.html",
     table_id: str | None = None,
+    metadata: dict[str, str] | None = None,
 ) -> None:
     """
     Inject a Web Add-in taskpane into an existing .xlsx file.
@@ -75,11 +90,14 @@ def inject_taskpane_manifest(
         # ── Step 2: Patch [Content_Types].xml ────────────────────────────
         _patch_content_types(tmp_dir)
 
+        defined_values = dict(metadata or {})
         if table_id:
-            _embed_table_id(tmp_dir, table_id)
+            defined_values["table_id"] = table_id
+        if defined_values:
+            _embed_workbook_metadata(tmp_dir, defined_values)
 
         # ── Step 3-4: Create webextension ────────────────────────────────
-        _create_webextension(tmp_dir, manifest_url, table_id)
+        _create_webextension(tmp_dir, manifest_url, table_id, metadata)
 
         # ── Step 5-6: Create taskpane ────────────────────────────────────
         _create_taskpane(tmp_dir)
@@ -99,8 +117,8 @@ def inject_taskpane_manifest(
 # Internal helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _embed_table_id(tmp_dir: str, table_id: str) -> None:
-    """Store the SQLite table ID as a hidden workbook-level defined name."""
+def _embed_workbook_metadata(tmp_dir: str, metadata: dict[str, str]) -> None:
+    """Store signed Git Walk identity as hidden workbook-level defined names."""
     workbook_path = os.path.join(tmp_dir, "xl", "workbook.xml")
     tree = ET.parse(workbook_path)
     root = tree.getroot()
@@ -128,16 +146,24 @@ def _embed_table_id(tmp_dir: str, table_id: str) -> None:
                 break
         root.insert(insert_at, defined_names)
 
+    name_map = {"table_id": TABLE_ID_DEFINED_NAME, **WORKBOOK_METADATA_NAMES}
+    names_to_replace = {
+        name_map[key] for key, value in metadata.items() if key in name_map and value is not None
+    }
     for existing in list(defined_names.findall(defined_name_tag)):
-        if existing.get("name") == TABLE_ID_DEFINED_NAME:
+        if existing.get("name") in names_to_replace:
             defined_names.remove(existing)
 
-    table_name = ET.SubElement(
-        defined_names,
-        defined_name_tag,
-        attrib={"name": TABLE_ID_DEFINED_NAME, "hidden": "1"},
-    )
-    table_name.text = f'"{table_id}"'
+    for key, defined_name in name_map.items():
+        value = metadata.get(key)
+        if value is None:
+            continue
+        item = ET.SubElement(
+            defined_names,
+            defined_name_tag,
+            attrib={"name": defined_name, "hidden": "1"},
+        )
+        item.text = f'"{str(value).replace(chr(34), chr(34) * 2)}"'
     tree.write(workbook_path, xml_declaration=True, encoding="UTF-8")
 
 def _patch_content_types(tmp_dir: str) -> None:
@@ -173,14 +199,17 @@ def _patch_content_types(tmp_dir: str) -> None:
 
 
 def _create_webextension(
-    tmp_dir: str, manifest_url: str, table_id: str | None = None
+    tmp_dir: str,
+    manifest_url: str,
+    table_id: str | None = None,
+    metadata: dict[str, str] | None = None,
 ) -> None:
     """Create xl/webextensions/webextension1.xml and its .rels file."""
     we_dir = os.path.join(tmp_dir, "xl", "webextensions")
     os.makedirs(we_dir, exist_ok=True)
 
     we_ns = NS["we"]
-    addin_id = str(uuid.uuid4())
+    addin_id = OFFICE_ADDIN_ID
 
     # ── webextension1.xml ────────────────────────────────────────────────
     we_root = ET.Element(f"{{{we_ns}}}webextension", attrib={"id": addin_id})
@@ -212,6 +241,14 @@ def _create_webextension(
             props,
             f"{{{we_ns}}}property",
             attrib={"name": "tableId", "value": table_id},
+        )
+    for key, value in (metadata or {}).items():
+        if key not in WORKBOOK_METADATA_NAMES or value is None:
+            continue
+        ET.SubElement(
+            props,
+            f"{{{we_ns}}}property",
+            attrib={"name": key, "value": str(value)},
         )
 
     # Bindings (empty)
