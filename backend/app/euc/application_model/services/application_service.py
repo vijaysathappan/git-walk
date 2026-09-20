@@ -166,16 +166,8 @@ class ApplicationModelService:
             if not component:
                 raise KeyError("AIR component does not exist")
             now = database._utcnow()
-            conn.execute(
-                """INSERT INTO EUC_APPLICATION_REVIEWS VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(APPLICATION_MODEL_ID,COMPONENT_ID) DO UPDATE SET
-                   DECISION=excluded.DECISION,REASON=excluded.REASON,ACTOR_USER_ID=excluded.ACTOR_USER_ID,CREATED_AT=excluded.CREATED_AT""",
-                (_id("REV"), model["APPLICATION_MODEL_ID"], component_id, decision, reason.strip(), user_id, now),
-            )
-            conn.execute("UPDATE EUC_APPLICATION_COMPONENTS SET REVIEW_STATE=? WHERE APPLICATION_MODEL_ID=? AND COMPONENT_ID=?", (decision, model["APPLICATION_MODEL_ID"], component_id))
-            pending = conn.execute("SELECT COUNT(*) FROM EUC_APPLICATION_COMPONENTS WHERE APPLICATION_MODEL_ID=? AND REVIEW_STATE='REVIEW_REQUIRED'", (model["APPLICATION_MODEL_ID"],)).fetchone()[0]
-            status = "VALIDATION_FAILED" if model["VALIDATION_ERROR_COUNT"] else ("GENERATED" if pending == 0 else "REVIEW_REQUIRED")
-            conn.execute("UPDATE EUC_APPLICATION_MODELS SET REVIEW_REQUIRED_COUNT=?,STATUS=? WHERE APPLICATION_MODEL_ID=?", (pending, status, model["APPLICATION_MODEL_ID"]))
+            self._write_review(conn, model["APPLICATION_MODEL_ID"], component_id, decision, reason.strip(), user_id, now)
+            self._refresh_model_status(conn, model)
             conn.commit()
             record_audit_event("EUC_APPLICATION_COMPONENT_REVIEWED", actor_user_id=user_id,
                                repository_id=asset["REPOSITORY_ID"], payload={"euc_id": euc_id,
@@ -184,6 +176,65 @@ class ApplicationModelService:
             return self.overview(euc_id, user_id, model["APPLICATION_MODEL_ID"])
         finally:
             conn.close()
+
+    def bulk_review(
+        self, euc_id: str, user_id: str, decision: str, reason: str,
+        component_type: str | None = None, min_confidence: float = 0.0,
+    ) -> dict:
+        """Confirm or reject every still-open (REVIEW_REQUIRED) component
+        matching an optional type/confidence filter, in one transaction --
+        the practical fix for a real AIR routinely having dozens of
+        components needing one-by-one review before approval is even
+        possible. Each component still gets its own EUC_APPLICATION_REVIEWS
+        row with the same reason and actor, so the audit trail reads
+        identically to reviewing them one at a time by hand."""
+        decision = decision.upper()
+        if decision not in REVIEW_DECISIONS:
+            raise ValueError("Review decision must be CONFIRMED or REJECTED")
+        if len(reason.strip()) < 3:
+            raise ValueError("A review reason is required")
+        conn = database._get_connection()
+        try:
+            asset = self._asset(conn, euc_id, user_id, edit=True); model = self._required_model(conn, euc_id)
+            clauses = ["APPLICATION_MODEL_ID=?", "REVIEW_STATE='REVIEW_REQUIRED'", "CONFIDENCE>=?"]
+            params: list[Any] = [model["APPLICATION_MODEL_ID"], min_confidence]
+            if component_type:
+                clauses.append("COMPONENT_TYPE=?")
+                params.append(component_type.upper())
+            targets = conn.execute(
+                f"SELECT COMPONENT_ID FROM EUC_APPLICATION_COMPONENTS WHERE {' AND '.join(clauses)}", params
+            ).fetchall()
+            now = database._utcnow()
+            for row in targets:
+                self._write_review(conn, model["APPLICATION_MODEL_ID"], row["COMPONENT_ID"], decision, reason.strip(), user_id, now)
+            self._refresh_model_status(conn, model)
+            conn.commit()
+            record_audit_event("EUC_APPLICATION_COMPONENTS_BULK_REVIEWED", actor_user_id=user_id,
+                               repository_id=asset["REPOSITORY_ID"], payload={"euc_id": euc_id,
+                               "application_model_id": model["APPLICATION_MODEL_ID"], "decision": decision,
+                               "reason": reason.strip(), "component_type": component_type,
+                               "min_confidence": min_confidence, "count": len(targets)})
+            result = self.overview(euc_id, user_id, model["APPLICATION_MODEL_ID"])
+            result["bulk_reviewed_count"] = len(targets)
+            return result
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _write_review(conn, application_model_id: str, component_id: str, decision: str, reason: str, user_id: str, now: str) -> None:
+        conn.execute(
+            """INSERT INTO EUC_APPLICATION_REVIEWS VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(APPLICATION_MODEL_ID,COMPONENT_ID) DO UPDATE SET
+               DECISION=excluded.DECISION,REASON=excluded.REASON,ACTOR_USER_ID=excluded.ACTOR_USER_ID,CREATED_AT=excluded.CREATED_AT""",
+            (_id("REV"), application_model_id, component_id, decision, reason, user_id, now),
+        )
+        conn.execute("UPDATE EUC_APPLICATION_COMPONENTS SET REVIEW_STATE=? WHERE APPLICATION_MODEL_ID=? AND COMPONENT_ID=?", (decision, application_model_id, component_id))
+
+    @staticmethod
+    def _refresh_model_status(conn, model) -> None:
+        pending = conn.execute("SELECT COUNT(*) FROM EUC_APPLICATION_COMPONENTS WHERE APPLICATION_MODEL_ID=? AND REVIEW_STATE='REVIEW_REQUIRED'", (model["APPLICATION_MODEL_ID"],)).fetchone()[0]
+        status = "VALIDATION_FAILED" if model["VALIDATION_ERROR_COUNT"] else ("GENERATED" if pending == 0 else "REVIEW_REQUIRED")
+        conn.execute("UPDATE EUC_APPLICATION_MODELS SET REVIEW_REQUIRED_COUNT=?,STATUS=? WHERE APPLICATION_MODEL_ID=?", (pending, status, model["APPLICATION_MODEL_ID"]))
 
     def approve(self, euc_id: str, user_id: str) -> dict:
         conn = database._get_connection()
@@ -291,6 +342,44 @@ class ApplicationModelService:
                 raise KeyError("Generated application bundle does not exist")
             payload = ledger_for_connection(conn).objects.get_bytes(conn, row["BUNDLE_OBJECT_HASH"])
             return f"{row['APPLICATION_VERSION'].lower()}.zip", payload
+        finally:
+            conn.close()
+
+    def _generation_output(self, conn, model, generation_run_id: str):
+        row = conn.execute(
+            "SELECT * FROM EUC_APPLICATION_GENERATION_RUNS WHERE APPLICATION_MODEL_ID=? AND GENERATION_RUN_ID=? AND STATUS='COMPLETED'",
+            (model["APPLICATION_MODEL_ID"], generation_run_id),
+        ).fetchone()
+        if not row:
+            raise KeyError("Generated application bundle does not exist")
+        return ledger_for_connection(conn).objects.get(conn, row["OUTPUT_MANIFEST_HASH"])
+
+    def generation_files(self, euc_id: str, user_id: str, generation_run_id: str) -> list[dict]:
+        """The generated bundle's file listing without downloading the zip
+        -- lets the UI show a real file tree/preview instead of a bundle
+        the reviewer can only inspect after downloading and unzipping."""
+        conn = database._get_connection()
+        try:
+            self._asset(conn, euc_id, user_id); model = self._required_model(conn, euc_id)
+            output = self._generation_output(conn, model, generation_run_id)
+            return [{"path": item["path"], "size_bytes": item["size_bytes"]} for item in output["files"]]
+        finally:
+            conn.close()
+
+    def generation_file(self, euc_id: str, user_id: str, generation_run_id: str, path: str) -> str:
+        conn = database._get_connection()
+        try:
+            self._asset(conn, euc_id, user_id); model = self._required_model(conn, euc_id)
+            ledger = ledger_for_connection(conn)
+            output = self._generation_output(conn, model, generation_run_id)
+            entry = next((item for item in output["files"] if item["path"] == path), None)
+            if not entry:
+                raise KeyError("File does not exist in this generated bundle")
+            payload = ledger.objects.get_bytes(conn, entry["object_hash"])
+            try:
+                return payload.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError("This file is binary and cannot be previewed as text")
         finally:
             conn.close()
 

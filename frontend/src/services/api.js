@@ -27,6 +27,24 @@ export function getClientId(surface) {
   return clientId;
 }
 
+// Stable per-machine-profile id, deliberately stored in browser localStorage
+// (not Office.context.document.settings, which is file-embedded and would
+// travel with a copied/emailed workbook) so device trust/blocking is bound
+// to the physical machine, not the file.
+const DEVICE_KEY = "gitwalk:device-id";
+export function getDeviceId() {
+  try {
+    let deviceId = localStorage.getItem(DEVICE_KEY);
+    if (!deviceId) {
+      deviceId = `dev_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+      localStorage.setItem(DEVICE_KEY, deviceId);
+    }
+    return deviceId;
+  } catch {
+    return null;
+  }
+}
+
 async function parseError(response) {
   const body = await response.json().catch(() => ({}));
   const detail = body.detail || body.message || `HTTP ${response.status}`;
@@ -37,6 +55,8 @@ async function apiFetch(path, options = {}) {
   const auth = getStoredAuth();
   const headers = new Headers(options.headers || {});
   if (auth?.token) headers.set("Authorization", `Bearer ${auth.token}`);
+  const deviceId = getDeviceId();
+  if (deviceId) headers.set("X-Device-Id", deviceId);
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!response.ok) {
     if (response.status === 401) {
@@ -69,11 +89,11 @@ export async function requestLoginCode(email) {
   return response.json();
 }
 
-export async function verifyLoginCode(email, code) {
+export async function verifyLoginCode(email, code, machineId = null) {
   const response = await fetch(`${API_BASE}/auth/verify-code`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, code }),
+    body: JSON.stringify(machineId ? { email, code, machine_id: machineId } : { email, code }),
   });
   if (!response.ok) {
     const parsed = await parseError(response);
@@ -117,6 +137,20 @@ export async function verifyWorkbookAccess(payload) {
     storeAuth({ token: result.token, user: result.user });
   }
   return result;
+}
+
+export async function sanitizeLocalWorkbook(payload) {
+  try {
+    const response = await fetch(`${API_BASE}/workbooks/sanitize-local`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return await response.json();
+  } catch (err) {
+    console.warn("sanitizeLocalWorkbook error:", err);
+    return null;
+  }
 }
 
 export async function setUserPassword(userIdOrEmail, password) {
@@ -203,6 +237,63 @@ export async function createServiceAccount(payload, organizationId = "") {
   })).json();
 }
 
+export async function getNotifications(unreadOnly = false) {
+  return (await apiFetch(`/notifications?unread_only=${unreadOnly ? "true" : "false"}`)).json();
+}
+
+export async function markNotificationRead(notificationId) {
+  return (await apiFetch(`/notifications/${notificationId}/read`, { method: "POST" })).json();
+}
+
+export async function markAllNotificationsRead() {
+  return (await apiFetch("/notifications/read-all", { method: "POST" })).json();
+}
+
+export async function ingestEucFromBranch(tableId, branchId) {
+  return (await apiFetch(`/euc/repositories/${tableId}/branches/${branchId}/ingest`, { method: "POST" })).json();
+}
+
+export async function getRepositoryCommitGraph(tableId, limit = 300) {
+  return (await apiFetch(`/repositories/${tableId}/commit-graph?limit=${limit}`)).json();
+}
+
+export async function getBranchProtection(tableId) {
+  return (await apiFetch(`/repositories/${tableId}/branch-protection`)).json();
+}
+
+export async function updateBranchProtection(tableId, payload) {
+  return (await apiFetch(`/repositories/${tableId}/branch-protection`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  })).json();
+}
+
+export async function getNotificationPreferences() {
+  return (await apiFetch("/notifications/preferences")).json();
+}
+
+export async function updateNotificationPreference(type, enabled) {
+  return (await apiFetch("/notifications/preferences", {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type, enabled }),
+  })).json();
+}
+
+export async function getOrganizationDevices(organizationId = "") {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return (await apiFetch(`/admin/devices${query}`)).json();
+}
+
+export async function setOrganizationDeviceTrust(fingerprintId, trustStatus, organizationId = "") {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return (await apiFetch(`/admin/devices/${fingerprintId}/trust${query}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trust_status: trustStatus }),
+  })).json();
+}
+
+export async function revokeOrganizationSession(sessionId, organizationId = "") {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  await apiFetch(`/admin/sessions/${sessionId}/revoke${query}`, { method: "POST" });
+}
+
 export async function uploadAndProvision(file, metadata = {}) {
   const formData = new FormData();
   formData.append("file", file);
@@ -262,6 +353,40 @@ export async function commitWorkbook(payload) {
       body: JSON.stringify(payload),
     })
   ).json();
+}
+
+export async function getRepositoryDevices(tableId) {
+  return (await apiFetch(`/repositories/${tableId}/devices`)).json();
+}
+
+export async function trustRepositoryDevice(tableId, fingerprintId) {
+  return (
+    await apiFetch(`/repositories/${tableId}/devices/${fingerprintId}/trust`, { method: "POST" })
+  ).json();
+}
+
+export async function blockRepositoryDevice(tableId, fingerprintId) {
+  return (
+    await apiFetch(`/repositories/${tableId}/devices/${fingerprintId}/block`, { method: "POST" })
+  ).json();
+}
+
+export async function getRepositoryActivity(tableId) {
+  return (await apiFetch(`/repositories/${tableId}/activity`)).json();
+}
+
+export async function getRepositoryActivityMatrix(tableId, days = 14) {
+  return (await apiFetch(`/repositories/${tableId}/activity/matrix?days=${days}`)).json();
+}
+
+export async function runCommitAIReview(commitId) {
+  return (
+    await apiFetch(`/commits/${commitId}/ai-review`, { method: "POST" })
+  ).json();
+}
+
+export async function getCommitAIReview(commitId) {
+  return (await apiFetch(`/commits/${commitId}/ai-review`)).json();
 }
 
 export async function getBranchState(branchId, commitId = "") {
@@ -337,6 +462,51 @@ export async function reviewMergeRequest(mergeRequestId, decision, comment = "")
 
 export async function mergeMergeRequest(mergeRequestId) {
   return (await apiFetch(`/merge-requests/${mergeRequestId}/merge`, { method: "POST" })).json();
+}
+
+export async function runMergeConflictAIAnalysis(mergeRequestId) {
+  return (
+    await apiFetch(`/merge-requests/${mergeRequestId}/ai-analyze`, { method: "POST" })
+  ).json();
+}
+
+export async function getMergeConflictAISuggestions(mergeRequestId) {
+  return (await apiFetch(`/merge-requests/${mergeRequestId}/ai-suggestions`)).json();
+}
+
+export async function prepareAIConflictApply(mergeRequestId, conflictId) {
+  return (
+    await apiFetch(
+      `/merge-requests/${mergeRequestId}/conflicts/${conflictId}/ai-apply`,
+      { method: "POST" }
+    )
+  ).json();
+}
+
+export async function proposeFindingRemediation(eucId, findingId) {
+  return (
+    await apiFetch(`/euc/${eucId}/findings/${findingId}/remediation`, { method: "POST" })
+  ).json();
+}
+
+export async function getFindingRemediations(eucId, findingId) {
+  return (await apiFetch(`/euc/${eucId}/findings/${findingId}/remediation`)).json();
+}
+
+export async function prepareFindingRemediationApply(eucId, findingId) {
+  return (
+    await apiFetch(`/euc/${eucId}/findings/${findingId}/remediation/apply`, { method: "POST" })
+  ).json();
+}
+
+export async function runMergeRequestAIAssessment(mergeRequestId) {
+  return (
+    await apiFetch(`/merge-requests/${mergeRequestId}/ai-assessment`, { method: "POST" })
+  ).json();
+}
+
+export async function getMergeRequestAIAssessment(mergeRequestId) {
+  return (await apiFetch(`/merge-requests/${mergeRequestId}/ai-assessment`)).json();
 }
 
 export async function revertSemanticCommit(commitId) {
@@ -518,12 +688,12 @@ export async function getWorkspaceState(tableId, sinceRevision = 0, waitSeconds 
   return (await apiFetch(`/datasets/${tableId}/workspace?${query}`)).json();
 }
 
-export async function heartbeatPresence(tableId, clientId, surface, activity = "viewing") {
+export async function heartbeatPresence(tableId, clientId, surface, activity = "viewing", status = "ONLINE") {
   return (
     await apiFetch(`/datasets/${tableId}/presence`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_id: clientId, surface, activity }),
+      body: JSON.stringify({ client_id: clientId, surface, activity, status }),
     })
   ).json();
 }
@@ -659,17 +829,56 @@ export async function getAIEvaluations() {
   return (await apiFetch("/ai-platform/evaluations")).json();
 }
 
+export async function getAgentLedgerLeaderboard(days = 30) {
+  return (await apiFetch(`/ai-platform/ledger/agents?days=${days}`)).json();
+}
+
+export async function getAgentLedgerTrend(days = 30) {
+  return (await apiFetch(`/ai-platform/ledger/trend?days=${days}`)).json();
+}
+
+export async function getAgentLedgerModels(days = 30) {
+  return (await apiFetch(`/ai-platform/ledger/models?days=${days}`)).json();
+}
+
+export async function getAgentLedgerRuns(filters = {}) {
+  const query = new URLSearchParams();
+  if (filters.agentKey) query.set("agent_key", filters.agentKey);
+  if (filters.status) query.set("status", filters.status);
+  query.set("limit", String(filters.limit || 50));
+  query.set("cursor", String(filters.cursor || 0));
+  return (await apiFetch(`/ai-platform/ledger/runs?${query}`)).json();
+}
+
+export async function getAgentLedgerRunReceipt(agentRunId) {
+  return (await apiFetch(`/ai-platform/ledger/runs/${agentRunId}`)).json();
+}
+
+export async function getAgentLedgerBudget() {
+  return (await apiFetch("/ai-platform/ledger/budget")).json();
+}
+
+export async function getPersonalActivity(range = "30d") {
+  return (await apiFetch(`/ai-platform/personal-activity?range=${range}`)).json();
+}
+
 export async function getAuditEvents(tableId = "", options = {}) {
   const query = new URLSearchParams();
   if (tableId) query.set("table_id", tableId);
   if (options.eventType) query.set("event_type", options.eventType);
   if (options.status) query.set("status", options.status);
+  if (options.since) query.set("since", options.since);
+  if (options.until) query.set("until", options.until);
   query.set("limit", String(options.limit || 300));
   return (await apiFetch(`/audit/events?${query}`)).json();
 }
 
 export async function getOperationalMetrics(hours = 24) {
   return (await apiFetch(`/observability/metrics?hours=${hours}`)).json();
+}
+
+export async function getOperationalMetricsTrend(hours = 24 * 14) {
+  return (await apiFetch(`/observability/metrics/trend?hours=${hours}`)).json();
 }
 
 export async function getSecurityPosture() {
@@ -695,10 +904,34 @@ export async function runStorageGC(tableId, dryRun = true) {
   return (await apiFetch(`/storage/gc?${query}`, { method: "POST" })).json();
 }
 
-export async function getEucAssets(repositoryId = "", search = "") {
+export async function getPortfolioRiskOverview() {
+  return (await apiFetch("/euc/portfolio/risk-overview")).json();
+}
+
+export async function getPortfolioAttestationOverview() {
+  return (await apiFetch("/euc/portfolio/attestation-overview")).json();
+}
+
+export async function getEucAttestation(eucId) {
+  return (await apiFetch(`/euc/${eucId}/attestation`)).json();
+}
+
+export async function submitEucAttestation(eucId, statement) {
+  return (
+    await apiFetch(`/euc/${eucId}/attestation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ statement }),
+    })
+  ).json();
+}
+
+export async function getEucAssets(repositoryId = "", search = "", since = "", until = "") {
   const query = new URLSearchParams();
   if (repositoryId) query.set("repository_id", repositoryId);
   if (search) query.set("search", search);
+  if (since) query.set("since", since);
+  if (until) query.set("until", until);
   return (await apiFetch(`/euc?${query}`)).json();
 }
 
@@ -816,6 +1049,16 @@ export async function updateEucFindingStatus(eucId, findingId, status, reason, e
   })).json();
 }
 
+export async function runEucBranchComparison(tableId, branchId) {
+  return (await apiFetch(`/euc/repositories/${tableId}/branches/${branchId}/ai-comparison`, {
+    method: "POST",
+  })).json();
+}
+
+export async function getEucBranchComparison(tableId, branchId) {
+  return (await apiFetch(`/euc/repositories/${tableId}/branches/${branchId}/ai-comparison`)).json();
+}
+
 export async function analyzeEucMigration(eucId) {
   return (await apiFetch(`/euc/${eucId}/migration/analyze`, { method: "POST" })).json();
 }
@@ -900,6 +1143,14 @@ export async function reviewEucApplicationComponent(eucId, componentId, decision
   })).json();
 }
 
+export async function bulkReviewEucApplicationComponents(eucId, decision, reason, componentType = null, minConfidence = 0) {
+  return (await apiFetch(`/euc/${eucId}/application-model/components/bulk-review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision, reason, component_type: componentType, min_confidence: minConfidence }),
+  })).json();
+}
+
 export async function approveEucApplicationModel(eucId) {
   return (await apiFetch(`/euc/${eucId}/application-model/approve`, { method: "POST" })).json();
 }
@@ -919,6 +1170,14 @@ export async function getEucApplicationGeneration(eucId) {
 export async function downloadEucApplicationGeneration(eucId, generationRunId) {
   const response = await apiFetch(`/euc/${eucId}/application-model/generation/${generationRunId}/download`);
   await downloadResponse(response, `${generationRunId.toLowerCase()}.zip`);
+}
+
+export async function getEucApplicationGenerationFiles(eucId, generationRunId) {
+  return (await apiFetch(`/euc/${eucId}/application-model/generation/${generationRunId}/files`)).json();
+}
+
+export async function getEucApplicationGenerationFile(eucId, generationRunId, path) {
+  return (await apiFetch(`/euc/${eucId}/application-model/generation/${generationRunId}/files/${path}`)).json();
 }
 
 export async function getWorkbookBlame(branchId, sheetId = "", limit = 5000) {

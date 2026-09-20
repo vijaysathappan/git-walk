@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .. import database
 from ..config import settings
+from ..observability import record_metric, structured_log
 from ..secret_store import decrypt_secret
 from ..services.semantic_ledger_service import ledger_for_connection
 from .catalog import is_free_nvidia_model_id, supports_structured_output
@@ -79,12 +81,19 @@ GROUNDED_ANSWER_SCHEMA = {
 }
 
 
+def _strip_reasoning_wrapper(raw: str) -> str:
+    """Remove <think>...</think> reasoning blocks and ``` fences some free
+    reasoning models (e.g. Nemotron) wrap around their JSON answer, so JSON
+    validation sees only the actual payload."""
+    candidate = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE).strip()
+    candidate = re.sub(r"^```(?:json|markdown)?\s*|\s*```$", "", candidate, flags=re.IGNORECASE).strip()
+    return candidate
+
+
 class StructuredOutputService:
     @staticmethod
     def parse(raw: str) -> GroundedAnswer:
-        candidate = raw.strip()
-        if candidate.startswith("```"):
-            candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.IGNORECASE)
+        candidate = _strip_reasoning_wrapper(raw)
         try:
             return GroundedAnswer.model_validate_json(candidate)
         except ValidationError:
@@ -95,10 +104,17 @@ class StructuredOutputService:
 
     @staticmethod
     def safe_fallback(raw: str) -> GroundedAnswer | None:
-        candidate = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE).strip()
-        candidate = re.sub(r"^```(?:json|markdown)?\s*|\s*```$", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = _strip_reasoning_wrapper(raw)
         if not candidate:
             return None
+        # The model may still have produced valid (or near-valid) JSON that
+        # simply failed strict validation on the first pass (e.g. an extra
+        # leading sentence before the object) — try once more here instead
+        # of dumping the raw JSON text into `answer` as if it were prose.
+        try:
+            return StructuredOutputService.parse(candidate)
+        except (ValidationError, json.JSONDecodeError):
+            pass
         return GroundedAnswer(
             answer=candidate[:12000], evidence=[], confidence=0,
             insufficient_evidence=True, recommended_actions=[],
@@ -133,6 +149,18 @@ class AIGateway:
 
     def route(self, conn, organization_id: str, user_id: str, feature: str, classification: str = "INTERNAL",
               requested_model: str | None = None) -> ModelRoute:
+        # Phase 2 AI/LLM hardening — Option A chosen (see gitwalk-production-
+        # readiness-audit.md task 1): the free-NVIDIA-only policy is a fixed
+        # cost-control decision, not something administration should be able
+        # to loosen. is_free_nvidia_model_id() (catalog.py) stays the single
+        # hardcoded source of truth; this method still re-checks it here as
+        # defense-in-depth even though both write paths that can set a model
+        # (POST /api/v1/ai/config for a user's personal key, and PUT
+        # /api/v1/ai-platform/administration/model-policies/{feature} for an
+        # org policy — see AIService.update_model_policy) already reject a
+        # non-free-NVIDIA model at write time. A request-time rejection here
+        # should now only ever happen from data that predates that write-time
+        # check, not from a fresh save through either endpoint.
         org = conn.execute("SELECT * FROM AI_ORGANIZATION_SETTINGS WHERE ORGANIZATION_ID=?", (organization_id,)).fetchone()
         if org and not org["AI_ENABLED"]: raise PermissionError("AI is disabled for this organization")
         if org and not org["EXTERNAL_AI_ENABLED"]: raise PermissionError("External AI providers are disabled for this organization")
@@ -147,7 +175,8 @@ class AIGateway:
         if model_slug and not is_free_nvidia_model_id(model_slug):
             raise AIProviderError(
                 "AI_MODEL_NOT_ALLOWED",
-                "Git Walk only permits free NVIDIA OpenRouter models.",
+                "Only free-tier NVIDIA OpenRouter models are permitted by system policy; "
+                f"the model configured for this user ({model_slug!r}) is not eligible.",
             )
         if policy and policy["MODEL_ID"]:
             model = conn.execute("SELECT * FROM AI_MODELS WHERE MODEL_ID=? AND ENABLED=1", (policy["MODEL_ID"],)).fetchone()
@@ -168,7 +197,8 @@ class AIGateway:
         if not is_free_nvidia_model_id(model["MODEL_SLUG"]):
             raise AIProviderError(
                 "AI_MODEL_NOT_ALLOWED",
-                "The active route is not a free NVIDIA OpenRouter model.",
+                "Only free-tier NVIDIA OpenRouter models are permitted by system policy; "
+                f"the model configured in this feature policy ({model['MODEL_SLUG']!r}) is not eligible.",
             )
         if policy and model["MODEL_ROLE"] != policy["MODEL_ROLE"]:
             raise PermissionError("The selected model does not satisfy the active feature capability policy")
@@ -192,11 +222,33 @@ class AIGateway:
         if org_used >= org_quota: raise AIProviderError("AI_ORGANIZATION_QUOTA_EXCEEDED", "Organization daily AI token quota is exhausted")
         if user_used >= user_quota: raise AIProviderError("AI_USER_QUOTA_EXCEEDED", "User daily AI token quota is exhausted")
 
+    @staticmethod
+    def _record_response_metrics(feature: str, user_id: str, grounding_confidence: float, insufficient_evidence: bool) -> None:
+        """The two numbers a 3-AM-debugging engineer needs to tell 'AI is
+        degraded' (grounding confidence trending down / insufficient-
+        evidence rate trending up) from 'AI is down' (which the existing
+        latency/error-rate metrics on ai_request_latency already cover).
+        Uses the same record_metric() mechanism as every other metric in
+        the product, so it appears in GET /api/v1/observability/metrics
+        for free — that endpoint groups by METRIC_NAME with no code change
+        needed per metric name.
+        """
+        record_metric("ai_grounding_confidence", grounding_confidence, "score", user_id=user_id, tags={"feature": feature})
+        record_metric("ai_insufficient_evidence", 1.0 if insufficient_evidence else 0.0, "flag", user_id=user_id, tags={"feature": feature})
+
     async def generate(self, *, organization_id: str, user_id: str, feature: str, question: str,
                        evidence: list[dict[str, Any]], context_hash: str, conversation_id: str | None = None,
-                       requested_model: str | None = None, classification: str = "INTERNAL") -> dict[str, Any]:
+                       requested_model: str | None = None, classification: str = "INTERNAL",
+                       agent_key: str | None = None, agent_run_id: str | None = None) -> dict[str, Any]:
         request_started = time.perf_counter()
         conn = database._get_connection(); now = database._utcnow(); request_id = _id("AIRQ")
+        # Correlates the AI-layer identifier with the ambient HTTP
+        # request_id/trace_id (structured_log() embeds both automatically
+        # from observability.py's context vars) — an operator can go from
+        # an X-Request-ID in an access log straight to this AI_REQUEST_ID,
+        # and from AI_REQUEST_ID back to the originating HTTP request.
+        structured_log(logging.INFO, "ai_request_started", ai_request_id=request_id,
+                       feature=feature, organization_id=organization_id, user_id=user_id)
         try:
             self.enforce_quota(conn, organization_id, user_id)
             route = self.route(conn, organization_id, user_id, feature, classification, requested_model)
@@ -204,8 +256,8 @@ class AIGateway:
             cache_key = _hash({"model": route.model_id, "prompt": route.prompt_version_id, "context": context_hash, "query": query_hash})
             cached = conn.execute("SELECT * FROM AI_RESPONSE_CACHE WHERE CACHE_KEY=? AND EXPIRES_AT>?", (cache_key, now)).fetchone()
             conn.execute("""INSERT INTO AI_REQUESTS
-                (AI_REQUEST_ID,ORGANIZATION_ID,USER_ID,CONVERSATION_ID,FEATURE,MODEL_ID,PROMPT_VERSION_ID,INPUT_HASH,CONTEXT_HASH,STATUS,CREATED_AT)
-                VALUES (?,?,?,?,?,?,?,?,?,'RUNNING',?)""", (request_id, organization_id, user_id, conversation_id, feature, route.model_id, route.prompt_version_id, input_hash, context_hash, now))
+                (AI_REQUEST_ID,ORGANIZATION_ID,USER_ID,CONVERSATION_ID,FEATURE,AGENT_KEY,MODEL_ID,PROMPT_VERSION_ID,INPUT_HASH,CONTEXT_HASH,STATUS,CREATED_AT,AGENT_RUN_ID)
+                VALUES (?,?,?,?,?,?,?,?,?,?,'RUNNING',?,?)""", (request_id, organization_id, user_id, conversation_id, feature, agent_key, route.model_id, route.prompt_version_id, input_hash, context_hash, now, agent_run_id))
             for ordinal, item in enumerate(evidence):
                 conn.execute("INSERT OR IGNORE INTO AI_REQUEST_CONTEXT_REFS VALUES (?,?,?,?,?,?,?)",
                              (request_id, item["type"], item["id"], item.get("source_hash"), item.get("freshness_at"), item.get("classification", "INTERNAL"), ordinal))
@@ -215,6 +267,9 @@ class AIGateway:
                 conn.execute("UPDATE AI_RESPONSE_CACHE SET LAST_HIT_AT=?,HIT_COUNT=HIT_COUNT+1 WHERE CACHE_KEY=?", (now, cache_key))
                 conn.execute("UPDATE AI_REQUESTS SET STATUS='COMPLETED',CACHE_HIT=1,LATENCY_MS=?,RETRIEVAL_HITS=?,OUTPUT_VALID=1,GROUNDING_CONFIDENCE=?,COMPLETED_AT=? WHERE AI_REQUEST_ID=?",
                              (cache_latency, len(evidence), answer.get("confidence", 0), now, request_id)); conn.commit()
+                self._record_response_metrics(feature, user_id, answer.get("confidence", 0), bool(answer.get("insufficient_evidence")))
+                structured_log(logging.INFO, "ai_request_completed", ai_request_id=request_id,
+                               feature=feature, cache_hit=True, grounding_confidence=answer.get("confidence", 0))
                 return {
                     **answer, "ai_request_id": request_id, "model": route.model_slug,
                     "cache_hit": True, "latency_ms": round(cache_latency, 2),
@@ -276,6 +331,10 @@ class AIGateway:
                          (_id("AITL"), request_id, organization_id, user_id, feature, route.model_id, provider_result.input_tokens,
                           provider_result.output_tokens, provider_result.reasoning_tokens, completed))
             conn.commit()
+            self._record_response_metrics(feature, user_id, grounding, insufficient)
+            structured_log(logging.INFO, "ai_request_completed", ai_request_id=request_id,
+                           feature=feature, cache_hit=False, grounding_confidence=grounding,
+                           insufficient_evidence=insufficient, latency_ms=round(latency, 2))
             return {**answer, "ai_request_id": request_id, "model": route.model_slug, "cache_hit": False,
                     "latency_ms": round(latency, 2),
                     "usage": {"input_tokens": provider_result.input_tokens, "output_tokens": provider_result.output_tokens, "reasoning_tokens": provider_result.reasoning_tokens}}

@@ -30,6 +30,7 @@ from ..repositories.merge_store import (
 from ..observability import metric_timer, record_audit_event, record_metric
 from ..access_control.engine import authorization_engine, branch_resource, repository_resource
 from .branch_lifecycle_manager import BranchLifecycleManager
+from ..euc.continuous_assurance import rescore_repository_after_merge
 
 
 class MergeConflictError(RuntimeError):
@@ -118,6 +119,17 @@ class MergeService:
                 payload={"count": len(merge_result["conflicts"]),
                          "types": sorted({item["conflict_type"] for item in merge_result["conflicts"]})},
             )
+            try:
+                owner_id = source.get("repository_owner_id")
+                if owner_id and owner_id != actor.user_id:
+                    from .. import database
+                    database.create_notification(
+                        owner_id, "MERGE_REQUEST_CONFLICTED", "New merge request has conflicts",
+                        f"'{title}' has {len(merge_result['conflicts'])} conflict(s) — run AI analysis or resolve manually.",
+                        resource_type="MERGE_REQUEST", resource_id=request_id,
+                    )
+            except Exception:
+                pass
         record_metric(
             "merge_conflict", 1 if merge_result["conflicts"] else 0, "boolean",
             user_id=actor.user_id, repository_id=source["repository_id"],
@@ -216,6 +228,11 @@ class MergeService:
         else:
             raise ValueError("Unsupported conflict resolution")
         resolve_conflict_record(conflict_id, actor.user_id, resolution_type, selected)
+        try:
+            from ..ai.merge_knowledge import record_resolution_outcome
+            record_resolution_outcome(conflict, resolution_type, selected, request["repository_id"])
+        except Exception:
+            pass
         record_audit_event(
             "MERGE_CONFLICT_RESOLVED", actor_user_id=actor.user_id,
             repository_id=request["repository_id"], branch_id=request["source_branch_id"],
@@ -329,6 +346,13 @@ class MergeService:
             repository_id=target["repository_id"], branch_id=source["branch_id"],
             merge_request_id=merge_request_id,
         )
+        try:
+            rescore_repository_after_merge(
+                target["repository_id"], target["data_table_id"], target["branch_id"],
+                target["branch_name"], actor.user_id,
+            )
+        except Exception:
+            pass
         return {
             **result,
             "merge_request_id": merge_request_id,

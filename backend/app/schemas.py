@@ -64,10 +64,6 @@ class SyncResponse(BaseModel):
         ...,
         description="True when this request changed the stored value",
     )
-    database_path: str = Field(
-        ...,
-        description="Canonical SQLite file updated by the backend",
-    )
 
 
 class CellValueResponse(BaseModel):
@@ -77,7 +73,6 @@ class CellValueResponse(BaseModel):
     row_id: int
     column_name: str
     value: str | int | float | bool | None = None
-    database_path: str
 
 
 class UploadResponse(BaseModel):
@@ -94,6 +89,7 @@ class LoginRequest(BaseModel):
 
 class LoginVerifyRequest(LoginRequest):
     code: str = Field(..., min_length=6, max_length=6)
+    machine_id: str | None = Field(default=None, max_length=200)
 
 
 class WorkbookAuthRequest(BaseModel):
@@ -104,6 +100,7 @@ class WorkbookAuthRequest(BaseModel):
     base_commit_id: str = Field(..., min_length=4, max_length=80)
     issued_at: str = Field(..., min_length=10, max_length=80)
     signature: str = Field(..., min_length=32, max_length=128)
+    machine_id: str | None = Field(default=None, max_length=200)
 
 
 class WorkbookVerifyRequest(BaseModel):
@@ -113,11 +110,19 @@ class WorkbookVerifyRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=120)
     code: str = Field(..., min_length=6, max_length=6)
     current_file_path: str = Field(..., min_length=1, max_length=500)
+    machine_id: str | None = Field(default=None, max_length=200)
 
 
 class SetPasswordRequest(BaseModel):
     user_id_or_email: str = Field(..., min_length=3, max_length=120)
     password: str = Field(..., min_length=1, max_length=128)
+
+
+class SanitizeLocalRequest(BaseModel):
+    working_copy_id: str | None = None
+    file_path: str | None = None
+    table_id: str | None = None
+    force: bool = False
 
 
 class BulkCellChange(BaseModel):
@@ -222,6 +227,7 @@ class PresenceRequest(BaseModel):
     client_id: str = Field(..., min_length=8, max_length=100)
     surface: str = Field(..., pattern="^(browser|excel)$")
     activity: str = Field(default="viewing", pattern="^(viewing|editing|idle)$")
+    status: str = Field(default="ONLINE", pattern="^(ONLINE|NEED_HELP)$")
 
 
 class AIInsightRequest(BaseModel):

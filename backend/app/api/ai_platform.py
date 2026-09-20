@@ -8,7 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..access_control.service import primary_organization
+from ..ai import ledger_analytics
 from ..ai.gateway import AIProviderError
+from ..ai.personal_activity import personal_activity
 from ..ai.service import ai_service
 from ..security import Principal, current_principal
 
@@ -155,6 +157,46 @@ async def usage(organization_id: str | None = Query(default=None), principal: Pr
     except Exception as exc: _raise(exc)
 
 
+@router.get("/ledger/agents")
+async def ledger_agents(days: int = Query(default=30, ge=1, le=365), organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return {"agents": ledger_analytics.agent_leaderboard(_organization(organization_id, principal), principal.user_id, days)}
+    except Exception as exc: _raise(exc)
+
+
+@router.get("/ledger/trend")
+async def ledger_trend(days: int = Query(default=30, ge=1, le=365), organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return {"trend": ledger_analytics.daily_trend(_organization(organization_id, principal), principal.user_id, days)}
+    except Exception as exc: _raise(exc)
+
+
+@router.get("/ledger/models")
+async def ledger_models(days: int = Query(default=30, ge=1, le=365), organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return {"models": ledger_analytics.model_breakdown(_organization(organization_id, principal), principal.user_id, days)}
+    except Exception as exc: _raise(exc)
+
+
+@router.get("/ledger/runs")
+async def ledger_runs(
+    agent_key: str | None = Query(default=None), status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200), cursor: int = Query(default=0, ge=0),
+    organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal),
+):
+    try: return ledger_analytics.run_ledger(_organization(organization_id, principal), principal.user_id, agent_key, status, limit, cursor)
+    except Exception as exc: _raise(exc)
+
+
+@router.get("/ledger/runs/{agent_run_id}")
+async def ledger_run_receipt(agent_run_id: str, organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return ledger_analytics.run_receipt(_organization(organization_id, principal), principal.user_id, agent_run_id)
+    except Exception as exc: _raise(exc)
+
+
+@router.get("/ledger/budget")
+async def ledger_budget(organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return ledger_analytics.budget_status(_organization(organization_id, principal), principal.user_id)
+    except Exception as exc: _raise(exc)
+
+
 @router.post("/evaluations/run")
 async def run_evaluation(organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
     try: return ai_service.run_evaluation(_organization(organization_id, principal), principal.user_id)
@@ -182,4 +224,10 @@ async def update_settings(payload: OrganizationAISettings, organization_id: str 
 @router.put("/administration/model-policies/{feature}")
 async def update_model_policy(feature: str, payload: ModelPolicyRequest, organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
     try: return ai_service.update_model_policy(_organization(organization_id, principal), principal.user_id, feature, payload.model_dump())
+    except Exception as exc: _raise(exc)
+
+
+@router.get("/personal-activity")
+async def get_personal_activity(range: str = Query(default="30d", pattern="^(7d|30d|all)$"), organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return personal_activity(_organization(organization_id, principal), principal.user_id, range)
     except Exception as exc: _raise(exc)

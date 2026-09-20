@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import CommitReviewPanel from "./CommitReviewPanel";
 import StatusBanner from "./StatusBanner";
 import {
   authenticateWorkbook,
@@ -7,6 +8,7 @@ import {
   getBranchState,
   getBranchDivergence,
   getClientId,
+  getDeviceId,
   getStoredAuth,
   getWorkbookSnapshot,
   heartbeatPresence,
@@ -16,6 +18,7 @@ import {
   syncBranchWithMain,
   verifyLoginCode,
   verifyWorkbookAccess,
+  sanitizeLocalWorkbook,
   setUserPassword,
 } from "../services/api";
 
@@ -30,6 +33,7 @@ const WORKBOOK_METADATA_NAMES = {
   signature: "_GITWALK_SIGNATURE",
   local_file_path: "_GITWALK_LOCAL_FILE_PATH",
   required_role: "_GITWALK_REQUIRED_ROLE",
+  assigned_email: "_GITWALK_ASSIGNED_EMAIL",
 };
 const ROW_ID_HEADER = "__GITWALK_ROW_ID";
 const LEGACY_ROW_ID_HEADER = "__LIVESYNC_ROW_ID";
@@ -710,7 +714,127 @@ const buttonStyle = {
   cursor: "pointer", boxShadow: "0 4px 14px rgba(35,134,54,.18)",
 };
 
-function PathBlockedPanel({ expectedPath, currentPath }) {
+async function purgeWorkbookData(lockNotice = "[LOCKED] Verification required to display branch data.") {
+  if (typeof window === "undefined" || !window.Excel || !window.Excel.run) return;
+  try {
+    await window.Excel.run(async (context) => {
+      const worksheets = context.workbook.worksheets;
+      worksheets.load("items/id,name,position");
+      await context.sync();
+
+      for (const sheet of worksheets.items) {
+        const used = sheet.getUsedRangeOrNullObject(true);
+        used.load(["isNullObject", "rowIndex", "columnIndex", "rowCount", "columnCount"]);
+        const tables = sheet.tables;
+        tables.load("items");
+        await context.sync();
+
+        if (used.isNullObject) continue;
+
+        // Process Excel tables on this worksheet
+        if (tables.items && tables.items.length > 0) {
+          for (const table of tables.items) {
+            try {
+              const tableRange = table.getRange();
+              tableRange.load(["rowIndex", "columnIndex", "rowCount", "columnCount"]);
+              const dataBody = table.getDataBodyRangeOrNullObject();
+              dataBody.load(["isNullObject"]);
+              await context.sync();
+
+              // Clear all existing data rows/formulas inside table
+              if (!dataBody.isNullObject) {
+                dataBody.clear(window.Excel.ClearApplyTo.contents);
+              }
+
+              const startRow = tableRange.rowIndex;
+              const startCol = tableRange.columnIndex;
+              const numCols = Math.max(1, tableRange.columnCount);
+              const oldRows = tableRange.rowCount;
+
+              if (oldRows > 1) {
+                // Resize table down to header + 1 placeholder row (2 rows total)
+                const minTarget = sheet.getRangeByIndexes(startRow, startCol, 2, numCols);
+                table.resize(minTarget);
+                await context.sync();
+
+                // Clear any leftover cells below the resized table
+                if (oldRows > 2) {
+                  sheet
+                    .getRangeByIndexes(startRow + 2, startCol, oldRows - 2, numCols)
+                    .clear(window.Excel.ClearApplyTo.all);
+                }
+
+                // Place the lockNotice in column 0 of row 2 (startRow + 1)
+                const placeholder = Array.from({ length: numCols }, (_, idx) => (idx === 0 ? lockNotice : ""));
+                const rowRange = sheet.getRangeByIndexes(startRow + 1, startCol, 1, numCols);
+                rowRange.values = [placeholder];
+              }
+            } catch (tblErr) {
+              console.warn("Table wipe warning:", tblErr);
+            }
+          }
+
+          // Clear any extra rows below row 2 across the used range
+          if (used.rowCount > 2) {
+            try {
+              sheet
+                .getRangeByIndexes(used.rowIndex + 2, used.columnIndex, used.rowCount - 2, used.columnCount)
+                .clear(window.Excel.ClearApplyTo.all);
+            } catch {
+              // ignore
+            }
+          }
+        } else {
+          // Plain sheet without Excel tables:
+          if (used.rowCount > 1) {
+            // Clear all data rows below header row (row 1 onwards)
+            sheet
+              .getRangeByIndexes(used.rowIndex + 1, used.columnIndex, used.rowCount - 1, used.columnCount)
+              .clear(window.Excel.ClearApplyTo.all);
+
+            // Put locked notice in the first cell under header
+            sheet.getCell(used.rowIndex + 1, used.columnIndex).values = [[lockNotice]];
+          }
+        }
+      }
+      try {
+        if (context.workbook && typeof context.workbook.save === "function") {
+          context.workbook.save(window.Excel?.SaveBehavior?.save || "Save");
+        }
+      } catch {
+        // ignore save errors
+      }
+      await context.sync();
+    });
+  } catch (err) {
+    console.warn("Could not purge workbook data:", err);
+  }
+}
+
+function PathBlockedPanel({ expectedPath, currentPath, onWipeData }) {
+  const [wiped, setWiped] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    purgeWorkbookData("[LOCKED] Unauthorized file location. Verification blocked.");
+  }, []);
+
+  const handleWipe = async () => {
+    setBusy(true);
+    try {
+      if (onWipeData) {
+        await onWipeData();
+      } else {
+        await purgeWorkbookData("[LOCKED] Unauthorized file location. Verification blocked.");
+      }
+      setWiped(true);
+    } catch {
+      // ignore
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div style={containerStyle}>
       <div style={{ marginTop: 25 }}>
@@ -722,7 +846,17 @@ function PathBlockedPanel({ expectedPath, currentPath }) {
           This workbook cannot load server data because its current file location does not match the authorized path injected during download.
         </p>
       </div>
-      <div style={{ ...cardStyle, borderColor: "#f85149", background: "rgba(248,81,73,0.08)", marginTop: 14 }}>
+
+      <div style={{ ...cardStyle, borderColor: "#2ea043", background: "rgba(46,160,67,0.12)", marginTop: 14, padding: "10px 12px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#75ead0", fontSize: 11, fontWeight: 700 }}>
+          <span>✓</span> Data Rows Wiped & Protected
+        </div>
+        <div style={{ color: "#8fa4af", fontSize: 10, marginTop: 4, lineHeight: 1.5 }}>
+          All worksheet data has been purged from this unauthorized copy. Sensitive EUC data is protected from exposure.
+        </div>
+      </div>
+
+      <div style={{ ...cardStyle, borderColor: "#f85149", background: "rgba(248,81,73,0.08)", marginTop: 12 }}>
         <div style={{ ...labelStyle, color: "#ff8b82" }}>Authorized Download Location</div>
         <div style={{ color: "#75ead0", fontSize: 10, fontFamily: "Consolas, monospace", wordBreak: "break-all", marginBottom: 12 }}>
           {expectedPath || "Not specified"}
@@ -742,13 +876,22 @@ function PathBlockedPanel({ expectedPath, currentPath }) {
         <div style={{ color: "#58a6ff", fontSize: 10, fontFamily: "Consolas, monospace", marginTop: 8, wordBreak: "break-all" }}>
           {expectedPath}
         </div>
+        <button
+          type="button"
+          style={{ ...buttonStyle, background: "#da3633", borderColor: "#f85149", marginTop: 14 }}
+          onClick={handleWipe}
+          disabled={busy}
+        >
+          {busy ? "Purging data..." : wiped ? "✓ Re-purge Worksheet Data" : "Purge Worksheet Data"}
+        </button>
       </div>
     </div>
   );
 }
 
 function WorkbookVerificationPanel({ embeddedInfo, onVerifiedAndLoaded }) {
-  const [email, setEmail] = useState("");
+  const assignedEmail = embeddedInfo.assigned_email || "";
+  const [email, setEmail] = useState(assignedEmail);
   const [code, setCode] = useState("");
   const [sent, setSent] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -776,11 +919,22 @@ function WorkbookVerificationPanel({ embeddedInfo, onVerifiedAndLoaded }) {
           email: email.trim(),
           code: code.trim(),
           current_file_path: currentDocPath,
+          machine_id: getDeviceId(),
         });
         await onVerifiedAndLoaded(result);
       }
     } catch (err) {
-      setError(err.message || "Verification failed. Check your code and role.");
+      if (err.detail?.code === "DEVICE_BLOCKED") {
+        await purgeWorkbookData("[LOCKED] This device was blocked by the repository owner.");
+        setError("This device has been blocked by the repository owner. Contact them to restore access.");
+      } else if (err.detail?.code === "DEVICE_MISMATCH") {
+        await purgeWorkbookData("[LOCKED] This workbook is locked to a different device. Ask the repository owner to trust this device.");
+        setError("This workbook was first opened on a different device and is locked to it. Ask the repository owner to trust this device from Team Activity, then try again.");
+      } else if (err.message?.includes("ASSIGNED_USER_MISMATCH")) {
+        setError("This workbook is issued to a different account. Ask the repository owner to issue you your own branch workbook.");
+      } else {
+        setError(err.message || "Verification failed. Check your code and role.");
+      }
     } finally {
       setBusy(false);
     }
@@ -812,16 +966,30 @@ function WorkbookVerificationPanel({ embeddedInfo, onVerifiedAndLoaded }) {
 
       <form onSubmit={submit} style={{ ...cardStyle, display: "grid", gap: 11 }}>
         <div>
-          <div style={labelStyle}>Work email</div>
+          <div style={labelStyle}>
+            {assignedEmail ? (
+              <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span>🔒</span> Issued to
+              </span>
+            ) : (
+              "Work email"
+            )}
+          </div>
           <input
-            style={inputStyle}
+            style={{ ...inputStyle, ...(assignedEmail ? { opacity: 0.75, cursor: "not-allowed" } : {}) }}
             type="email"
             value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            onChange={(e) => { if (!assignedEmail) setEmail(e.target.value); }}
             placeholder="name@company.com"
             disabled={sent || busy}
+            readOnly={!!assignedEmail}
             autoFocus
           />
+          {assignedEmail ? (
+            <div style={{ color: "#8fa4af", fontSize: 10, marginTop: 4 }}>
+              This workbook is issued to {assignedEmail}. Sign in with another account isn't allowed on this file.
+            </div>
+          ) : null}
         </div>
         {sent ? (
           <div>
@@ -880,7 +1048,7 @@ function AuthPanel({ onAuthenticated }) {
         setNote(result.dev_otp ? `Local code: ${result.dev_otp}` : "Check your email for the 6-digit code.");
         if (result.dev_otp) setCode(result.dev_otp);
       } else {
-        onAuthenticated(await verifyLoginCode(email.trim(), code.trim()));
+        onAuthenticated(await verifyLoginCode(email.trim(), code.trim(), getDeviceId()));
       }
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   };
@@ -925,6 +1093,12 @@ export default function TaskpaneUI() {
   const [workspaceClosed, setWorkspaceClosed] = useState(false);
   const [branchName, setBranchName] = useState("");
   const [pullSource, setPullSource] = useState("branch");
+  const [lastCommitId, setLastCommitId] = useState(null);
+  const [recoveredDraft, setRecoveredDraft] = useState(null);
+  const [pendingCommit, setPendingCommit] = useState(null);
+  const [pendingCommitBusy, setPendingCommitBusy] = useState(false);
+  const [deviceBlocked, setDeviceBlocked] = useState(false);
+  const [workStatus, setWorkStatus] = useState("ONLINE");
 
   const baselineRef = useRef(null);
   const workbookIdentityRef = useRef(null);
@@ -936,6 +1110,10 @@ export default function TaskpaneUI() {
   const logEndRef = useRef(null);
   const presenceTimerRef = useRef(null);
   const clientIdRef = useRef(getClientId("excel"));
+  const workStatusRef = useRef("ONLINE");
+  const deviceBlockedRef = useRef(false);
+  const retryPendingCommitRef = useRef(null);
+  const reviewChangesRef = useRef(null);
 
   useEffect(() => {
     const expireSession = () => setAuth(null);
@@ -949,12 +1127,91 @@ export default function TaskpaneUI() {
     setLogs((previous) => [...previous.slice(-119), { time, message, isError }]);
   }, []);
 
+  useEffect(() => {
+    const onReconnect = () => {
+      if (!pendingCommit) return;
+      addLog("Network connection restored. Retrying pending commit automatically...");
+      retryPendingCommitRef.current?.();
+    };
+    window.addEventListener("online", onReconnect);
+    return () => window.removeEventListener("online", onReconnect);
+  }, [addLog, pendingCommit]);
+
   const saveBaseVersion = useCallback((version, targetTableId = tableId, headCommitId = null) => new Promise((resolve) => {
     Office.context.document.settings.set(`baseVersion:${targetTableId}`, version);
     Office.context.document.settings.set("baseVersion", version);
     if (headCommitId) Office.context.document.settings.set(`baseHead:${targetTableId}`, headCommitId);
     Office.context.document.settings.saveAsync(() => resolve());
   }), [tableId]);
+
+  // Local, no-network draft/pending-commit persistence — stored in the
+  // workbook file itself (Office.context.document.settings), so it survives
+  // an Excel crash/close-without-committing and a failed commit request,
+  // without needing a server round-trip to save.
+  const saveDraft = useCallback((targetTableId, draft) => new Promise((resolve) => {
+    Office.context.document.settings.set(`draftDiff:${targetTableId}`, JSON.stringify(draft));
+    Office.context.document.settings.saveAsync(() => resolve());
+  }), []);
+  const loadDraft = useCallback((targetTableId) => {
+    const raw = Office.context.document.settings.get(`draftDiff:${targetTableId}`);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  }, []);
+  const clearDraft = useCallback((targetTableId) => new Promise((resolve) => {
+    Office.context.document.settings.remove(`draftDiff:${targetTableId}`);
+    Office.context.document.settings.saveAsync(() => resolve());
+  }), []);
+
+  const savePendingCommit = useCallback((targetTableId, payload) => new Promise((resolve) => {
+    Office.context.document.settings.set(`pendingCommit:${targetTableId}`, JSON.stringify({ ...payload, saved_at: new Date().toISOString() }));
+    Office.context.document.settings.saveAsync(() => resolve());
+  }), []);
+  const loadPendingCommit = useCallback((targetTableId) => {
+    const raw = Office.context.document.settings.get(`pendingCommit:${targetTableId}`);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  }, []);
+  const clearPendingCommit = useCallback((targetTableId) => new Promise((resolve) => {
+    Office.context.document.settings.remove(`pendingCommit:${targetTableId}`);
+    Office.context.document.settings.saveAsync(() => resolve());
+  }), []);
+
+  // Shared reaction to a DEVICE_BLOCKED response from any endpoint (login,
+  // workbook-verify, commit, or the periodic presence heartbeat below):
+  // protect whatever is currently staged-but-uncommitted BEFORE wiping the
+  // sheet, so a block never silently destroys local work.
+  const handleDeviceBlocked = useCallback(async (targetTableId = tableId) => {
+    // Idempotency guard: purging the sheet fires Excel onChanged events,
+    // which drive markDirty -> another heartbeat -> another 403 -> another
+    // call here. A synchronous ref (not state, which updates async) stops
+    // that from looping.
+    if (deviceBlockedRef.current) return;
+    deviceBlockedRef.current = true;
+    clearInterval(presenceTimerRef.current);
+    setDeviceBlocked(true);
+    // Force-compute the current diff first: `staged` can be null/stale if
+    // the user made raw cell edits but never triggered reviewChanges() —
+    // without this, those edits would never be captured before the purge.
+    let latestStaged = staged;
+    if (targetTableId && baselineRef.current) {
+      try {
+        latestStaged = await reviewChangesRef.current?.();
+      } catch {
+        // Excel may already be unreachable; fall back to whatever was staged.
+      }
+    }
+    if (targetTableId && latestStaged?.changeCount) {
+      await saveDraft(targetTableId, {
+        base_head: baselineRef.current?.head_commit_id, base_version: baselineRef.current?.version,
+        semantic_changes: latestStaged.semantic_changes, commit_message: commitMessage,
+        blocked_at: new Date().toISOString(),
+      }).catch(() => {});
+      addLog(`Saved ${latestStaged.changeCount} uncommitted change(s) locally before locking — they'll be offered for recovery once access is restored.`, true);
+    }
+    await purgeWorkbookData("[LOCKED] This device was blocked by the repository owner. Any unsaved changes were saved locally.");
+    setSyncStatus("error"); setStatusMsg("Device blocked by repository owner");
+    addLog("This device has been blocked by the repository owner. Contact them to restore access.", true);
+  }, [addLog, commitMessage, saveDraft, staged, tableId]);
 
   const readWorkbook = useCallback(async () => window.Excel.run(async (context) => {
     const worksheets = context.workbook.worksheets;
@@ -1167,8 +1424,20 @@ export default function TaskpaneUI() {
     setSyncStatus(diff.changeCount ? "syncing" : "connected");
     setStatusMsg(diff.changeCount ? `${diff.changeCount} staged change(s)` : "Working tree clean");
     addLog(diff.changeCount ? `Reviewed ${diff.changeCount} staged change(s).` : "Working tree matches the checked-out version.");
+    if (diff.changeCount && tableId) {
+      saveDraft(tableId, {
+        base_head: baselineRef.current.head_commit_id, base_version: baselineRef.current.version,
+        semantic_changes: diff.semantic_changes, commit_message: commitMessage,
+      }).catch(() => {});
+    } else if (tableId) {
+      clearDraft(tableId).catch(() => {});
+    }
     return diff;
-  }, [addLog, readWorkbook]);
+  }, [addLog, clearDraft, commitMessage, readWorkbook, saveDraft, tableId]);
+
+  useEffect(() => {
+    reviewChangesRef.current = reviewChanges;
+  }, [reviewChanges]);
 
   const refreshAfterCommit = useCallback(async () => {
     const latest = await getWorkbookSnapshot(tableId);
@@ -1182,10 +1451,11 @@ export default function TaskpaneUI() {
   const commitChanges = useCallback(async () => {
     if (!commitMessage.trim()) { addLog("Enter a commit message first.", true); return; }
     setBusy(true); setSyncStatus("syncing"); setStatusMsg("Creating audited commit...");
+    let commitPayload = null;
     try {
       const diff = await reviewChanges();
       if (!diff.changeCount) return;
-      const result = await commitWorkbook({
+      commitPayload = {
         table_id: tableId,
         ...(workbookIdentityRef.current || {}),
         base_version: baselineRef.current.version,
@@ -1193,9 +1463,14 @@ export default function TaskpaneUI() {
         semantic_changes: diff.semantic_changes,
         source: "excel_commit",
         commit_message: commitMessage.trim(),
-      });
+      };
+      const result = await commitWorkbook(commitPayload);
       addLog(`Committed ${result.commit_id} as version ${result.version}; ${result.change_count} semantic operation(s).`);
       setCommitMessage("");
+      setLastCommitId(result.commit_id);
+      clearDraft(tableId).catch(() => {});
+      clearPendingCommit(tableId).catch(() => {});
+      setPendingCommit(null); setRecoveredDraft(null);
       try {
         await refreshAfterCommit();
         setSyncStatus("synced");
@@ -1210,7 +1485,9 @@ export default function TaskpaneUI() {
       }
     } catch (err) {
       setSyncStatus("error"); setStatusMsg(err.message);
-      if (err.detail?.code === "WORKING_COPY_CLOSED") {
+      if (err.detail?.code === "DEVICE_BLOCKED") {
+        await handleDeviceBlocked();
+      } else if (err.detail?.code === "WORKING_COPY_CLOSED") {
         setWorkspaceClosed(true);
         setStatusMsg("Workspace merged");
         addLog("This branch was merged. Commit is disabled; create a new workspace from Git Walk.", true);
@@ -1218,9 +1495,45 @@ export default function TaskpaneUI() {
         const currentHead = err.detail?.current_head_commit_id || err.detail?.current_head || "a newer commit";
         setConflicts([`Branch HEAD advanced to ${currentHead}. Pull latest before committing.`]);
         addLog("Commit rejected because the server advanced. Pull latest to rebase your local work.", true);
+      } else if ((!err.status || err.status >= 500) && commitPayload) {
+        // No HTTP status at all => the request never reached the server
+        // (network drop mid-flight). A 5xx means it reached the server but
+        // failed transiently there. Either way the client can't tell if the
+        // commit landed, so save the exact payload for retry instead of
+        // losing it — a timeout/server hiccup shouldn't be worse than a
+        // dropped connection. Conflict (409) and permission errors above
+        // are deliberately excluded — retrying those blindly would be wrong.
+        await savePendingCommit(tableId, commitPayload);
+        setPendingCommit(loadPendingCommit(tableId));
+        addLog("Network error during commit — saved as a pending commit. It will be offered for retry once you're back online.", true);
       } else addLog(`Commit failed: ${err.message}`, true);
     } finally { setBusy(false); }
-  }, [addLog, commitMessage, refreshAfterCommit, reviewChanges, tableId]);
+  }, [addLog, clearDraft, clearPendingCommit, commitMessage, handleDeviceBlocked, loadPendingCommit, refreshAfterCommit, reviewChanges, savePendingCommit, tableId]);
+
+  const retryPendingCommit = useCallback(async () => {
+    if (!pendingCommit) return;
+    setPendingCommitBusy(true);
+    try {
+      const { saved_at, ...payload } = pendingCommit;
+      const result = await commitWorkbook(payload);
+      addLog(`Pending commit retried successfully: ${result.commit_id} (version ${result.version}).`);
+      setLastCommitId(result.commit_id);
+      await clearPendingCommit(tableId);
+      setPendingCommit(null);
+      await refreshAfterCommit();
+    } catch (err) {
+      addLog(`Retry of pending commit failed: ${err.message}`, true);
+    } finally { setPendingCommitBusy(false); }
+  }, [addLog, clearPendingCommit, pendingCommit, refreshAfterCommit, tableId]);
+
+  useEffect(() => {
+    retryPendingCommitRef.current = retryPendingCommit;
+  }, [retryPendingCommit]);
+
+  const discardPendingCommit = useCallback(async () => {
+    await clearPendingCommit(tableId);
+    setPendingCommit(null);
+  }, [clearPendingCommit, tableId]);
 
   const syncMain = useCallback(async () => {
     const branchId = workbookIdentityRef.current?.branch_id;
@@ -1289,6 +1602,8 @@ export default function TaskpaneUI() {
   const disconnect = useCallback(async () => {
     clearInterval(presenceTimerRef.current);
     presenceTimerRef.current = null;
+    workStatusRef.current = "ONLINE";
+    setWorkStatus("ONLINE");
     if (tableId) leaveDatasetPresence(tableId, clientIdRef.current).catch(() => {});
     try {
       await window.Excel.run(async (context) => {
@@ -1314,6 +1629,7 @@ export default function TaskpaneUI() {
   const connect = useCallback(async (requestedTableId = tableId) => {
     const normalized = String(requestedTableId || "").trim().toUpperCase();
     if (!normalized) return;
+    deviceBlockedRef.current = false; setDeviceBlocked(false);
     setBusy(true); setTableId(normalized); setSyncStatus("syncing"); setStatusMsg("Checking out workbook...");
     try {
       const latest = await getWorkbookSnapshot(normalized);
@@ -1343,15 +1659,32 @@ export default function TaskpaneUI() {
       baselineRef.current = baseline;
       setBaseVersion(baseline.version);
 
+      const draft = loadDraft(normalized);
+      if (draft?.semantic_changes?.length) {
+        setRecoveredDraft(draft);
+        addLog(`Recovered ${draft.semantic_changes.length} unsaved change(s) from a previous session.`);
+      } else {
+        setRecoveredDraft(null);
+      }
+      const pending = loadPendingCommit(normalized);
+      if (pending) {
+        setPendingCommit(pending);
+        addLog("A previously failed commit is saved locally and can be retried.");
+      } else {
+        setPendingCommit(null);
+      }
+
       await window.Excel.run(async (context) => {
         const worksheets = context.workbook.worksheets;
         worksheets.load("items/id,name");
         await context.sync();
         const markDirty = () => {
-          if (applyingRemoteRef.current) return;
+          if (applyingRemoteRef.current || deviceBlockedRef.current) return;
           setDirty(true); setStaged(null); setConflicts([]);
           setSyncStatus("syncing"); setStatusMsg("Local changes pending review");
-          heartbeatPresence(normalized, clientIdRef.current, "excel", "editing").catch(() => {});
+          heartbeatPresence(normalized, clientIdRef.current, "excel", "editing", workStatusRef.current).catch((err) => {
+            if (err.detail?.code === "DEVICE_BLOCKED") handleDeviceBlocked(normalized);
+          });
         };
         const bindings = worksheets.items.map((sheet) => {
           const handler = () => markDirty();
@@ -1380,18 +1713,20 @@ export default function TaskpaneUI() {
         } catch { setDivergence(null); }
       }
       const heartbeat = () => heartbeatPresence(
-        normalized, clientIdRef.current, "excel", "viewing"
-      ).catch(() => {});
+        normalized, clientIdRef.current, "excel", "viewing", workStatusRef.current
+      ).catch((err) => {
+        if (err.detail?.code === "DEVICE_BLOCKED") handleDeviceBlocked(normalized);
+      });
       heartbeat();
       clearInterval(presenceTimerRef.current);
-      presenceTimerRef.current = setInterval(heartbeat, 15000);
+      presenceTimerRef.current = setInterval(heartbeat, 60000);
       setStatusMsg(latest.version > baseline.version ? `Server ahead: v${latest.version}` : `Checked out v${baseline.version}`);
       addLog(`Checked out version ${baseline.version}. Edits stay local until Commit.`);
       if (latest.version > baseline.version) addLog(`Server version ${latest.version} is available. Pull before committing.`);
     } catch (err) {
       setSyncStatus("error"); setStatusMsg(err.message); addLog(`Connection failed: ${err.message}`, true);
     } finally { setBusy(false); }
-  }, [addLog, ensureRowIdentity, readWorkbook, tableId]);
+  }, [addLog, ensureRowIdentity, handleDeviceBlocked, loadDraft, loadPendingCommit, readWorkbook, tableId]);
 
   const getEmbeddedIdentity = useCallback(async () => {
     try {
@@ -1445,10 +1780,16 @@ export default function TaskpaneUI() {
               current: docUrl || "Unknown location (file outside authorized directory)",
             });
             addLog(`Security Alert: Workbook path mismatch. Expected: ${embedded.local_file_path}, Current: ${docUrl}`, true);
+            await purgeWorkbookData("[LOCKED] Unauthorized file location. Verification blocked.");
             setAuthBootstrapping(false);
             return;
           }
           addLog(`Path verification passed for authorized location.`);
+        }
+
+        // Ensure data rows remain locked and empty until OTP verification completes
+        if (!workbookVerified) {
+          await purgeWorkbookData("[LOCKED] Identity & OTP verification required to load branch data.");
         }
       } catch (err) {
         addLog(`Workbook initialization check failed: ${err.message}`, true);
@@ -1456,7 +1797,7 @@ export default function TaskpaneUI() {
         setAuthBootstrapping(false);
       }
     })();
-  }, [addLog, getEmbeddedIdentity]);
+  }, [addLog, getEmbeddedIdentity, workbookVerified]);
 
   const handleVerifiedAndLoaded = useCallback(async (result) => {
     setBusy(true);
@@ -1497,6 +1838,14 @@ export default function TaskpaneUI() {
     })();
   }, [addLog, auth, connect, embeddedInfo, getEmbeddedIdentity, workbookVerified]);
 
+  const updateWorkStatus = useCallback((status) => {
+    setWorkStatus(status);
+    workStatusRef.current = status;
+    if (tableId) {
+      heartbeatPresence(tableId, clientIdRef.current, "excel", "viewing", status).catch(() => {});
+    }
+  }, [tableId]);
+
   const signOut = useCallback(async () => {
     if (connected) await disconnect();
     await logout().catch(() => clearAuth());
@@ -1507,13 +1856,38 @@ export default function TaskpaneUI() {
     setLogs([]);
     autoConnectedRef.current = false;
     workbookIdentityRef.current = null;
-  }, [connected, disconnect]);
+    await purgeWorkbookData("[LOCKED] Signed out. Verification required.");
+    if (embeddedInfo?.working_copy_id || embeddedInfo?.local_file_path) {
+      sanitizeLocalWorkbook({
+        working_copy_id: embeddedInfo?.working_copy_id,
+        file_path: embeddedInfo?.local_file_path,
+      }).catch(() => {});
+    }
+  }, [connected, disconnect, embeddedInfo]);
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (embeddedInfo?.working_copy_id || embeddedInfo?.local_file_path) {
+        const payload = JSON.stringify({
+          working_copy_id: embeddedInfo.working_copy_id,
+          file_path: embeddedInfo.local_file_path,
+        });
+        if (navigator.sendBeacon) {
+          const blob = new Blob([payload], { type: "application/json" });
+          navigator.sendBeacon("/api/v1/workbooks/sanitize-local", blob);
+        }
+      }
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [embeddedInfo]);
 
   if (pathBlocked) {
     return (
       <PathBlockedPanel
         expectedPath={pathDetails.expected}
         currentPath={pathDetails.current}
+        onWipeData={() => purgeWorkbookData("[LOCKED] Unauthorized file location. Verification blocked.")}
       />
     );
   }
@@ -1550,7 +1924,38 @@ export default function TaskpaneUI() {
     <div style={containerStyle}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div><div style={{ color: "#58a6ff", fontSize: 10, fontWeight: 800, letterSpacing: ".13em" }}>GIT WALK / SOURCE CONTROL</div><div style={{ fontSize: 20, fontWeight: 800 }}>Repository workspace</div></div>
-        <button onClick={signOut} style={{ border: 0, color: "#92a6af", background: "transparent" }}>Sign out</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+          <button
+            type="button"
+            onClick={async () => {
+              if (window.confirm("Lock sheets and revert file to 9KB protected state?")) {
+                await purgeWorkbookData("[LOCKED] Locked & protected. Verification required.");
+                if (embeddedInfo?.working_copy_id || embeddedInfo?.local_file_path) {
+                  sanitizeLocalWorkbook({
+                    working_copy_id: embeddedInfo?.working_copy_id,
+                    file_path: embeddedInfo?.local_file_path,
+                  }).catch(() => {});
+                }
+                setWorkbookVerified(false);
+                setConnected(false);
+              }
+            }}
+            style={{
+              border: "1px solid #f85149",
+              color: "#ff8b82",
+              background: "rgba(248,81,73,0.12)",
+              borderRadius: 4,
+              padding: "4px 8px",
+              fontSize: 10,
+              fontWeight: 700,
+              cursor: "pointer",
+            }}
+            title="Save to protected 9KB state and wipe sheets before closing Excel"
+          >
+            🔒 Lock & Exit (9KB)
+          </button>
+          <button onClick={signOut} style={{ border: 0, color: "#92a6af", background: "transparent", cursor: "pointer", fontSize: 11 }}>Sign out</button>
+        </div>
       </div>
       <div style={{ ...cardStyle, padding: 11, display: "flex", justifyContent: "space-between" }}>
         <div><div style={{ fontSize: 11 }}>{auth.user?.email}</div><div style={{ color: "#70858f", fontSize: 9, marginTop: 3 }}>{auth.user?.user_id}</div></div>
@@ -1560,15 +1965,41 @@ export default function TaskpaneUI() {
       <div style={cardStyle}><div style={labelStyle}>Repository data ID</div><input style={inputStyle} value={tableId} onChange={(e) => setTableId(e.target.value.toUpperCase())} disabled={connected} placeholder="QUEUE_BOARD_A1B2C3D4" /></div>
 
       {!connected ? <button style={buttonStyle} disabled={busy || !tableId} onClick={() => connect()}>{busy ? "Connecting..." : "Open repository workspace"}</button> : <>
+        <div style={{ ...cardStyle, padding: 10 }}>
+          <div style={{ ...labelStyle, marginBottom: 7 }}>Your status</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              onClick={() => updateWorkStatus("ONLINE")}
+              style={{
+                flex: 1, padding: "7px 6px", borderRadius: 5, fontSize: 10, fontWeight: 800, cursor: "pointer",
+                border: workStatus === "ONLINE" ? "1px solid #3fb950" : "1px solid #30363d",
+                background: workStatus === "ONLINE" ? "rgba(63,185,80,0.16)" : "transparent",
+                color: workStatus === "ONLINE" ? "#7ee787" : "#8b949e",
+              }}
+            >🟢 Online</button>
+            <button
+              onClick={() => updateWorkStatus("NEED_HELP")}
+              style={{
+                flex: 1, padding: "7px 6px", borderRadius: 5, fontSize: 10, fontWeight: 800, cursor: "pointer",
+                border: workStatus === "NEED_HELP" ? "1px solid #d29922" : "1px solid #30363d",
+                background: workStatus === "NEED_HELP" ? "rgba(210,153,34,0.16)" : "transparent",
+                color: workStatus === "NEED_HELP" ? "#f0b849" : "#8b949e",
+              }}
+              title="Notifies the repository owner"
+            >🆘 Need help</button>
+          </div>
+          {workStatus === "NEED_HELP" ? <div style={{ marginTop: 7, color: "#f0b849", fontSize: 9 }}>The repository owner has been notified. Switch back to Online once you're unblocked.</div> : null}
+        </div>
+        {deviceBlocked ? <div style={{ ...cardStyle, borderColor: "#f85149", background: "#2a191c" }}><div style={{ ...labelStyle, color: "#ff8b82" }}>🔒 Device blocked</div><div style={{ color: "#ffaaa3", fontSize: 11, lineHeight: 1.55 }}>The repository owner blocked this device. Data has been wiped from this workbook; any uncommitted edits were saved locally and will be offered for recovery once access is restored. Contact the owner to unblock this device.</div></div> : null}
         {workspaceClosed ? <div style={{ ...cardStyle, borderColor: "#b9862d", background: "#2a2114" }}><div style={{ ...labelStyle, color: "#f4ba62" }}>Workspace merged</div><div style={{ color: "#e9d7b5", fontSize: 11, lineHeight: 1.55 }}>This signed working copy is closed. Download latest main or create a new workspace in Git Walk.</div></div> : null}
         {divergence ? <div style={{ ...cardStyle, padding: 10, display: "flex", justifyContent: "space-between", color: "#9bafb8", fontSize: 10 }}><span><b style={{ color: "#75ead0" }}>{divergence.ahead}</b> ahead</span><span><b style={{ color: "#f4ba62" }}>{divergence.behind}</b> behind main</span></div> : null}
-        <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#172632", boxShadow: "none" }} disabled={busy || workspaceClosed} onClick={reviewChanges}>Review local changes</button>
+        <button style={{ ...buttonStyle, color: "#d8e5e9", background: "#172632", boxShadow: "none" }} disabled={busy || workspaceClosed || deviceBlocked} onClick={reviewChanges}>Review local changes</button>
         <div style={{ ...cardStyle, padding: 11 }}>
           <div style={labelStyle}>Pull data from</div>
           <select
             style={{ ...inputStyle, appearance: "auto", cursor: "pointer" }}
             value={pullSource}
-            disabled={busy || workspaceClosed}
+            disabled={busy || workspaceClosed || deviceBlocked}
             onChange={(event) => setPullSource(event.target.value)}
           >
             <option value="main">Protected main{divergence?.target_branch_name ? ` / ${divergence.target_branch_name}` : ""}</option>
@@ -1581,28 +2012,30 @@ export default function TaskpaneUI() {
           </div>
           <button
             style={{ ...buttonStyle, marginTop: 10, color: "#071716", background: "linear-gradient(135deg,#66c4ff,#49a8e8)" }}
-            disabled={busy || workspaceClosed}
+            disabled={busy || workspaceClosed || deviceBlocked}
             onClick={() => (pullSource === "main" ? syncMain() : pullLatest(false))}
           >
             {pullSource === "main" ? "Pull from protected main" : "Pull from my branch"}
           </button>
         </div>
-        <div style={cardStyle}>
-          <div style={labelStyle}>Commit message</div>
-          <input style={inputStyle} value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder="Describe this data change" maxLength={300} />
-          <button style={{ ...buttonStyle, marginTop: 10, opacity: !commitMessage.trim() || busy || workspaceClosed ? .55 : 1 }} disabled={!commitMessage.trim() || busy || workspaceClosed} onClick={commitChanges}>{busy ? "Working..." : `Commit ${summary.changeCount === "?" ? "changes" : `${summary.changeCount} change(s)`}`}</button>
-        </div>
+        <CommitReviewPanel
+          summary={summary}
+          commitMessage={commitMessage}
+          setCommitMessage={setCommitMessage}
+          busy={busy}
+          workspaceClosed={workspaceClosed || deviceBlocked}
+          onCommit={commitChanges}
+          lastCommitId={lastCommitId}
+          recoveredDraft={recoveredDraft}
+          onReviewRecoveredDraft={() => reviewChanges().catch((err) => addLog(err.message, true))}
+          onDiscardDraft={() => { clearDraft(tableId).catch(() => {}); setRecoveredDraft(null); }}
+          pendingCommit={pendingCommit}
+          pendingCommitBusy={pendingCommitBusy}
+          onRetryPendingCommit={retryPendingCommit}
+          onDiscardPendingCommit={discardPendingCommit}
+        />
         <button style={{ ...buttonStyle, color: "#ffaaa3", background: "#2a191c", boxShadow: "none" }} onClick={disconnect}>Disconnect</button>
       </>}
-
-      {connected ? <div style={{ ...cardStyle, display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 8, textAlign: "center" }}>
-        <div><div style={labelStyle}>Cells / formulas</div><strong style={{ color: "#75ead0" }}>{summary.counts.cells}/{summary.counts.formulas}</strong></div>
-        <div><div style={labelStyle}>Row operations</div><strong style={{ color: "#66c4ff" }}>{summary.counts.rows}</strong></div>
-        <div><div style={labelStyle}>Column operations</div><strong style={{ color: "#f4ba62" }}>{summary.counts.columns}</strong></div>
-        <div><div style={labelStyle}>Sheet operations</div><strong style={{ color: "#d2a8ff" }}>{summary.counts.sheets || 0}</strong></div>
-      </div> : null}
-
-      {staged?.preview.length ? <div style={cardStyle}><div style={labelStyle}>Staged diff</div><div style={{ maxHeight: 155, overflowY: "auto" }}>{staged.preview.slice(0, 30).map((line, index) => <div key={index} style={{ color: "#a8bbc3", borderBottom: "1px solid #20303a", padding: "5px 0", font: "10px Consolas,monospace" }}>{line}</div>)}</div></div> : null}
 
       {conflicts.length ? <div style={{ ...cardStyle, borderColor: "rgba(255,127,117,.45)" }}><div style={{ ...labelStyle, color: "#ff8b82" }}>Merge conflicts</div>{conflicts.slice(0, 12).map((item, index) => <div key={index} style={{ color: "#ffaaa3", fontSize: 10, padding: "4px 0" }}>{item}</div>)}<button style={{ ...buttonStyle, marginTop: 10, color: "#fff", background: "#b84540" }} onClick={() => { if (window.confirm("Discard every local uncommitted change and pull the server version?")) pullLatest(true); }}>Discard local changes and pull</button></div> : null}
 

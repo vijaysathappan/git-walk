@@ -189,6 +189,43 @@ class DatabaseSyncTests(unittest.TestCase):
             {item["table_id"] for item in database.list_datasets(viewer["user_id"])},
         )
 
+    def test_branch_access_owner_member_creator_and_non_member(self):
+        """Pins user_can_access_branch's current behavior before task 6
+        consolidates it with the other two access-check functions: MAIN is
+        open to any dataset member, a non-MAIN branch is only open to its
+        creator/the owner (not just any dataset member), and a non-member
+        is refused both."""
+        database.initialize_product_schema()
+        owner = database.get_or_create_user("branch-owner@example.com")
+        registered = database.register_dataset(
+            "QUEUE_BOARD_TEST", owner["user_id"], "teams.xlsx", 2, 2
+        )
+        main_branch_id = registered["main_branch_id"]
+
+        viewer = database.get_or_create_user("branch-viewer@example.com")
+        editor = database.get_or_create_user("branch-editor@example.com")
+        outsider = database.get_or_create_user("branch-outsider@example.com")
+        database.add_dataset_member("QUEUE_BOARD_TEST", owner["user_id"], viewer["email"], "viewer")
+        database.add_dataset_member("QUEUE_BOARD_TEST", owner["user_id"], editor["email"], "editor")
+
+        branch = database.create_semantic_branch(
+            "QUEUE_BOARD_TEST", "feature/branch-access-test", None, editor["user_id"]
+        )
+        feature_branch_id = branch["branch_id"]
+
+        # MAIN is open to every dataset member, including a viewer.
+        self.assertTrue(database.user_can_access_branch(main_branch_id, owner["user_id"]))
+        self.assertTrue(database.user_can_access_branch(main_branch_id, viewer["user_id"]))
+        self.assertTrue(database.user_can_access_branch(main_branch_id, editor["user_id"]))
+        self.assertFalse(database.user_can_access_branch(main_branch_id, outsider["user_id"]))
+
+        # A non-MAIN branch is only open to its creator and the owner, not
+        # every dataset member (a viewer who didn't create it is refused).
+        self.assertTrue(database.user_can_access_branch(feature_branch_id, editor["user_id"]))
+        self.assertTrue(database.user_can_access_branch(feature_branch_id, owner["user_id"]))
+        self.assertFalse(database.user_can_access_branch(feature_branch_id, viewer["user_id"]))
+        self.assertFalse(database.user_can_access_branch(feature_branch_id, outsider["user_id"]))
+
     def test_workbook_commit_applies_full_diff_as_one_version(self):
         user = self._registered_user()
         result = database.apply_workbook_commit(
@@ -381,9 +418,16 @@ class DatabaseSyncTests(unittest.TestCase):
     def test_categories_and_repository_metadata_are_queryable(self):
         user = self._registered_user()
         category = database.create_category("Payments", "Payment operations", "CAT_HOME")
-        database.move_repository("QUEUE_BOARD_TEST", category["category_id"], user["user_id"])
+        move_result = database.move_repository("QUEUE_BOARD_TEST", category["category_id"], user["user_id"])
         repository = database.get_repository("QUEUE_BOARD_TEST", user["user_id"])
 
+        # Pins the exact shape the API layer depends on — a prior version
+        # of move_repository() omitted "repository_id", which the
+        # PATCH /repositories/{table_id}/category route reads unconditionally
+        # to record an audit event; the missing key raised an uncaught
+        # KeyError there, surfaced to the client as a raw HTTP 500 on every
+        # single business-area change.
+        self.assertEqual(repository["repository_id"], move_result["repository_id"])
         self.assertEqual(category["category_id"], repository["category_id"])
         self.assertEqual("Payments", repository["category_name"])
         self.assertEqual(1, len(repository["sheets"]))
@@ -391,6 +435,28 @@ class DatabaseSyncTests(unittest.TestCase):
             category["category_id"],
             {item["category_id"] for item in database.list_categories()},
         )
+
+    def test_change_business_area_api_endpoint_does_not_500(self):
+        """End-to-end through the real FastAPI route, not just the service
+        function — a unit test on move_repository() alone wouldn't catch a
+        route/service dict-key mismatch like the one this pins."""
+        from fastapi.testclient import TestClient
+        from app.main import app
+        from app.security import create_session_token
+
+        user = self._registered_user()
+        category = database.create_category("Finance", "Finance operations", "CAT_HOME")
+        token = create_session_token(user["user_id"], user["email"])
+        client = TestClient(app)
+
+        response = client.patch(
+            "/api/v1/repositories/QUEUE_BOARD_TEST/category",
+            json={"category_id": category["category_id"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(category["category_id"], response.json()["category_id"])
 
 
 if __name__ == "__main__":

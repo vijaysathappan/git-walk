@@ -8,7 +8,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from ..config import settings
-from ..database import _get_connection, create_working_copy
+from ..database import _get_connection, create_working_copy, update_branch_local_path
 from ..excel.identity import semantic_snapshot
 from ..openxml_injector import inject_taskpane_manifest
 
@@ -84,12 +84,14 @@ def issue_branch_workbook(
         main_table_id, user_id, user_email, branch_mode=branch_mode,
         branch_id=branch_id,
     )
+    identity["assigned_email"] = user_email
     if not local_file_path and local_target_dir:
         filename = f"gitwalk_{identity['branch_name'].replace('/', '_')}.xlsx"
         local_file_path = str(Path(local_target_dir) / filename)
     if local_file_path:
         identity["local_file_path"] = local_file_path
         identity["required_role"] = "editor"
+        update_branch_local_path(identity["branch_id"], local_file_path)
     directory = Path(tempfile.mkdtemp(prefix="gitwalk_working_copy_"))
     raw_path = directory / "branch.xlsx"
     output_path = directory / f"gitwalk_{identity['branch_id']}.xlsx"

@@ -73,8 +73,14 @@ class Settings:
     dev_show_otp = env_bool("DEV_SHOW_OTP", app_env == "development")
     session_hours = int(os.getenv("SESSION_HOURS", "24"))
     otp_minutes = int(os.getenv("OTP_MINUTES", "10"))
-    otp_request_cooldown_seconds = int(os.getenv("OTP_REQUEST_COOLDOWN_SECONDS", "60"))
-    otp_requests_per_hour = int(os.getenv("OTP_REQUESTS_PER_HOUR", "5"))
+    otp_request_cooldown_seconds = int(os.getenv("OTP_REQUEST_COOLDOWN_SECONDS", "12"))
+    otp_requests_per_hour = int(os.getenv("OTP_REQUESTS_PER_HOUR", "25"))
+    # Reference mid-tier commercial LLM pricing, used only to compute a
+    # "what this would have cost" figure for the AI token ledger's
+    # cost-avoidance KPI. Git Walk routes exclusively to free-tier models,
+    # so actual spend is always $0 — this is informational, not a real bill.
+    ai_reference_cost_per_1k_input_tokens = float(os.getenv("AI_REFERENCE_COST_PER_1K_INPUT_TOKENS", "0.003"))
+    ai_reference_cost_per_1k_output_tokens = float(os.getenv("AI_REFERENCE_COST_PER_1K_OUTPUT_TOKENS", "0.015"))
     max_upload_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
     max_xlsx_entries = int(os.getenv("MAX_XLSX_ENTRIES", "2500"))
     max_xlsx_uncompressed_bytes = int(
@@ -87,6 +93,11 @@ class Settings:
         os.getenv("UPLOAD_PROCESSING_TIMEOUT_SECONDS", "60")
     )
     temp_file_max_age_hours = int(os.getenv("TEMP_FILE_MAX_AGE_HOURS", "24"))
+    repository_purge_sweep_enabled = os.getenv("REPOSITORY_PURGE_SWEEP_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+    repository_purge_inactivity_days = max(1, int(os.getenv("REPOSITORY_PURGE_INACTIVITY_DAYS", "30")))
+    repository_purge_sweep_interval_seconds = max(300, int(os.getenv("REPOSITORY_PURGE_SWEEP_INTERVAL_SECONDS", str(24 * 3600))))
+    repository_purge_export_dir = os.getenv("REPOSITORY_PURGE_EXPORT_DIR", "").strip()
+    repository_purge_max_physical_rows_per_table = max(100, int(os.getenv("REPOSITORY_PURGE_MAX_PHYSICAL_ROWS_PER_TABLE", "20000")))
     euc_analysis_version = os.getenv("EUC_ANALYSIS_VERSION", "2.1.0").strip()
     euc_max_file_bytes = int(os.getenv("EUC_MAX_FILE_SIZE", str(50 * 1024 * 1024)))
     euc_max_decompressed_bytes = int(

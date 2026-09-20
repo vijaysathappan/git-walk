@@ -1,8 +1,16 @@
 import React, { useEffect, useState } from "react";
+import AIAnswerView from "./AIAnswerView";
 import {
   clearAIConfig,
   confirmAIAction,
+  getAgentLedgerBudget,
+  getAgentLedgerLeaderboard,
+  getAgentLedgerModels,
+  getAgentLedgerRunReceipt,
+  getAgentLedgerRuns,
+  getAgentLedgerTrend,
   getAIAgentRuns,
+  getAIConversation,
   getAIConversations,
   getAIEvaluations,
   getAIInsights,
@@ -22,6 +30,7 @@ const prompts = [
   ["Control brief", "Explain the highest-priority control exceptions, their evidence, and the safest next decisions."],
   ["Change impact", "Summarize recent repository changes and identify downstream impact using only cited evidence."],
   ["Operations", "Diagnose integration freshness, reconciliation, conflicts, and dead-letter health. Do not execute actions."],
+  ["EUC risk portfolio", "Which of our EUCs carry the most risk right now, and what are their open high-severity findings?"],
 ];
 
 const fallbackAgents = [
@@ -65,6 +74,26 @@ export default function AICommandCenter({ repositoryId, onError }) {
   const [editingProvider, setEditingProvider] = useState(false);
   const [policyFeature, setPolicyFeature] = useState("ENTERPRISE_COPILOT");
   const [policyModelId, setPolicyModelId] = useState("");
+  const [ledgerAgents, setLedgerAgents] = useState([]);
+  const [ledgerTrend, setLedgerTrend] = useState([]);
+  const [ledgerModels, setLedgerModels] = useState([]);
+  const [ledgerRuns, setLedgerRuns] = useState({ items: [], next_cursor: null });
+  const [ledgerBudget, setLedgerBudget] = useState(null);
+  const [ledgerAgentFilter, setLedgerAgentFilter] = useState("");
+  const [ledgerStatusFilter, setLedgerStatusFilter] = useState("");
+  const [ledgerReceipt, setLedgerReceipt] = useState(null);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [historyConversationId, setHistoryConversationId] = useState(null);
+  const [historyConversation, setHistoryConversation] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const openHistoryConversation = async (id) => {
+    setHistoryConversationId(id);
+    setHistoryLoading(true);
+    try { setHistoryConversation(await getAIConversation(id)); }
+    catch (err) { onError?.(err.message); }
+    finally { setHistoryLoading(false); }
+  };
 
   const refresh = async () => {
     const requests = await Promise.allSettled([
@@ -85,6 +114,28 @@ export default function AICommandCenter({ repositoryId, onError }) {
   };
 
   useEffect(() => { refresh().catch((error) => onError?.(error.message)); }, []);
+
+  const loadLedger = async () => {
+    setLedgerLoading(true);
+    try {
+      const [agents, trend, models, runsResult, budget] = await Promise.all([
+        getAgentLedgerLeaderboard(30), getAgentLedgerTrend(30), getAgentLedgerModels(30),
+        getAgentLedgerRuns({ agentKey: ledgerAgentFilter, status: ledgerStatusFilter }), getAgentLedgerBudget(),
+      ]);
+      setLedgerAgents(agents.agents || []); setLedgerTrend(trend.trend || []); setLedgerModels(models.models || []);
+      setLedgerRuns(runsResult); setLedgerBudget(budget);
+    } catch (error) { onError?.(error.message); }
+    finally { setLedgerLoading(false); }
+  };
+
+  useEffect(() => { if (view === "ledger") loadLedger(); }, [view, ledgerAgentFilter, ledgerStatusFilter]);
+
+  const openReceipt = async (agentRunId) => {
+    setLedgerLoading(true);
+    try { setLedgerReceipt(await getAgentLedgerRunReceipt(agentRunId)); }
+    catch (error) { onError?.(error.message); }
+    finally { setLedgerLoading(false); }
+  };
 
   const perform = async (work, success) => {
     setBusy(true); setNotice(""); setFailure(null);
@@ -151,7 +202,16 @@ export default function AICommandCenter({ repositoryId, onError }) {
     max_input_tokens: 24000, max_output_tokens: 3000, temperature: 0.1,
   }), (result) => `${result.feature} routing policy saved.`);
 
-  const tabs = [["copilot", "Copilot"], ["controls", "Controls"], ["agents", "Agents"], ["operations", "AI operations"]];
+  const tabs = [["copilot", "Copilot"], ["controls", "Controls"], ["agents", "Agents"], ["operations", "AI operations"], ["ledger", "Token Ledger"], ["history", "History"]];
+  const ledgerMaxDailyTokens = Math.max(1, ...ledgerTrend.map((item) => item.total_tokens || 0));
+  const ledgerTotalTokens30d = ledgerAgents.reduce((sum, item) => sum + (item.total_tokens || 0), 0);
+  const ledgerTotalRuns30d = ledgerAgents.filter((item) => item.is_agent).reduce((sum, item) => sum + (item.requests || 0), 0);
+  const ledgerOverallSuccessRate = (() => {
+    const agentRows = ledgerAgents.filter((item) => item.is_agent);
+    const succeeded = agentRows.reduce((sum, item) => sum + (item.succeeded || 0), 0);
+    const total = agentRows.reduce((sum, item) => sum + (item.requests || 0), 0);
+    return total ? succeeded / total : null;
+  })();
   const agents = admin?.agents || fallbackAgents;
   const quota = usage?.quota || admin?.settings || {};
   const tokenTotal = usage?.tokens?.total || 0;
@@ -211,6 +271,164 @@ export default function AICommandCenter({ repositoryId, onError }) {
       <section className="ai-surface ai-usage"><header><div><p className="eyebrow">FINOPS / OBSERVABILITY</p><h3>AI consumption and quality</h3></div><strong>{tokenTotal.toLocaleString()} tokens</strong></header><div className="ai-quota"><i style={{ width: `${Math.min(100, (tokenTotal / quotaTotal) * 100)}%` }} /></div><small>{Math.max(0, quotaTotal - tokenTotal).toLocaleString()} organization tokens remain in today&apos;s configured envelope</small><div className="ai-usage-facts"><span>Cache hits<b>{usage?.cache_hits || 0}</b></span><span>Invalid outputs<b>{usage?.invalid_outputs || 0}</b></span><span>Average latency<b>{Math.round(usage?.average_latency_ms || 0)} ms</b></span><span>Reasoning tokens<b>{usage?.tokens?.reasoning || 0}</b></span></div></section>
       <section className="ai-surface ai-evaluations"><header><div><p className="eyebrow">EVALUATION / RED TEAM</p><h3>Release safety baseline</h3></div><button onClick={() => perform(runAIEvaluation, (result) => `${result.passed_cases}/${result.total_cases} safety checks passed.`)} disabled={busy}>Run baseline</button></header>{evaluations.slice(0, 8).map((evaluation) => <article key={evaluation.evaluation_run_id}><span className={evaluation.status === "PASSED" ? "pass" : "fail"}>{evaluation.status}</span><div><strong>{evaluation.suite_name.replaceAll("_", " ")}</strong><small>{new Date(evaluation.started_at).toLocaleString()}</small></div><b>{evaluation.passed_cases}/{evaluation.total_cases}</b></article>)}</section>
       {admin ? <section className="ai-surface ai-admin-policy"><header><div><p className="eyebrow">ORGANIZATION POLICY</p><h3>AI remains below policy</h3></div><button onClick={updatePolicy} disabled={busy}>Save policy</button></header><div className="ai-policy-grid"><label><span>AI enabled</span><input type="checkbox" checked={Boolean(admin.settings.ai_enabled)} onChange={(event) => setAdmin({ ...admin, settings: { ...admin.settings, ai_enabled: event.target.checked } })} /></label><label><span>External provider</span><input type="checkbox" checked={Boolean(admin.settings.external_ai_enabled)} onChange={(event) => setAdmin({ ...admin, settings: { ...admin.settings, external_ai_enabled: event.target.checked } })} /></label><label><span>Agent actions</span><input type="checkbox" checked={Boolean(admin.settings.agent_actions_enabled)} onChange={(event) => setAdmin({ ...admin, settings: { ...admin.settings, agent_actions_enabled: event.target.checked } })} /></label><label><span>User daily quota</span><input type="number" value={admin.settings.user_daily_token_quota} onChange={(event) => setAdmin({ ...admin, settings: { ...admin.settings, user_daily_token_quota: event.target.value } })} /></label></div><div className="ai-model-route"><label><span>Feature route</span><input value={policyFeature} onChange={(event) => setPolicyFeature(event.target.value.toUpperCase())} /></label><label><span>Enforced model</span><select value={policyModelId} onChange={(event) => setPolicyModelId(event.target.value)}><option value="">Capability-based routing</option>{admin.models.map((item) => <option key={item.model_id} value={item.model_id}>{item.model_slug} / {item.model_role}</option>)}</select></label><button onClick={updateRoute} disabled={busy || !policyFeature.trim()}>Enforce route</button><div>{admin.policies.map((item) => <span key={item.policy_id}>{item.feature} / {item.model_role}</span>)}</div></div><footer><span>{admin.models.length} governed models</span><span>{admin.tools.length} registered tools</span><span>{admin.agents.length} bounded agents</span><button onClick={() => perform(clearAIConfig, () => "Personal provider credential disconnected.")} disabled={!models.configured}>Disconnect provider</button></footer></section> : <section className="ai-surface ai-empty"><strong>Administrative metrics are permission restricted</strong><p>Organization owners and auditors can review quotas, provider policy, and evaluations.</p></section>}
+    </div> : null}
+
+    {view === "ledger" ? <div className="ai-ledger-layout">
+      <section className="ai-signal-grid ai-ledger-kpis">
+        <article><span>Tokens (30d)</span><strong>{ledgerTotalTokens30d.toLocaleString()}</strong><small>Across agents and copilot chat</small></article>
+        <article><span>Agent runs (30d)</span><strong>{ledgerTotalRuns30d.toLocaleString()}</strong><small>{ledgerAgents.filter((item) => item.is_agent).length} agent(s) active</small></article>
+        <article><span>Agent success rate</span><strong>{ledgerOverallSuccessRate == null ? "-" : `${Math.round(ledgerOverallSuccessRate * 100)}%`}</strong><small>Across every agent run this month</small></article>
+        <article><span>Reference savings (30d)</span><strong>${(ledgerBudget?.reference_savings_30d_usd ?? 0).toFixed(2)}</strong><small>vs. reference commercial-tier pricing</small></article>
+      </section>
+
+      {ledgerBudget ? <section className="ai-surface ai-ledger-budget">
+        <header><div><p className="eyebrow">BUDGET / TODAY</p><h3>Daily token quota burn rate</h3></div><strong>{ledgerBudget.today_usage.toLocaleString()} / {ledgerBudget.daily_token_quota.toLocaleString()}</strong></header>
+        <div className="ai-quota"><i style={{ width: `${Math.min(100, ledgerBudget.quota_pct_used * 100)}%` }} /></div>
+        <small>Trailing 7-day average: {ledgerBudget.trailing_7day_avg_tokens_per_day.toLocaleString()} tokens/day &middot; projected end-of-day at current pace: {ledgerBudget.projected_end_of_day_usage.toLocaleString()} tokens</small>
+        {ledgerBudget.alerts?.map((alert) => <p key={alert.type} className="ai-guardrail-note">{alert.message}</p>)}
+        <p className="ai-guardrail-note ai-ledger-caveat">Agent runs are not yet subject to this quota — only direct copilot chat calls are enforced today.</p>
+      </section> : null}
+
+      <section className="ai-surface ai-ledger-trend">
+        <header><div><p className="eyebrow">TREND / LAST 30 DAYS</p><h3>Daily token burn</h3></div></header>
+        <div className="ledger-trend-chart">
+          {ledgerTrend.map((day) => <div key={day.day} className="ledger-trend-col" title={`${day.day}: ${day.total_tokens.toLocaleString()} tokens, ${day.failures} failure(s)`}>
+            <div className="ledger-trend-bar" style={{ height: `${Math.max(3, (day.total_tokens / ledgerMaxDailyTokens) * 100)}%` }} />
+          </div>)}
+          {!ledgerTrend.length ? <div className="empty-state compact">No AI activity recorded yet.</div> : null}
+        </div>
+      </section>
+
+      <div className="ai-ledger-split">
+        <section className="ai-surface ai-ledger-agents">
+          <header><div><p className="eyebrow">LEADERBOARD</p><h3>Per-agent burn &amp; reliability</h3></div></header>
+          <div className="ai-ledger-agent-list">
+            {ledgerAgents.map((agent) => <article key={agent.agent_key} className="ai-ledger-agent-row">
+              <div><strong>{agent.agent_name}</strong><small>{agent.requests} request(s) &middot; last run {agent.last_run_at ? new Date(agent.last_run_at).toLocaleString() : "never"}</small></div>
+              <span className={`pill device-trust-${agent.success_rate >= 0.9 ? "trusted" : agent.success_rate >= 0.5 ? "unknown" : "blocked"}`}>{Math.round(agent.success_rate * 100)}% success</span>
+              <b>{agent.total_tokens.toLocaleString()} tok</b>
+              <em>${agent.reference_cost_usd.toFixed(3)}</em>
+            </article>)}
+            {!ledgerAgents.length ? <div className="empty-state compact">No agent activity yet.</div> : null}
+          </div>
+        </section>
+
+        <section className="ai-surface ai-ledger-models">
+          <header><div><p className="eyebrow">BY MODEL</p><h3>Routing mix</h3></div></header>
+          <div className="ai-ledger-model-list">
+            {ledgerModels.map((item) => <div key={item.model_id || "unknown"} className="ledger-model-row">
+              <span>{item.display_name || item.model_slug || "Unknown model"}</span>
+              <div className="contribution-track"><i style={{ width: `${Math.min(100, (item.total_tokens / (ledgerModels[0]?.total_tokens || 1)) * 100)}%` }} /></div>
+              <b>{item.total_tokens.toLocaleString()}</b>
+            </div>)}
+            {!ledgerModels.length ? <div className="empty-state compact">No model usage yet.</div> : null}
+          </div>
+        </section>
+      </div>
+
+      <section className="ai-surface ai-ledger-runs">
+        <header>
+          <div><p className="eyebrow">LEDGER BOOK</p><h3>Every agent run, priced</h3></div>
+          <div className="ai-ledger-filters">
+            <select value={ledgerAgentFilter} onChange={(event) => setLedgerAgentFilter(event.target.value)}>
+              <option value="">All agents</option>
+              <option value="MERGE_CONFLICT_AGENT">Merge conflict agent</option>
+              <option value="COMMIT_REVIEW_AGENT">Commit review agent</option>
+              <option value="EUC_RISK_RADAR_AGENT">EUC risk drift radar</option>
+            </select>
+            <select value={ledgerStatusFilter} onChange={(event) => setLedgerStatusFilter(event.target.value)}>
+              <option value="">Any status</option><option value="COMPLETED">Completed</option><option value="FAILED">Failed</option><option value="RUNNING">Running</option>
+            </select>
+          </div>
+        </header>
+        <div className="review-ledger">
+          {ledgerRuns.items.map((run) => <article key={run.agent_run_id} onClick={() => openReceipt(run.agent_run_id)} className="ai-ledger-run-row">
+            <span className={run.status === "COMPLETED" ? "approved" : run.status === "FAILED" ? "rejected" : ""}>{run.status.slice(0, 1)}</span>
+            <div><strong>{run.agent_name}</strong><p>{run.goal}</p></div>
+            <b>{run.total_tokens.toLocaleString()} tok &middot; ${run.reference_cost_usd.toFixed(3)}{run.failed_requests ? ` · ${run.failed_requests} failed call(s)` : ""}</b>
+          </article>)}
+          {!ledgerRuns.items.length ? <div className="empty-state compact">No runs match this filter.</div> : null}
+        </div>
+      </section>
+
+      {ledgerReceipt ? <section className="ai-surface ai-ledger-receipt">
+        <header><div><p className="eyebrow">RECEIPT / {ledgerReceipt.run.agent_run_id}</p><h3>{ledgerReceipt.run.agent_name}</h3></div><button onClick={() => setLedgerReceipt(null)}>Close</button></header>
+        <p>{ledgerReceipt.run.goal}</p>
+        <div className="merge-timeline">
+          {ledgerReceipt.steps.map((step, index) => <article key={step.step_id}>
+            <div className="timeline-rail"><span>{index + 1}</span></div>
+            <div className="timeline-change"><header><b>{step.step_type}</b><small>{step.status}</small></header><p>{step.description}</p></div>
+          </article>)}
+        </div>
+        <div className="ai-ledger-receipt-requests">
+          <p className="ai-field-explainability-title">Priced requests</p>
+          {ledgerReceipt.requests.map((request) => <div key={request.ai_request_id} className="ledger-model-row">
+            <span>{request.feature} &middot; {request.status}{request.error_code ? ` (${request.error_code})` : ""}</span>
+            <b>{((request.input_tokens || 0) + (request.output_tokens || 0)).toLocaleString()} tok &middot; ${request.reference_cost_usd.toFixed(3)}</b>
+          </div>)}
+        </div>
+      </section> : null}
+      {ledgerLoading ? <div className="ai-notice">Loading ledger...</div> : null}
+    </div> : null}
+
+    {view === "history" ? <div className="ai-history-layout">
+      <section className="ai-surface ai-history-list">
+        <header><p className="eyebrow">CHAT HISTORY</p><h3>{conversations.length} saved conversation{conversations.length === 1 ? "" : "s"}</h3></header>
+        <div className="ai-history-conversations">
+          {conversations.map((item) => (
+            <button
+              key={item.conversation_id}
+              className={`ai-history-conversation-row ${historyConversationId === item.conversation_id ? "active" : ""}`}
+              onClick={() => openHistoryConversation(item.conversation_id)}
+            >
+              <strong>{item.title}</strong>
+              <small>{item.resource_type}{item.resource_id ? ` / ${item.resource_id}` : ""}</small>
+              <time>{new Date(item.updated_at).toLocaleString()}</time>
+            </button>
+          ))}
+          {!conversations.length ? <div className="empty-state compact">No AI conversations yet. Ask something from the Copilot tab.</div> : null}
+        </div>
+      </section>
+
+      <section className="ai-surface ai-history-reader">
+        {historyLoading ? <div className="ai-notice">Loading conversation...</div> : null}
+        {!historyLoading && historyConversation ? (
+          <article className="ai-history-doc">
+            <header>
+              <p className="eyebrow">{historyConversation.conversation.resource_type}{historyConversation.conversation.resource_id ? ` / ${historyConversation.conversation.resource_id}` : ""}</p>
+              <h2>{historyConversation.conversation.title}</h2>
+              <small>Started {new Date(historyConversation.conversation.created_at).toLocaleString()}</small>
+            </header>
+            <div className="ai-history-messages">
+              {historyConversation.messages.map((message) => {
+                const isUser = String(message.role).toLowerCase() === "user";
+                return (
+                <section key={message.message_id} className={`ai-history-message role-${String(message.role).toLowerCase()}`}>
+                  <div className="ai-history-message-meta">
+                    <b>{isUser ? "You asked" : "Git Walk AI"}</b>
+                    <time>{new Date(message.created_at).toLocaleString()}</time>
+                    {message.model_id ? <span>{message.model_id}</span> : null}
+                  </div>
+                  {isUser ? (
+                    <p className="ai-history-question">{typeof message.content === "string" ? message.content : message.content?.answer || ""}</p>
+                  ) : (
+                    <AIAnswerView text={message.content} confidence={message.grounding_confidence} />
+                  )}
+                  {message.evidence_refs?.length ? (
+                    <div className="ai-answer-evidence">
+                      {message.evidence_refs.map((ref, index) => <span key={index}>{ref.type}<code>{ref.id}</code></span>)}
+                    </div>
+                  ) : null}
+                </section>
+                );
+              })}
+            </div>
+          </article>
+        ) : null}
+        {!historyLoading && !historyConversation ? (
+          <div className="ai-empty"><strong>Pick a conversation</strong><p>Every grounded Copilot exchange is saved here, reader-formatted with its evidence and confidence.</p></div>
+        ) : null}
+      </section>
     </div> : null}
   </div>;
 }

@@ -650,6 +650,42 @@ def list_branch_commits(branch_id: str, limit: int = 100) -> list[dict[str, Any]
         conn.close()
 
 
+def list_repository_commits(repository_id: str, limit: int = 300) -> list[dict[str, Any]]:
+    """Every commit across every branch of this repository, each with ALL
+    of its parents (not just the first) — unlike list_branch_commits(),
+    this is branch-agnostic and merge-aware, the dataset a real multi-lane
+    git graph needs. change-count enrichment is intentionally omitted here
+    (cheap per-commit — this is a topology view, not a diff view)."""
+    conn = _get_connection()
+    try:
+        limit = max(1, min(limit, 1000))
+        rows = conn.execute(
+            """
+            SELECT C.*, B.BRANCH_NAME, B.BRANCH_TYPE
+            FROM COMMITS C JOIN BRANCHES B ON B.BRANCH_ID=C.BRANCH_ID
+            WHERE C.REPOSITORY_ID=? ORDER BY C.CREATED_AT DESC LIMIT ?
+            """,
+            (repository_id, limit),
+        ).fetchall()
+        commit_ids = [row["COMMIT_ID"] for row in rows]
+        parents_by_commit: dict[str, list[str]] = {commit_id: [] for commit_id in commit_ids}
+        if commit_ids:
+            placeholders = ",".join("?" * len(commit_ids))
+            for parent_row in conn.execute(
+                f"SELECT COMMIT_ID, PARENT_COMMIT_ID FROM COMMIT_PARENTS WHERE COMMIT_ID IN ({placeholders}) ORDER BY PARENT_ORDER",
+                commit_ids,
+            ):
+                parents_by_commit.setdefault(parent_row["COMMIT_ID"], []).append(parent_row["PARENT_COMMIT_ID"])
+        output = []
+        for row in rows:
+            item = {key.lower(): row[key] for key in row.keys()}
+            item["parent_commit_ids"] = parents_by_commit.get(item["commit_id"], [])
+            output.append(item)
+        return output
+    finally:
+        conn.close()
+
+
 def get_commit(commit_id: str) -> dict[str, Any] | None:
     conn = _get_connection()
     try:

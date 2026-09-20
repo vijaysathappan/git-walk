@@ -65,10 +65,19 @@ def security_overview(organization_id: str, actor_id: str) -> dict[str, Any]:
                FROM SECURITY_ROLES R LEFT JOIN SECURITY_ROLE_PERMISSIONS RP ON RP.ROLE_ID=R.ROLE_ID
                GROUP BY R.ROLE_ID ORDER BY R.ROLE_KEY"""
         )]
+        # Repository-scoped assignments are excluded once their repository
+        # is deleted (soft-deleted rows drop out of STATUS='ACTIVE') so a
+        # removed repository's stale grants don't linger in the Security
+        # Center view or its repository filter. Organization-scoped rows
+        # (no WORKBOOK_REPOSITORIES match) are untouched by this filter.
         assignments = [_row(row) for row in conn.execute(
-            """SELECT A.ASSIGNMENT_ID,A.USER_ID,U.EMAIL,R.ROLE_KEY,A.SCOPE_TYPE,A.SCOPE_ID,A.CREATED_AT
+            """SELECT A.ASSIGNMENT_ID,A.USER_ID,U.EMAIL,R.ROLE_KEY,A.SCOPE_TYPE,A.SCOPE_ID,A.CREATED_AT,
+                      W.REPOSITORY_NAME AS SCOPE_NAME
                FROM SECURITY_USER_ROLE_ASSIGNMENTS A JOIN SECURITY_ROLES R ON R.ROLE_ID=A.ROLE_ID
-               LEFT JOIN APP_USERS U ON U.USER_ID=A.USER_ID WHERE A.ORGANIZATION_ID=? ORDER BY A.CREATED_AT DESC""",
+               LEFT JOIN APP_USERS U ON U.USER_ID=A.USER_ID
+               LEFT JOIN WORKBOOK_REPOSITORIES W ON A.SCOPE_TYPE='REPOSITORY' AND A.SCOPE_ID=W.REPOSITORY_ID
+               WHERE A.ORGANIZATION_ID=? AND (A.SCOPE_TYPE!='REPOSITORY' OR W.STATUS='ACTIVE')
+               ORDER BY A.CREATED_AT DESC""",
             (organization_id,),
         )]
         policies = [_row(row) for row in conn.execute(
@@ -229,6 +238,42 @@ def set_user_status(organization_id: str, user_id: str, status: str, actor_id: s
     record_security_event("USER_STATUS_CHANGED", severity="WARNING", user_id=user_id, details={"organization_id": organization_id, "status": normalized, "changed_by": actor_id})
     record_audit_event("USER_STATUS_CHANGED", actor_user_id=actor_id, payload={"organization_id": organization_id, "user_id": user_id, "status": normalized})
     return {"user_id": user_id, "status": normalized}
+
+
+def list_organization_devices(organization_id: str, actor_id: str) -> list[dict[str, Any]]:
+    conn = database._get_connection()
+    try:
+        _require_admin(conn, organization_id, actor_id)
+    finally:
+        conn.close()
+    return database.list_organization_devices(organization_id)
+
+
+def set_organization_device_trust(organization_id: str, actor_id: str, fingerprint_id: str, trust_status: str) -> dict[str, Any]:
+    conn = database._get_connection()
+    try:
+        _require_admin(conn, organization_id, actor_id)
+    finally:
+        conn.close()
+    result = database.set_device_trust_status(fingerprint_id, trust_status)
+    record_security_event("DEVICE_TRUST_CHANGED", severity="WARNING" if trust_status == "BLOCKED" else "INFO",
+                          user_id=None, details={"organization_id": organization_id, "fingerprint_id": fingerprint_id,
+                                                  "trust_status": trust_status, "changed_by": actor_id})
+    record_audit_event("DEVICE_TRUST_CHANGED", actor_user_id=actor_id,
+                       payload={"organization_id": organization_id, "fingerprint_id": fingerprint_id, "trust_status": trust_status})
+    return result
+
+
+def revoke_organization_session(organization_id: str, actor_id: str, session_id: str) -> None:
+    conn = database._get_connection()
+    try:
+        _require_admin(conn, organization_id, actor_id)
+    finally:
+        conn.close()
+    database.revoke_session(session_id, organization_id)
+    record_security_event("SESSION_REVOKED", severity="WARNING", user_id=None,
+                          details={"organization_id": organization_id, "session_id": session_id, "revoked_by": actor_id})
+    record_audit_event("SESSION_REVOKED", actor_user_id=actor_id, payload={"organization_id": organization_id, "session_id": session_id})
 
 
 def create_service_account(organization_id: str, name: str, role_key: str, scope_type: str, scope_id: str, actor_id: str) -> dict[str, Any]:

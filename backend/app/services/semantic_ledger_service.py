@@ -214,16 +214,28 @@ class SemanticLedgerService:
             json.dumps(request, sort_keys=True, default=str, separators=(",", ":")).encode()
         ).hexdigest()
         existing = conn.execute(
-            "SELECT REQUEST_HASH,RESPONSE_JSON,STATUS FROM IDEMPOTENCY_KEYS WHERE IDEMPOTENCY_KEY=? AND ACTOR_ID=? AND OPERATION=?",
+            "SELECT REQUEST_HASH,RESPONSE_JSON,STATUS,EXPIRES_AT FROM IDEMPOTENCY_KEYS WHERE IDEMPOTENCY_KEY=? AND ACTOR_ID=? AND OPERATION=?",
             (key, actor_id, operation),
         ).fetchone()
+        now = datetime.now(timezone.utc)
         if existing:
             if existing[0] != request_hash:
                 raise ValueError("An Idempotency-Key cannot be reused with a different request")
             if existing[2] == "COMPLETED" and existing[1]:
                 return json.loads(existing[1])
-            raise RuntimeError("An identical request is already being processed")
-        now = datetime.now(timezone.utc)
+            expires_at = existing[3]
+            is_expired = expires_at and datetime.fromisoformat(expires_at) <= now
+            if existing[2] == "PROCESSING" and is_expired:
+                # The request that owned this key crashed/never finished
+                # before its TTL — treat it as abandoned instead of
+                # permanently blocking every future retry with this key.
+                conn.execute(
+                    "DELETE FROM IDEMPOTENCY_KEYS WHERE IDEMPOTENCY_KEY=? AND ACTOR_ID=? AND OPERATION=?",
+                    (key, actor_id, operation),
+                )
+                conn.commit()
+            else:
+                raise RuntimeError("An identical request is already being processed")
         conn.execute(
             "INSERT INTO IDEMPOTENCY_KEYS VALUES (?,?,?,?,NULL,'PROCESSING',?,?)",
             (key, actor_id, operation, request_hash, now.isoformat(),

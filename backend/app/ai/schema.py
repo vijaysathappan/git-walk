@@ -208,6 +208,10 @@ def initialize_ai_schema(conn: sqlite3.Connection, now: str) -> None:
         ("get_digital_thread", "Traverse an authorized digital-thread evidence graph", "thread.read", "LOW", "AUTO", 1, 1),
         ("run_integration", "Execute an integration connection after explicit confirmation", "integration.execute", "HIGH", "EXPLICIT_CONFIRMATION", 0, 0),
         ("replay_dead_letter", "Replay one dead-letter item after explicit confirmation", "integration.replay", "HIGH", "EXPLICIT_CONFIRMATION", 0, 0),
+        ("get_merge_conflict_context", "Read conflict state, authorship history, and resolution precedents for a merge conflict", "merge_request.read", "LOW", "AUTO", 1, 1),
+        ("get_commit_change_context", "Read a commit's semantic diff and cleared-field edit history", "branch.read", "LOW", "AUTO", 1, 1),
+        ("get_euc_risk_drift_context", "Read a branch-vs-main EUC risk finding diff with per-finding commit attribution", "repository.read", "LOW", "AUTO", 1, 1),
+        ("get_finding_context", "Read one EUC finding's full evidence, dependency impact, and prior lifecycle actions", "euc.read", "LOW", "AUTO", 1, 1),
     )
     for name, description, permission, risk, approval, idempotent, read_only in tools:
         conn.execute("INSERT OR IGNORE INTO AI_TOOLS VALUES (?,?,?,?,?,?,?,?,?,'ACTIVE',?,?)",
@@ -216,6 +220,10 @@ def initialize_ai_schema(conn: sqlite3.Connection, now: str) -> None:
         ("INVESTIGATION_AGENT", "Root-cause investigator", "Builds an evidence-backed explanation without changing source systems", "A2", ["search_information_fabric", "get_repository_summary", "get_integration_health", "get_digital_thread"]),
         ("INTEGRATION_OPERATIONS_AGENT", "Integration operations agent", "Diagnoses integration incidents and prepares confirmation-gated recovery actions", "A3", ["get_integration_health", "get_digital_thread", "run_integration", "replay_dead_letter"]),
         ("CONTROL_REMEDIATION_AGENT", "Control remediation agent", "Explains deterministic control failures and drafts remediation", "A3", ["search_information_fabric", "get_repository_summary", "get_digital_thread"]),
+        ("MERGE_CONFLICT_AGENT", "Merge conflict resolution agent", "Investigates branch-vs-main conflicts using resolution precedents and proposes confirmation-gated resolutions", "A2", ["get_merge_conflict_context"]),
+        ("COMMIT_REVIEW_AGENT", "Commit risk review agent", "Explains a personal-branch commit's deterministic risk score and investigates any fields it cleared", "A2", ["get_commit_change_context"]),
+        ("EUC_RISK_RADAR_AGENT", "EUC risk drift radar agent", "Diffs a branch's EUC risk findings against main and attributes every newly-introduced finding to the commit and author that caused it", "A2", ["get_euc_risk_drift_context"]),
+        ("EUC_REMEDIATION_AGENT", "EUC finding remediation agent", "Investigates one EUC finding's evidence and drafts a confirmation-gated recommendation for its lifecycle status and reason", "A2", ["get_finding_context"]),
     )
     for key, name, description, level, allowed_tools in agents:
         conn.execute("INSERT OR IGNORE INTO AI_AGENTS VALUES (?,?,?,?,?,?,8,'ACTIVE',?,?)",

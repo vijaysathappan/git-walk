@@ -211,6 +211,76 @@ class Stage5AIPlatformTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evaluation["total_cases"], evaluation["passed_cases"])
         self.assertEqual(1, len(service.evaluations(self.organization_id, self.owner["user_id"])))
 
+    def test_policy_write_rejects_a_non_free_nvidia_model_at_save_time(self):
+        """The honesty-gap fix (Phase 2 AI/LLM audit, task 1, Option A): a
+        policy referencing a disallowed model must be rejected AT WRITE
+        TIME with a clear, non-transient AIProviderError (which the API
+        layer maps to 422) — not silently accepted and only discovered
+        later when a request actually tries to route through it."""
+        service, _ = self.service()
+        conn = database._get_connection()
+        try:
+            now = database._utcnow()
+            conn.execute(
+                "INSERT INTO AI_MODELS VALUES (?, 'OPENROUTER','openai/gpt-4o','GPT-4o','REASONING','[\"CHAT\"]',NULL,0,0,1,0,1,10,?,?)",
+                ("AIM_PAID_TEST", now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with self.assertRaises(AIProviderError) as ctx:
+            service.update_model_policy(self.organization_id, self.owner["user_id"], "ENTERPRISE_COPILOT", {
+                "model_role": "REASONING", "model_id": "AIM_PAID_TEST",
+                "allow_external": True, "allowed_classifications": ["PUBLIC", "INTERNAL"],
+                "max_input_tokens": 24000, "max_output_tokens": 3000, "temperature": 0.1,
+            })
+        self.assertEqual("AI_MODEL_NOT_ALLOWED", ctx.exception.code)
+        self.assertFalse(ctx.exception.transient)
+        self.assertIn("free-tier NVIDIA", str(ctx.exception))
+
+        # The rejected write must not have persisted a policy at all.
+        administration = service.administration(self.organization_id, self.owner["user_id"])
+        self.assertFalse(
+            any(p["feature"] == "ENTERPRISE_COPILOT" for p in administration["policies"])
+        )
+        # And the disabled/disallowed model must never appear as a pickable
+        # option in the admin UI's model dropdown.
+        self.assertNotIn("AIM_PAID_TEST", [m["model_id"] for m in administration["models"]])
+
+    async def test_api_layer_maps_the_rejection_to_422(self):
+        """End-to-end through the FastAPI route, not just the service
+        function, since that's what an operator following the audit's
+        curl/UI workflow actually hits."""
+        from fastapi.testclient import TestClient
+        from app.main import app
+        from app.security import create_session_token
+
+        conn = database._get_connection()
+        try:
+            now = database._utcnow()
+            conn.execute(
+                "INSERT INTO AI_MODELS VALUES (?, 'OPENROUTER','openai/gpt-4o','GPT-4o','REASONING','[\"CHAT\"]',NULL,0,0,1,0,1,10,?,?)",
+                ("AIM_PAID_TEST2", now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        token = create_session_token(self.owner["user_id"], self.owner["email"])
+        client = TestClient(app)
+        response = client.put(
+            f"/api/v1/ai-platform/administration/model-policies/ENTERPRISE_COPILOT?organization_id={self.organization_id}",
+            json={
+                "model_role": "REASONING", "model_id": "AIM_PAID_TEST2",
+                "allow_external": True, "allowed_classifications": ["PUBLIC", "INTERNAL"],
+                "max_input_tokens": 24000, "max_output_tokens": 3000, "temperature": 0.1,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(422, response.status_code)
+        self.assertEqual("AI_MODEL_NOT_ALLOWED", response.json()["detail"]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

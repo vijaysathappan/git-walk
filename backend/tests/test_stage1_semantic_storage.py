@@ -1,6 +1,9 @@
+import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -143,6 +146,50 @@ class SemanticStorageTests(unittest.TestCase):
             self.assertEqual("C1", replay["commit_id"])
             with self.assertRaises(ValueError):
                 ledger.begin_idempotent(conn, "same-key", self.user["user_id"], "COMMIT", {"a": 2})
+        finally:
+            conn.close()
+
+    def test_expired_processing_row_is_abandoned_not_permanently_stuck(self):
+        """A request that crashed mid-flight leaves a PROCESSING row behind.
+        Once its EXPIRES_AT has passed, a later begin_idempotent() call for
+        the same key must treat it as abandoned and succeed, instead of
+        raising 'already being processed' forever (the bug this test
+        pins down: EXPIRES_AT was written but never read)."""
+        conn = database._get_connection()
+        try:
+            request_hash = hashlib.sha256(
+                json.dumps({"a": 1}, sort_keys=True, default=str, separators=(",", ":")).encode()
+            ).hexdigest()
+            past = datetime.now(timezone.utc) - timedelta(hours=1)
+            conn.execute(
+                "INSERT INTO IDEMPOTENCY_KEYS VALUES (?,?,?,?,NULL,'PROCESSING',?,?)",
+                (
+                    "stuck-key", self.user["user_id"], "COMMIT", request_hash,
+                    (past - timedelta(hours=1)).isoformat(), past.isoformat(),
+                ),
+            )
+            conn.commit()
+
+            ledger = ledger_for_connection(conn)
+            result = ledger.begin_idempotent(conn, "stuck-key", self.user["user_id"], "COMMIT", {"a": 1})
+            self.assertIsNone(result)
+            row = conn.execute(
+                "SELECT STATUS FROM IDEMPOTENCY_KEYS WHERE IDEMPOTENCY_KEY=? AND ACTOR_ID=? AND OPERATION=?",
+                ("stuck-key", self.user["user_id"], "COMMIT"),
+            ).fetchone()
+            self.assertEqual("PROCESSING", row[0])
+        finally:
+            conn.close()
+
+    def test_non_expired_processing_row_still_blocks_a_concurrent_retry(self):
+        """The fix must not weaken the concurrency guard for a request that
+        is still genuinely in flight (EXPIRES_AT in the future)."""
+        conn = database._get_connection()
+        try:
+            ledger = ledger_for_connection(conn)
+            self.assertIsNone(ledger.begin_idempotent(conn, "live-key", self.user["user_id"], "COMMIT", {"a": 1}))
+            with self.assertRaises(RuntimeError):
+                ledger.begin_idempotent(conn, "live-key", self.user["user_id"], "COMMIT", {"a": 1})
         finally:
             conn.close()
 

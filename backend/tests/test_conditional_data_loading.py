@@ -203,23 +203,28 @@ class ConditionalDataLoadingTests(unittest.TestCase):
         self.assertIn("FILE_PATH_MISMATCH", str(ctx.exception))
 
     def test_verify_workbook_access_role_enforcement(self):
-        """Users with role 'viewer' must be denied workbook access to edit branch data."""
+        """Users with role 'viewer' must be denied workbook access to edit branch data.
+
+        The workbook is issued to the viewer themself (not the owner) so this
+        test isolates role enforcement from the separate assigned-email lock
+        (a workbook issued to one account can't be opened by a different
+        account at all, regardless of role — see test_device_binding.py)."""
+        # Create a viewer-only user, then issue THEM their own branch workbook.
+        viewer = get_or_create_user("viewer_user@example.com")
+
         dest_folder = self.temp_dir / "role_test"
         dest_folder.mkdir(parents=True, exist_ok=True)
         result = issue_branch_workbook(
             main_table_id=self.table_id,
-            user_id=self.owner["user_id"],
-            user_email=self.owner["email"],
+            user_id=viewer["user_id"],
+            user_email=viewer["email"],
             local_target_dir=str(dest_folder),
         )
         auth_path = result["local_file_path"]
         update_branch_local_path(result["branch_id"], auth_path)
 
-        # Create a viewer-only user
-        viewer = get_or_create_user("viewer_user@example.com")
-        viewer_code = self._get_otp(viewer["email"])
-
-        # Add viewer to repository with 'viewer' role
+        # Re-assert 'viewer' role on this specific repository (issuing the
+        # workbook may have granted default access) before verifying.
         conn = _get_connection()
         try:
             conn.execute(
@@ -231,6 +236,8 @@ class ConditionalDataLoadingTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+
+        viewer_code = self._get_otp(viewer["email"])
 
         # Attempt verification with viewer credentials
         with self.assertRaises(PermissionError) as ctx:
@@ -308,6 +315,92 @@ class ConditionalDataLoadingTests(unittest.TestCase):
             },
         )
         self.assertEqual(401, bad_pwd_res.status_code)
+
+    def test_sanitize_local_workbook_reverts_to_9kb(self):
+        """When an open/populated workbook (>20KB) is closed, sanitization reverts it back to ~9KB."""
+        from app.services.local_workbook_sanitizer import (
+            sanitize_local_workbook_file,
+            is_file_locked,
+        )
+
+        dest_folder = self.temp_dir / "sanitize_test"
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        result = issue_branch_workbook(
+            main_table_id=self.table_id,
+            user_id=self.owner["user_id"],
+            user_email=self.owner["email"],
+            local_target_dir=str(dest_folder),
+        )
+        file_path = Path(result["local_file_path"])
+        shutil.copyfile(result["path"], file_path)
+        initial_size = file_path.stat().st_size
+        self.assertLessEqual(initial_size, 10752)  # Initially ~7-9KB
+
+        # Simulate user working in Excel: data populated and saved
+        wb = load_workbook(str(file_path))
+        sheet = wb.active
+        for r in range(2, 60):
+            sheet.cell(row=r, column=1, value=f"Person {r}")
+            sheet.cell(row=r, column=2, value=50000 + r * 100)
+            sheet.cell(row=r, column=3, value="Dept")
+            sheet.cell(row=r, column=4, value=f"ROW_{r:08X}")
+        wb.save(str(file_path))
+
+        from app.services.local_workbook_sanitizer import needs_sanitization
+        self.assertTrue(needs_sanitization(file_path))
+
+        # Verify not locked (Excel is closed)
+        self.assertFalse(is_file_locked(file_path))
+
+        # Sanitize
+        sanitize_res = sanitize_local_workbook_file(file_path, table_id=self.table_id, force=True)
+        self.assertTrue(sanitize_res["success"])
+
+        # Size after sanitize must be compact protected size
+        sanitized_size = file_path.stat().st_size
+        self.assertLessEqual(sanitized_size, 10752)
+
+        # Verify workbook content: headers intact, rows 2+ wiped to [LOCKED]
+        wb_check = load_workbook(str(file_path))
+        check_sheet = wb_check.active
+        self.assertEqual(2, check_sheet.max_row)
+        self.assertIn("[LOCKED]", str(check_sheet.cell(row=2, column=1).value))
+        self.assertEqual("NAME", check_sheet.cell(row=1, column=1).value)
+        self.assertFalse(needs_sanitization(file_path))
+
+    def test_api_sanitize_local_endpoint(self):
+        """POST /api/v1/workbooks/sanitize-local endpoint triggers size reversion."""
+        from app.services.local_workbook_sanitizer import needs_sanitization
+
+        dest_folder = self.temp_dir / "api_sanitize_test"
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        result = issue_branch_workbook(
+            main_table_id=self.table_id,
+            user_id=self.owner["user_id"],
+            user_email=self.owner["email"],
+            local_target_dir=str(dest_folder),
+        )
+        file_path = Path(result["local_file_path"])
+        shutil.copyfile(result["path"], file_path)
+
+        # Inflate file with rows
+        wb = load_workbook(str(file_path))
+        sheet = wb.active
+        for r in range(2, 50):
+            sheet.cell(row=r, column=1, value=f"Person {r}")
+        wb.save(str(file_path))
+        self.assertTrue(needs_sanitization(file_path))
+
+        # Call endpoint with working_copy_id
+        res = self.client.post(
+            "/api/v1/workbooks/sanitize-local",
+            json={"working_copy_id": result["working_copy_id"]},
+        )
+        self.assertEqual(200, res.status_code)
+        data = res.json()
+        self.assertTrue(data["success"])
+        self.assertLessEqual(file_path.stat().st_size, 10752)
+        self.assertFalse(needs_sanitization(file_path))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from ..observability import record_audit_event
 from ..services.semantic_ledger_service import ledger_for_connection
 from .catalog import is_free_nvidia_model_id
 from .gateway import AIGateway, StructuredOutputService, ai_gateway
+from .provider import AIProviderError
 from .retrieval import INJECTION_PATTERNS, evidence_retriever
 
 
@@ -252,7 +253,9 @@ class AIService:
     def _prepare_action(organization_id: str, user_id: str, run_id: str, requested: dict[str, Any]) -> dict[str, Any]:
         action_type = requested.get("action_type", "").upper()
         specs = {"RUN_INTEGRATION": ("integration.execute", "INTEGRATION_CONNECTION", requested.get("connection_id")),
-                 "REPLAY_DEAD_LETTER": ("integration.replay", "DEAD_LETTER", requested.get("dead_letter_id"))}
+                 "REPLAY_DEAD_LETTER": ("integration.replay", "DEAD_LETTER", requested.get("dead_letter_id")),
+                 "APPLY_MERGE_RESOLUTION": ("merge_request.resolve", "MERGE_CONFLICT", requested.get("conflict_id")),
+                 "APPLY_FINDING_REMEDIATION": ("euc.analyze", "EUC_FINDING", requested.get("finding_id"))}
         if action_type not in specs: raise ValueError("Agent may only prepare a registered governed action")
         permission, resource_type, resource_id = specs[action_type]
         if not resource_id: raise ValueError(f"{action_type} requires a target resource")
@@ -282,6 +285,43 @@ class AIService:
                                                            idempotency_key=f"AI_ACTION:{action_id}", batch_size=int(payload.get("batch_size", 1000)))
             elif action["ACTION_TYPE"] == "REPLAY_DEAD_LETTER":
                 result = await integration_service.replay_dead_letter(organization_id, payload["dead_letter_id"], user_id)
+            elif action["ACTION_TYPE"] == "APPLY_MERGE_RESOLUTION":
+                from ..services.merge_service import MergeActor, merge_service
+                from .merge_agent import list_suggestions
+                conn = database._get_connection()
+                try:
+                    user_row = conn.execute("SELECT EMAIL FROM APP_USERS WHERE USER_ID=?", (user_id,)).fetchone()
+                finally: conn.close()
+                merge_actor = MergeActor(user_id, user_row["EMAIL"] if user_row else "")
+                merged = merge_service.resolve_conflict(
+                    merge_request_id=payload["merge_request_id"], conflict_id=payload["conflict_id"],
+                    resolution_type=payload["resolution_type"], custom_value=payload.get("custom_value"),
+                    actor=merge_actor,
+                )
+                suggestion = next((item for item in list_suggestions(payload["merge_request_id"]) if item["suggestion_id"] == payload.get("suggestion_id")), None)
+                if suggestion:
+                    conn = database._get_connection()
+                    try:
+                        conn.execute("UPDATE MERGE_CONFLICT_AI_SUGGESTIONS SET STATUS='APPLIED',APPLIED_AT=? WHERE SUGGESTION_ID=?", (database._utcnow(), suggestion["suggestion_id"]))
+                        conn.commit()
+                    finally: conn.close()
+                result = {"merge_request_id": payload["merge_request_id"], "conflict_id": payload["conflict_id"], "status": merged["status"]}
+            elif action["ACTION_TYPE"] == "APPLY_FINDING_REMEDIATION":
+                from ..euc.intelligence import IntelligenceService
+                expires_at = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat() if payload["recommended_status"] == "ACCEPTED_RISK" else None
+                updated = IntelligenceService().update_finding(
+                    payload["euc_id"], user_id, payload["finding_id"],
+                    payload["recommended_status"], payload["reason"], expires_at,
+                )
+                conn = database._get_connection()
+                try:
+                    conn.execute(
+                        "UPDATE EUC_FINDING_REMEDIATIONS SET STATUS='APPLIED',APPLIED_AT=? WHERE REMEDIATION_ID=?",
+                        (database._utcnow(), payload["remediation_id"]),
+                    )
+                    conn.commit()
+                finally: conn.close()
+                result = {"euc_id": payload["euc_id"], "finding_id": payload["finding_id"], "status": updated["status"]}
             else: raise ValueError("AI action executor is not registered")
             conn = database._get_connection()
             try:
@@ -376,8 +416,11 @@ class AIService:
         try:
             self._ensure_settings(conn, organization_id, user_id); conn.commit()
             settings_row = conn.execute("SELECT * FROM AI_ORGANIZATION_SETTINGS WHERE ORGANIZATION_ID=?", (organization_id,)).fetchone()
+            # Only show models that update_model_policy() would actually
+            # accept (free-NVIDIA AND enabled) — otherwise the admin UI's
+            # dropdown could offer an option that 422s/404s on save.
             models = [
-                _row(row) for row in conn.execute("SELECT * FROM AI_MODELS ORDER BY PRIORITY")
+                _row(row) for row in conn.execute("SELECT * FROM AI_MODELS WHERE ENABLED=1 ORDER BY PRIORITY")
                 if is_free_nvidia_model_id(row["MODEL_SLUG"])
             ]
             policies = [_row(row) for row in conn.execute("SELECT * FROM AI_MODEL_POLICIES WHERE ORGANIZATION_ID=? ORDER BY FEATURE", (organization_id,))]
@@ -417,7 +460,16 @@ class AIService:
                 if not model:
                     raise KeyError("Enabled AI model does not exist")
                 if not is_free_nvidia_model_id(model["MODEL_SLUG"]):
-                    raise PermissionError("Only free NVIDIA OpenRouter models may be assigned to AI policies")
+                    # Reject at write time (422), not just at request time —
+                    # see gateway.py::route()'s Option A comment. A caller
+                    # that tries to save a non-free-NVIDIA model as a
+                    # feature's enforced route never gets a policy that
+                    # would only fail later, silently, on first use.
+                    raise AIProviderError(
+                        "AI_MODEL_NOT_ALLOWED",
+                        "Only free-tier NVIDIA OpenRouter models are permitted by system policy; "
+                        f"the model requested for this policy ({model['MODEL_SLUG']!r}) is not eligible.",
+                    )
             classifications = [str(item).upper() for item in payload.get("allowed_classifications", ["PUBLIC", "INTERNAL"])]
             conn.execute(
                 """INSERT INTO AI_MODEL_POLICIES

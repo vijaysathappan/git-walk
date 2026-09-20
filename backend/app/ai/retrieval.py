@@ -11,9 +11,16 @@ from typing import Any
 
 from .. import database
 from ..access_control.engine import ResourceContext, authorization_engine, repository_resource
+from ..euc.portfolio import portfolio_open_findings, portfolio_risk_overview
 from ..integrations.search import operations_dashboard, search_catalogue
 from ..integrations.thread import node_timeline, thread_graph
 from ..repositories.governance_store import list_audit_events, repository_insights
+
+
+_EUC_PORTFOLIO_KEYWORDS = (
+    "euc", "spreadsheet", "workbook", "risk", "finding", "compliance", "control",
+    "governance", "audit", "pii", "validation", "broken reference", "formula",
+)
 
 
 INJECTION_PATTERNS = re.compile(
@@ -88,6 +95,29 @@ class EvidenceRetriever:
                     data = {key.lower(): finding[key] for key in finding.keys()}
                     evidence.append(EvidenceItem("EUC_FINDING", finding["FINDING_ID"], finding["TITLE"], finding["DESCRIPTION"] or "Open deterministic EUC finding", data, classification, finding["UPDATED_AT"], self._hash(data)))
             finally: conn.close()
+        elif any(word in question.lower() for word in _EUC_PORTFOLIO_KEYWORDS):
+            # No repository was pinned, but the question is EUC/risk/compliance
+            # shaped -- ground it in the real portfolio-wide risk posture
+            # instead of falling through to the (EUC-blind) enterprise
+            # catalogue alone. Reuses the Portfolio Risk Command Center's own
+            # aggregation, so the copilot's answer and the dashboard numbers
+            # can never drift apart.
+            try:
+                overview = portfolio_risk_overview(user_id, organization_id=organization_id)
+                evidence.append(EvidenceItem(
+                    "EUC_PORTFOLIO_SUMMARY", organization_id, "EUC portfolio risk summary",
+                    "Aggregate residual risk, finding counts, and staleness across every governed EUC asset",
+                    overview["summary"], classification, database._utcnow(), self._hash(overview["summary"]),
+                ))
+                for finding in portfolio_open_findings(user_id, organization_id=organization_id, limit=15):
+                    evidence.append(EvidenceItem(
+                        "EUC_FINDING", finding["finding_id"],
+                        f"{finding['repository_name']}: {finding['title']}",
+                        finding["description"] or "Open deterministic EUC finding", finding,
+                        classification, finding["updated_at"], self._hash(finding),
+                    ))
+            except PermissionError:
+                warnings.append("EUC portfolio evidence was excluded by authorization policy.")
         query = " ".join(terms) or question[:120]
         try:
             catalogue = search_catalogue(organization_id, user_id, query, limit=15)

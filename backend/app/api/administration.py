@@ -14,9 +14,12 @@ from ..access_control.service import (
     create_group,
     create_policy,
     create_service_account,
+    list_organization_devices,
     primary_organization,
     revoke_assignment,
+    revoke_organization_session,
     security_overview,
+    set_organization_device_trust,
     set_user_status,
 )
 from ..security import Principal, current_principal
@@ -67,6 +70,10 @@ class ServiceAccountRequest(BaseModel):
     role_key: str = Field(min_length=2, max_length=80)
     scope_type: str = Field(min_length=2, max_length=40)
     scope_id: str = Field(min_length=2, max_length=120)
+
+
+class DeviceTrustRequest(BaseModel):
+    trust_status: str = Field(pattern="^(TRUSTED|BLOCKED|UNKNOWN)$")
 
 
 def _organization(requested: str | None, principal: Principal) -> str:
@@ -142,4 +149,22 @@ async def service_accounts(payload: ServiceAccountRequest, organization_id: str 
     try:
         return create_service_account(_organization(organization_id, principal), payload.name, payload.role_key,
                                       payload.scope_type, payload.scope_id, principal.user_id)
+    except Exception as exc: _raise(exc)
+
+
+@router.get("/devices")
+async def devices(organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return {"devices": list_organization_devices(_organization(organization_id, principal), principal.user_id)}
+    except Exception as exc: _raise(exc)
+
+
+@router.post("/devices/{fingerprint_id}/trust")
+async def device_trust(fingerprint_id: str, payload: DeviceTrustRequest, organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: return set_organization_device_trust(_organization(organization_id, principal), principal.user_id, fingerprint_id, payload.trust_status)
+    except Exception as exc: _raise(exc)
+
+
+@router.post("/sessions/{session_id}/revoke", status_code=204)
+async def revoke_session_route(session_id: str, organization_id: str | None = Query(default=None), principal: Principal = Depends(current_principal)):
+    try: revoke_organization_session(_organization(organization_id, principal), principal.user_id, session_id)
     except Exception as exc: _raise(exc)

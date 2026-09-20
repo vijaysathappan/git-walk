@@ -6,18 +6,27 @@ from starlette.background import BackgroundTask
 import shutil
 from pathlib import Path
 
+from pydantic import BaseModel, Field
+
 from ..database import (
     create_category,
     create_semantic_branch,
     delete_branch,
     delete_repository,
+    get_branch_protection,
     get_branch_sheet_page,
     get_repository,
+    get_repository_organization_id,
     list_categories,
     list_repository_branches,
+    list_repository_devices,
     list_user_working_copies,
     move_repository,
+    repository_activity_matrix,
+    repository_activity_overview,
     repository_name_available,
+    set_device_trust_status,
+    update_branch_protection,
     working_copy_checkout_options,
     user_can_access_branch,
     user_can_work_on_repository,
@@ -26,6 +35,12 @@ from ..database import (
     update_branch_local_path,
 )
 from ..schemas import BranchCreateRequest, CategoryCreateRequest, RepositoryCategoryRequest, WorkingCopyRequest, EucStorageSettingsRequest
+
+
+class BranchProtectionRequest(BaseModel):
+    allow_direct_commits: bool = False
+    required_approvals: int = Field(default=1, ge=0, le=10)
+    require_validation: bool = True
 from ..security import Principal, current_principal
 from ..repositories.merge_store import branch_context
 from ..services.workbook_service import export_branch_workbook, issue_branch_workbook
@@ -74,6 +89,123 @@ async def repository_detail(
     if not repository:
         raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
     return repository
+
+
+def _require_repository_owner(table_id: str, principal: Principal):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    if repository.get("repository_role") != "owner":
+        raise HTTPException(status_code=403, detail="Only the repository owner can view this")
+    return repository
+
+
+@router.get("/repositories/{table_id}/branch-protection")
+async def branch_protection(table_id: str, principal: Principal = Depends(current_principal)):
+    repository = _require_repository_owner(table_id, principal)
+    default_branch_id = repository.get("default_branch_id")
+    if not default_branch_id:
+        raise HTTPException(status_code=404, detail="Repository has no default branch")
+    rule = get_branch_protection(repository["repository_id"], default_branch_id)
+    return {"branch_id": default_branch_id, "rule": rule or {
+        "allow_direct_commits": False, "required_approvals": 1, "require_validation": True,
+    }}
+
+
+@router.put("/repositories/{table_id}/branch-protection")
+async def update_branch_protection_route(
+    table_id: str, payload: BranchProtectionRequest, principal: Principal = Depends(current_principal),
+):
+    repository = _require_repository_owner(table_id, principal)
+    default_branch_id = repository.get("default_branch_id")
+    if not default_branch_id:
+        raise HTTPException(status_code=404, detail="Repository has no default branch")
+    organization_id = get_repository_organization_id(repository["repository_id"])
+    rule = update_branch_protection(
+        repository["repository_id"], default_branch_id, organization_id,
+        payload.allow_direct_commits, payload.required_approvals, payload.require_validation, principal.user_id,
+    )
+    record_audit_event(
+        "BRANCH_PROTECTION_UPDATED", actor_user_id=principal.user_id,
+        repository_id=repository["repository_id"], branch_id=default_branch_id,
+        payload={"allow_direct_commits": payload.allow_direct_commits, "required_approvals": payload.required_approvals,
+                 "require_validation": payload.require_validation},
+    )
+    return {"branch_id": default_branch_id, "rule": rule}
+
+
+@router.get("/repositories/{table_id}/devices")
+async def repository_devices(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    repository = _require_repository_owner(table_id, principal)
+    return {"devices": list_repository_devices(repository["repository_id"])}
+
+
+@router.post("/repositories/{table_id}/devices/{fingerprint_id}/trust")
+async def trust_repository_device(
+    table_id: str,
+    fingerprint_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    _require_repository_owner(table_id, principal)
+    try:
+        device = set_device_trust_status(fingerprint_id, "TRUSTED")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    record_audit_event(
+        "DEVICE_TRUSTED", actor_user_id=principal.user_id,
+        payload={"fingerprint_id": fingerprint_id, "device_user_id": device["user_id"]},
+    )
+    return device
+
+
+@router.post("/repositories/{table_id}/devices/{fingerprint_id}/block")
+async def block_repository_device(
+    table_id: str,
+    fingerprint_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    _require_repository_owner(table_id, principal)
+    try:
+        device = set_device_trust_status(fingerprint_id, "BLOCKED")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    record_audit_event(
+        "DEVICE_BLOCKED", actor_user_id=principal.user_id,
+        payload={"fingerprint_id": fingerprint_id, "device_user_id": device["user_id"]},
+    )
+    return device
+
+
+@router.get("/repositories/{table_id}/activity")
+async def repository_activity(
+    table_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    try:
+        return {"activity": repository_activity_overview(repository["repository_id"])}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/repositories/{table_id}/activity/matrix")
+async def repository_activity_matrix_route(
+    table_id: str,
+    days: int = Query(default=14, ge=1, le=60),
+    principal: Principal = Depends(current_principal),
+):
+    repository = get_repository(table_id.strip().upper(), principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    try:
+        return repository_activity_matrix(repository["repository_id"], days)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.patch("/repositories/{table_id}/category")
@@ -189,13 +321,14 @@ async def remove_repository(
     principal: Principal = Depends(current_principal),
 ):
     try:
+        # delete_repository() now runs the full permanent-deletion pipeline
+        # (export -> email -> notify -> hard delete) and already records
+        # its own REPOSITORY_PURGED audit event — see
+        # services/repository_purge_service.py — so no separate audit call
+        # is needed here.
         result = delete_repository(table_id.strip().upper(), principal.user_id)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    record_audit_event(
-        "REPOSITORY_DELETED", actor_user_id=principal.user_id,
-        repository_id=result["repository_id"], payload={"table_id": result["table_id"]},
-    )
     return result
 
 

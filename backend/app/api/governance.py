@@ -7,6 +7,7 @@ from ..repositories.governance_store import (
     cell_traceability,
     list_audit_events,
     operational_metrics,
+    operational_metrics_trend,
     repository_id_for_table,
     repository_insights,
     row_history,
@@ -36,6 +37,8 @@ async def audit_events(
     event_type: str | None = None,
     status: str | None = None,
     limit: int = Query(default=200, ge=1, le=1000),
+    since: str | None = None,
+    until: str | None = None,
     principal: Principal = Depends(current_principal),
 ):
     repository_id = None
@@ -51,6 +54,7 @@ async def audit_events(
         "events": list_audit_events(
             repository_id=repository_id, actor_user_id=actor_user_id,
             event_type=event_type, status=status, limit=limit,
+            since=since, until=until,
         ),
         "integrity": verify_audit_integrity(),
     }
@@ -62,6 +66,14 @@ async def metrics(
     _principal: Principal = Depends(current_principal),
 ):
     return operational_metrics(hours)
+
+
+@router.get("/observability/metrics/trend")
+async def metrics_trend(
+    hours: int = Query(default=24 * 14, ge=1, le=24 * 180),
+    _principal: Principal = Depends(current_principal),
+):
+    return {"trend": operational_metrics_trend(hours)}
 
 
 @router.get("/security/posture")

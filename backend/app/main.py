@@ -41,6 +41,7 @@ from .database import (
     column_exists,
     create_sqlite_table_from_df,
     delete_user_ai_settings,
+    device_trust_status,
     get_audit_history,
     get_dataset_members,
     get_workspace_snapshot,
@@ -49,9 +50,11 @@ from .database import (
     get_table_page,
     get_table_snapshot,
     initialize_product_schema,
+    reconcile_orphaned_upload_tables,
     list_datasets,
     list_active_presence,
     read_cell,
+    record_device_fingerprint,
     resolve_repository_owner,
     remove_dataset_presence,
     remove_dataset_member,
@@ -76,6 +79,7 @@ from .api.governance import router as governance_router
 from .api.storage import router as storage_router
 from .api.euc import router as euc_router
 from .api.administration import router as administration_router
+from .api.notifications import router as notifications_router
 from .api.integrations import router as integrations_router
 from .api.ai_platform import router as ai_platform_router
 from .access_control.service import primary_organization
@@ -96,6 +100,7 @@ from .schemas import (
     WorkbookAuthRequest,
     WorkbookVerifyRequest,
     SetPasswordRequest,
+    SanitizeLocalRequest,
     PresenceRequest,
     RollbackRequest,
     SyncRequest,
@@ -112,6 +117,15 @@ from .security import (
 )
 from .secret_store import decrypt_secret, encrypt_secret
 from .services.workbook_service import issue_branch_workbook
+from .services.local_workbook_sanitizer import (
+    start_local_sanitizer_watcher,
+    stop_local_sanitizer_watcher,
+    sanitize_local_workbook_file,
+)
+from .services.repository_purge_service import (
+    start_repository_purge_watcher,
+    stop_repository_purge_watcher,
+)
 from .services.commit_service import CommitActor, commit_service
 from .repositories.commit_store import BranchHeadChangedError
 from .repositories.governance_store import (
@@ -143,8 +157,13 @@ from .observability import (
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     initialize_product_schema()
+    reconcile_orphaned_upload_tables()
     cleanup_abandoned_uploads()
+    start_local_sanitizer_watcher(interval_seconds=3.0)
+    start_repository_purge_watcher()
     yield
+    stop_local_sanitizer_watcher()
+    stop_repository_purge_watcher()
 
 
 app = FastAPI(
@@ -163,6 +182,7 @@ app.include_router(governance_router)
 app.include_router(storage_router)
 app.include_router(euc_router)
 app.include_router(administration_router)
+app.include_router(notifications_router)
 app.include_router(integrations_router)
 app.include_router(ai_platform_router)
 
@@ -204,7 +224,8 @@ async def request_observability(request: Request, call_next):
             response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
             response.headers["Cache-Control"] = "no-store"
 
-# ── CORS — Allow all origins for local dev ───────────────────────────────
+# ── CORS — origins are an explicit allowlist from settings.cors_origins,
+# configured per environment (see .env.example); this is NOT a wildcard.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -375,8 +396,15 @@ async def request_login_code(payload: LoginRequest):
     return response
 
 
+def _client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
 @app.post("/api/v1/auth/verify-code")
-async def verify_code(payload: LoginVerifyRequest):
+async def verify_code(payload: LoginVerifyRequest, request: Request):
     email = _valid_email(payload.email)
     try:
         user, token = verify_login_code(email, payload.code)
@@ -387,6 +415,15 @@ async def verify_code(payload: LoginVerifyRequest):
         )
         record_security_event("LOGIN_FAILED", details={"email": email, "reason": str(exc)})
         raise
+    if device_trust_status(user["user_id"], payload.machine_id) == "BLOCKED":
+        record_security_event(
+            "LOGIN_DEVICE_BLOCKED", details={"email": email, "machine_id": payload.machine_id},
+        )
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_BLOCKED", "message": "This device has been blocked by the repository owner."})
+    record_device_fingerprint(
+        user["user_id"], session_id=None, ip_address=_client_ip(request),
+        user_agent=request.headers.get("user-agent"), machine_id=payload.machine_id,
+    )
     record_audit_event(
         "LOGIN_SUCCESS", actor_user_id=user["user_id"], payload={"email": email}
     )
@@ -394,15 +431,29 @@ async def verify_code(payload: LoginVerifyRequest):
 
 
 @app.post("/api/v1/auth/workbook")
-async def authenticate_workbook(payload: WorkbookAuthRequest):
+async def authenticate_workbook(payload: WorkbookAuthRequest, request: Request):
+    workbook_fields = payload.model_dump(exclude={"machine_id"})
     try:
-        user = authenticate_working_copy_identity(**payload.model_dump())
+        user = authenticate_working_copy_identity(**workbook_fields, machine_id=payload.machine_id)
     except PermissionError as exc:
+        reason = str(exc)
         record_security_event(
             "WORKBOOK_AUTH_REJECTED",
-            details={"working_copy_id": payload.working_copy_id, "reason": str(exc)},
+            details={"working_copy_id": payload.working_copy_id, "machine_id": payload.machine_id, "reason": reason},
         )
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        if reason.startswith("DEVICE_MISMATCH:"):
+            raise HTTPException(status_code=403, detail={"code": "DEVICE_MISMATCH", "message": reason.split(":", 1)[1].strip()}) from exc
+        raise HTTPException(status_code=401, detail=reason) from exc
+    if device_trust_status(user["user_id"], payload.machine_id) == "BLOCKED":
+        record_security_event(
+            "WORKBOOK_AUTH_DEVICE_BLOCKED",
+            details={"working_copy_id": payload.working_copy_id, "machine_id": payload.machine_id},
+        )
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_BLOCKED", "message": "This device has been blocked by the repository owner."})
+    record_device_fingerprint(
+        user["user_id"], session_id=None, ip_address=_client_ip(request),
+        user_agent=request.headers.get("user-agent"), machine_id=payload.machine_id,
+    )
     token = create_session_token(user["user_id"], user["email"])
     record_audit_event(
         "WORKBOOK_AUTHENTICATED", actor_user_id=user["user_id"],
@@ -413,7 +464,7 @@ async def authenticate_workbook(payload: WorkbookAuthRequest):
 
 
 @app.post("/api/v1/auth/workbook-verify")
-async def verify_workbook(payload: WorkbookVerifyRequest):
+async def verify_workbook(payload: WorkbookVerifyRequest, request: Request):
     try:
         access_result = verify_workbook_access(
             repository_id=payload.repository_id,
@@ -422,24 +473,39 @@ async def verify_workbook(payload: WorkbookVerifyRequest):
             email=payload.email,
             code=payload.code,
             current_file_path=payload.current_file_path,
+            machine_id=payload.machine_id,
         )
     except PermissionError as exc:
         reason = str(exc)
-        status_code = 403 if "FILE_PATH_MISMATCH" in reason or "INSUFFICIENT_ROLE" in reason else 401
         record_security_event(
             "WORKBOOK_VERIFY_REJECTED",
             details={
                 "working_copy_id": payload.working_copy_id,
                 "current_file_path": payload.current_file_path,
+                "machine_id": payload.machine_id,
                 "email": payload.email,
                 "reason": reason,
             },
         )
+        if reason.startswith("DEVICE_MISMATCH:"):
+            raise HTTPException(status_code=403, detail={"code": "DEVICE_MISMATCH", "message": reason.split(":", 1)[1].strip()}) from exc
+        status_code = 403 if "FILE_PATH_MISMATCH" in reason or "INSUFFICIENT_ROLE" in reason else 401
         raise HTTPException(status_code=status_code, detail=reason) from exc
 
     user = access_result["user"]
     token = access_result["token"]
     table_id = access_result["table_id"]
+
+    if device_trust_status(user["user_id"], payload.machine_id) == "BLOCKED":
+        record_security_event(
+            "WORKBOOK_VERIFY_DEVICE_BLOCKED",
+            details={"working_copy_id": payload.working_copy_id, "machine_id": payload.machine_id, "email": payload.email},
+        )
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_BLOCKED", "message": "This device has been blocked by the repository owner."})
+    record_device_fingerprint(
+        user["user_id"], session_id=None, ip_address=_client_ip(request),
+        user_agent=request.headers.get("user-agent"), machine_id=payload.machine_id,
+    )
     snapshot = get_table_snapshot(table_id)
 
     record_audit_event(
@@ -458,6 +524,33 @@ async def verify_workbook(payload: WorkbookVerifyRequest):
         "table_id": table_id,
         "snapshot": snapshot,
     }
+
+
+@app.post("/api/v1/workbooks/sanitize-local")
+async def sanitize_local_endpoint(payload: SanitizeLocalRequest):
+    file_path = payload.file_path
+    table_id = payload.table_id
+    if not file_path and payload.working_copy_id:
+        conn = _get_connection()
+        try:
+            row = conn.execute(
+                """
+                SELECT W.LOCAL_FILE_PATH, B.DATA_TABLE_ID
+                FROM WORKING_COPIES W
+                JOIN BRANCHES B ON B.BRANCH_ID = W.BRANCH_ID
+                WHERE W.WORKING_COPY_ID = ?
+                """,
+                (payload.working_copy_id,),
+            ).fetchone()
+            if row:
+                file_path = row["LOCAL_FILE_PATH"]
+                table_id = table_id or row["DATA_TABLE_ID"]
+        finally:
+            conn.close()
+    if not file_path:
+        raise HTTPException(status_code=400, detail="Missing file_path or working_copy_id")
+    result = sanitize_local_workbook_file(file_path, table_id=table_id, force=payload.force)
+    return result
 
 
 @app.post("/api/v1/auth/set-password")
@@ -725,7 +818,6 @@ async def realtime_sync(
         message=f"{action} {table_id}.{column_name} @ ROW_ID={row_id}",
         persisted_value=update_result["persisted_value"],
         changed=update_result["changed"],
-        database_path=str(DB_PATH),
     )
 
 
@@ -755,8 +847,15 @@ async def bulk_sync(
 async def workbook_commit(
     payload: WorkbookCommitRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
+    x_device_id: str | None = Header(default=None, alias="X-Device-Id", max_length=200),
     principal: Principal = Depends(current_principal),
 ):
+    if device_trust_status(principal.user_id, x_device_id) == "BLOCKED":
+        record_security_event(
+            "COMMIT_DEVICE_BLOCKED", user_id=principal.user_id,
+            details={"table_id": payload.table_id, "machine_id": x_device_id},
+        )
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_BLOCKED", "message": "This device has been blocked by the repository owner."})
     table_id = _ensure_access(payload.table_id, principal, write=True)
     ledger = ledger_for(DB_PATH)
     idempotency_conn = None
@@ -880,7 +979,6 @@ async def get_cell_value(
         row_id=row_id,
         column_name=normalized_column,
         value=value,
-        database_path=str(DB_PATH),
     )
 
 
@@ -999,12 +1097,19 @@ async def dataset_presence(
 async def heartbeat_presence(
     table_id: str,
     payload: PresenceRequest,
+    x_device_id: str | None = Header(default=None, alias="X-Device-Id", max_length=200),
     principal: Principal = Depends(current_principal),
 ):
     normalized = _ensure_access(table_id, principal)
+    if device_trust_status(principal.user_id, x_device_id) == "BLOCKED":
+        record_security_event(
+            "PRESENCE_DEVICE_BLOCKED", user_id=principal.user_id,
+            details={"table_id": normalized, "machine_id": x_device_id},
+        )
+        raise HTTPException(status_code=403, detail={"code": "DEVICE_BLOCKED", "message": "This device has been blocked by the repository owner."})
     touch_dataset_presence(
         normalized, principal.user_id, payload.client_id,
-        payload.surface, payload.activity,
+        payload.surface, payload.activity, payload.status,
     )
     return {"active_users": list_active_presence(normalized)}
 

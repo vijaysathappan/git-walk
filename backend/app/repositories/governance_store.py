@@ -143,6 +143,7 @@ def repository_id_for_table(table_id: str) -> str | None:
 def list_audit_events(
     *, repository_id: str | None = None, actor_user_id: str | None = None,
     event_type: str | None = None, status: str | None = None, limit: int = 200,
+    since: str | None = None, until: str | None = None,
 ) -> list[dict[str, Any]]:
     where, params = [], []
     for column, value in (
@@ -152,6 +153,12 @@ def list_audit_events(
         if value:
             where.append(f"{column}=?")
             params.append(value)
+    if since:
+        where.append("CREATED_AT>=?")
+        params.append(since)
+    if until:
+        where.append("CREATED_AT<=?")
+        params.append(until)
     sql = "SELECT * FROM AUDIT_EVENTS"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -218,6 +225,36 @@ def operational_metrics(hours: int = 24) -> dict[str, Any]:
         "window_hours": hours, "samples": len(rows), "metrics": summary,
         "security_events": {row["SEVERITY"].lower(): row["COUNT"] for row in security},
     }
+
+
+def operational_metrics_trend(hours: int = 24 * 14) -> list[dict[str, Any]]:
+    """Day-grouped trend of the same OPERATION_METRICS operational_metrics()
+    flattens to one all-time average — gives the Insights hub's trend charts
+    real day-over-day movement instead of a single snapshot number."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=max(1, min(hours, 24 * 180)))).isoformat()
+    conn = _get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DATE(CREATED_AT) AS DAY, METRIC_NAME, METRIC_VALUE, STATUS "
+            "FROM OPERATION_METRICS WHERE CREATED_AT>=? ORDER BY DAY ASC",
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_day: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        day = row["DAY"]
+        bucket = by_day.setdefault(day, {"day": day, "samples": 0, "failures": 0, "values": []})
+        bucket["samples"] += 1
+        bucket["values"].append(float(row["METRIC_VALUE"]))
+        if row["STATUS"] == "FAILED":
+            bucket["failures"] += 1
+    trend = []
+    for day, bucket in sorted(by_day.items()):
+        values = bucket.pop("values")
+        bucket["average"] = round(sum(values) / len(values), 2) if values else 0
+        trend.append(bucket)
+    return trend
 
 
 def repository_insights(repository_id: str) -> dict[str, Any]:

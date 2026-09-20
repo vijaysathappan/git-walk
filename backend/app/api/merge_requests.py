@@ -1,7 +1,16 @@
 """Stage 3 merge request, review, validation, sync, and revert APIs."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from ..access_control.service import primary_organization
+from ..ai.gateway import AIProviderError
+from ..ai.merge_agent import (
+    analyze_merge_request,
+    assess_merge_request,
+    get_latest_assessment,
+    list_suggestions,
+    prepare_apply_action,
+)
 from ..database import get_repository
 from ..schemas import (
     ConflictResolutionRequest,
@@ -22,6 +31,24 @@ router = APIRouter(prefix="/api/v1", tags=["merge-requests"])
 
 def _actor(principal: Principal) -> MergeActor:
     return MergeActor(principal.user_id, principal.email)
+
+
+def _organization(requested: str | None, principal: Principal) -> str:
+    organization_id = requested or primary_organization(principal.user_id)
+    if not organization_id:
+        raise HTTPException(status_code=404, detail="No organization is available for this account")
+    return organization_id
+
+
+def _raise_ai(exc: Exception) -> None:
+    if isinstance(exc, PermissionError):
+        raise HTTPException(status_code=403, detail={"code": "AI_POLICY_DENIED", "message": str(exc)}) from exc
+    if isinstance(exc, KeyError):
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    if isinstance(exc, AIProviderError):
+        status = 503 if exc.transient or exc.code in {"AI_PROVIDER_NOT_CONFIGURED", "AI_PROVIDER_UNAVAILABLE"} else 422
+        raise HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc), "transient": exc.transient}) from exc
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _raise(exc: Exception) -> None:
@@ -136,6 +163,76 @@ async def resolve_merge_conflict(
         )
     except (PermissionError, ValueError, MergeConflictError) as exc:
         _raise(exc)
+
+
+@router.post("/merge-requests/{merge_request_id}/ai-analyze")
+async def analyze_merge_request_conflicts(
+    merge_request_id: str,
+    organization_id: str | None = Query(default=None),
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return await analyze_merge_request(
+            _organization(organization_id, principal), principal.user_id, merge_request_id, _actor(principal)
+        )
+    except (PermissionError, ValueError, KeyError, AIProviderError) as exc:
+        _raise_ai(exc)
+
+
+@router.get("/merge-requests/{merge_request_id}/ai-suggestions")
+async def merge_request_ai_suggestions(
+    merge_request_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        # Access-checked read: raises if the caller cannot see this merge request.
+        merge_service.get_request(merge_request_id, _actor(principal))
+    except (PermissionError, ValueError) as exc:
+        _raise(exc)
+    return {"suggestions": list_suggestions(merge_request_id)}
+
+
+@router.post("/merge-requests/{merge_request_id}/conflicts/{conflict_id}/ai-apply")
+async def prepare_ai_conflict_apply(
+    merge_request_id: str,
+    conflict_id: str,
+    organization_id: str | None = Query(default=None),
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return prepare_apply_action(
+            _organization(organization_id, principal), principal.user_id,
+            merge_request_id, conflict_id, _actor(principal),
+        )
+    except (PermissionError, ValueError, KeyError) as exc:
+        _raise_ai(exc)
+
+
+@router.post("/merge-requests/{merge_request_id}/ai-assessment")
+async def run_merge_request_ai_assessment(
+    merge_request_id: str,
+    organization_id: str | None = Query(default=None),
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return await assess_merge_request(
+            _organization(organization_id, principal), principal.user_id, merge_request_id, _actor(principal)
+        )
+    except (PermissionError, ValueError, KeyError, AIProviderError) as exc:
+        _raise_ai(exc)
+
+
+@router.get("/merge-requests/{merge_request_id}/ai-assessment")
+async def merge_request_ai_assessment(
+    merge_request_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        # Access-checked read: raises if the caller cannot see this merge request.
+        merge_service.get_request(merge_request_id, _actor(principal))
+    except (PermissionError, ValueError) as exc:
+        _raise(exc)
+    return {"assessment": get_latest_assessment(merge_request_id)}
 
 
 @router.post("/merge-requests/{merge_request_id}/review")

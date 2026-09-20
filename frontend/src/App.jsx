@@ -1,6 +1,15 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import InformationFabric from "./components/InformationFabric";
 import AICommandCenter from "./components/AICommandCenter";
+import TeamActivityPanel from "./components/TeamActivityPanel";
+import CommitGraphView from "./components/CommitGraphView";
+import AuditGraphView from "./components/AuditGraphView";
+import SignalFilter from "./components/SignalFilter";
+import DependencyGraphView from "./components/DependencyGraphView";
+import ArchitectureDiagramView from "./components/ArchitectureDiagramView";
+import RoleFamilyTree from "./components/RoleFamilyTree";
+import PersonalActivityModal from "./components/PersonalActivityModal";
+import AIAnswerView from "./components/AIAnswerView";
 import {
   addDatasetMember,
   addOrganizationMember,
@@ -8,6 +17,7 @@ import {
   clearAIConfig,
   clearAuth,
   checkRepositoryName,
+  confirmAIAction,
   createMergeRequest,
   createAccessPolicy,
   createRoleAssignment,
@@ -19,7 +29,14 @@ import {
   downloadRepositoryBranch,
   generateAIInsight,
   getEucAssets,
+  getEucAttestation,
+  getPortfolioAttestationOverview,
+  getPortfolioRiskOverview,
+  submitEucAttestation,
   getEucInventory,
+  ingestEucFromBranch,
+  getEucBranchComparison,
+  runEucBranchComparison,
   getAIModels,
   getAuditEvents,
   getBranchCommits,
@@ -41,12 +58,19 @@ import {
   getWorkspaceState,
   getDatasets,
   getKpis,
+  getMergeConflictAISuggestions,
   getMergeRequest,
+  getMergeRequestAIAssessment,
   getMergeRequests,
   getOperationalMetrics,
+  getOperationalMetricsTrend,
   getRepositoryInsights,
   getRepositoryStorage,
   getSecurityPosture,
+  getNotifications,
+  getBranchProtection,
+  getNotificationPreferences,
+  getOrganizationDevices,
   getSecurityAdminOverview,
   getStoredAuth,
   getStableCellHistory,
@@ -54,14 +78,23 @@ import {
   heartbeatPresence,
   leaveDatasetPresence,
   logout,
+  prepareAIConflictApply,
   requestLoginCode,
   resolveMergeConflict,
   reviewMergeRequest,
   rollbackChangeSet,
   mergeMergeRequest,
+  runMergeConflictAIAnalysis,
+  runMergeRequestAIAssessment,
   revertSemanticCommit,
   revokeDatasetMember,
+  markAllNotificationsRead,
+  markNotificationRead,
+  updateBranchProtection,
+  updateNotificationPreference,
+  revokeOrganizationSession,
   revokeRoleAssignment,
+  setOrganizationDeviceTrust,
   saveAIConfig,
   syncBranchWithMain,
   moveRepositoryToCategory,
@@ -82,6 +115,9 @@ import {
   getEucComplexity,
   getEucControls,
   getEucFinding,
+  getFindingRemediations,
+  proposeFindingRemediation,
+  prepareFindingRemediationApply,
   getEucFindings,
   getEucIntelligence,
   getEucRiskExplanation,
@@ -95,10 +131,13 @@ import {
   getEucMigrationWaves,
   approveEucApplicationModel,
   buildEucApplicationModel,
+  bulkReviewEucApplicationComponents,
   downloadEucApplicationGeneration,
   generateEucApplication,
   getEucApplicationComponents,
   getEucApplicationGeneration,
+  getEucApplicationGenerationFile,
+  getEucApplicationGenerationFiles,
   getEucApplicationLineage,
   getEucApplicationManifest,
   getEucApplicationModel,
@@ -123,6 +162,52 @@ function formatBytes(value) {
   let unit = -1;
   do { amount /= 1024; unit += 1; } while (amount >= 1024 && unit < units.length - 1);
   return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+function formatDatasetOption(dataset, allDatasets = []) {
+  const status = dataset.can_edit ? "EDIT" : dataset.can_view ? "VIEW" : "LOCKED";
+  const name = dataset.repository_name || dataset.original_filename || "Workbook";
+
+  const duplicates = allDatasets.filter((item) => item.repository_name === dataset.repository_name);
+  const isDuplicate = duplicates.length > 1;
+  const displayName = isDuplicate && dataset.repository_slug ? `${name} (${dataset.repository_slug})` : name;
+
+  const parts = [];
+  if (dataset.category_name && dataset.category_name !== "Unsorted") {
+    parts.push(dataset.category_name);
+  }
+  const rows = dataset.row_count ?? dataset.total_rows;
+  if (rows !== undefined && rows !== null) {
+    parts.push(`${rows} ${rows === 1 ? "row" : "rows"}`);
+  }
+  if (dataset.current_version !== undefined && dataset.current_version !== null) {
+    parts.push(`v${dataset.current_version}`);
+  }
+  if (dataset.branch_count && dataset.branch_count > 1) {
+    parts.push(`${dataset.branch_count} branches`);
+  }
+
+  const meta = parts.length > 0 ? ` — ${parts.join(" · ")}` : "";
+  return `[${status}] ${displayName}${meta}`;
+}
+
+// Same name/meta computation as formatDatasetOption, but split apart for UI
+// that already conveys edit/view/locked status with a colored dot — a
+// "[EDIT]" bracket tag baked into the label text next to that dot is
+// redundant. formatDatasetOption itself stays as-is for native <option>
+// elements, which can't render a colored dot and need the tag in plain text.
+function datasetDisplayName(dataset) {
+  return dataset.repository_name || dataset.original_filename || "Workbook";
+}
+
+function datasetMetaLine(dataset) {
+  const parts = [];
+  if (dataset.category_name && dataset.category_name !== "Unsorted") parts.push(dataset.category_name);
+  const rows = dataset.row_count ?? dataset.total_rows;
+  if (rows !== undefined && rows !== null) parts.push(`${rows} ${rows === 1 ? "row" : "rows"}`);
+  if (dataset.current_version !== undefined && dataset.current_version !== null) parts.push(`v${dataset.current_version}`);
+  if (dataset.branch_count && dataset.branch_count > 1) parts.push(`${dataset.branch_count} branches`);
+  return parts.join(" · ");
 }
 
 function DependencyWorkspace({ eucId, inventory, onError }) {
@@ -196,7 +281,7 @@ function DependencyWorkspace({ eucId, inventory, onError }) {
       <article><span>Calc depth</span><strong>{metrics.maximum_calculation_depth || 0}</strong><small>{metrics.calculation_components || 0} components</small></article>
       <article className={metrics.cycle_count ? "attention" : ""}><span>Integrity</span><strong>{metrics.cycle_count || 0}</strong><small>{metrics.broken_count || 0} broken / {metrics.formula_pattern_breaks || 0} pattern breaks</small></article>
     </div>
-    <section className="sheet-flow"><div className="dependency-section-head"><div><p className="eyebrow">SHEET GRAPH</p><h3>Workbook calculation flow</h3></div><span>{sheetGraph.edges?.length || 0} cross-sheet paths</span></div><div className="sheet-flow-nodes">{(sheetGraph.nodes || []).map((sheet) => <article key={sheet.sheet_id} className={`role-${sheet.role?.toLowerCase()}`}><i /><div><strong>{sheet.name}</strong><small>{sheet.role} / {sheet.formula_count} formulas</small></div><b>{sheet.used_cells}</b></article>)}</div><div className="sheet-flow-edges">{(sheetGraph.edges || []).map((edge) => <div key={`${edge.source_sheet_id}-${edge.target_sheet_id}`}><span>{sheetNames[edge.source_sheet_id]}</span><i>depends on</i><span>{sheetNames[edge.target_sheet_id]}</span><b>{Number(edge.edge_weight).toLocaleString()}</b></div>)}{!sheetGraph.edges?.length ? <p>No cross-sheet formula paths. In-sheet dependencies remain available in lineage.</p> : null}</div></section>
+    <section className="sheet-flow"><div className="dependency-section-head"><div><p className="eyebrow">SHEET GRAPH</p><h3>Workbook calculation flow</h3></div><div className="dependency-graph-legend"><span><i style={{ background: "#2da44e" }} />Source</span><span><i style={{ background: "#0969da" }} />Transform</span><span><i style={{ background: "#8250df" }} />Output</span>{cycles.length ? <span><i className="dependency-graph-legend-ring" />Cycle</span> : null}</div><span>{sheetGraph.edges?.length || 0} cross-sheet paths</span></div><div className="dependency-graph-canvas"><DependencyGraphView nodes={sheetGraph.nodes} edges={sheetGraph.edges} cycles={cycles} onSelectSheet={(node) => setSheetId(node.sheet_id)} /></div></section>
     <section className="lineage-console"><div className="lineage-query"><p className="eyebrow">CELL EXPLORER</p><h3>Trace before you change</h3><div><select value={sheetId} onChange={(event) => setSheetId(event.target.value)}>{(sheetGraph.nodes || []).map((sheet) => <option key={sheet.sheet_id} value={sheet.sheet_id}>{sheet.name}</option>)}</select><input value={cellAddress} onChange={(event) => setCellAddress(event.target.value)} placeholder="B14" /><button onClick={() => inspect()} disabled={busy}>Trace + impact</button></div><p>References use Excel addresses, while persisted identity remains stable across row and column movement.</p></div>{impact ? <div className="impact-readout"><div><span>Downstream</span><strong>{impact.total_downstream}</strong></div><div><span>Sheets reached</span><strong>{impact.affected_sheet_count}</strong></div><div><span>Maximum depth</span><strong>{impact.maximum_depth}</strong></div><div><span>Technical criticality</span><strong>{impact.technical_criticality}</strong></div></div> : <div className="impact-placeholder">Select a formula or precedent cell to reveal blast radius.</div>}
       {lineage ? <div className="lineage-results">{["upstream", "downstream"].map((direction) => <div key={direction}><h4>{direction}</h4>{(lineage.directions?.[direction]?.nodes || []).map((node) => <button key={node.node_id} onClick={() => { setSheetId(node.sheet_id || sheetId); setCellAddress(node.cell_address || cellAddress); if (node.sheet_id && node.cell_address) inspect(node.sheet_id, node.cell_address); }}><span>{node.display_name}</span><b>depth {node.depth}</b><em>{node.node_role}</em></button>)}{!lineage.directions?.[direction]?.nodes?.length ? <p>No {direction} nodes.</p> : null}</div>)}</div> : null}
     </section>
@@ -204,7 +289,7 @@ function DependencyWorkspace({ eucId, inventory, onError }) {
   </div>;
 }
 
-function IntelligenceWorkspace({ eucId, onError }) {
+function IntelligenceWorkspace({ eucId, tableId, onError }) {
   const [overview, setOverview] = useState(null);
   const [complexity, setComplexity] = useState(null);
   const [risk, setRisk] = useState(null);
@@ -217,6 +302,58 @@ function IntelligenceWorkspace({ eucId, onError }) {
   const [actionStatus, setActionStatus] = useState("ACKNOWLEDGED");
   const [actionReason, setActionReason] = useState("");
   const [busy, setBusy] = useState(false);
+  const [remediation, setRemediation] = useState(null);
+  const [remediationBusy, setRemediationBusy] = useState(false);
+  const [radarBranches, setRadarBranches] = useState([]);
+  const [radarBranchId, setRadarBranchId] = useState("");
+  const [radarComparison, setRadarComparison] = useState(null);
+  const [radarBusy, setRadarBusy] = useState(false);
+  const [attestation, setAttestation] = useState(null);
+  const [attestationStatement, setAttestationStatement] = useState("");
+  const [attestationBusy, setAttestationBusy] = useState(false);
+  const [attestationFormOpen, setAttestationFormOpen] = useState(false);
+
+  const loadAttestation = useCallback(() => {
+    getEucAttestation(eucId).then(setAttestation).catch(() => {});
+  }, [eucId]);
+
+  useEffect(() => { setAttestation(null); loadAttestation(); }, [loadAttestation]);
+
+  const submitAttestation = async () => {
+    if (attestationStatement.trim().length < 10) return;
+    setAttestationBusy(true);
+    try {
+      await submitEucAttestation(eucId, attestationStatement.trim());
+      setAttestationStatement(""); setAttestationFormOpen(false);
+      loadAttestation();
+    } catch (error) { onError(error.message); }
+    finally { setAttestationBusy(false); }
+  };
+
+  useEffect(() => {
+    setRadarBranches([]); setRadarBranchId(""); setRadarComparison(null);
+    if (!tableId) return;
+    getRepositoryBranches(tableId).then((result) => {
+      const userBranches = (result.branches || []).filter((branch) => branch.branch_type === "USER");
+      setRadarBranches(userBranches);
+      if (userBranches.length) setRadarBranchId(userBranches[0].branch_id);
+    }).catch(() => {});
+  }, [tableId]);
+
+  useEffect(() => {
+    if (!tableId || !radarBranchId) { setRadarComparison(null); return; }
+    getEucBranchComparison(tableId, radarBranchId)
+      .then((result) => setRadarComparison(result.comparison || null))
+      .catch(() => setRadarComparison(null));
+  }, [tableId, radarBranchId]);
+
+  const runRadarComparison = async () => {
+    if (!tableId || !radarBranchId) return;
+    setRadarBusy(true);
+    try { setRadarComparison(await runEucBranchComparison(tableId, radarBranchId)); }
+    catch (error) { onError(error.message); }
+    finally { setRadarBusy(false); }
+  };
 
   const load = async () => {
     const next = await getEucIntelligence(eucId);
@@ -259,6 +396,41 @@ function IntelligenceWorkspace({ eucId, onError }) {
     finally { setBusy(false); }
   };
 
+  useEffect(() => {
+    setRemediation(null);
+    if (!selectedFinding) return;
+    getFindingRemediations(eucId, selectedFinding.finding_id)
+      .then((result) => setRemediation(result.remediations?.[0] || null))
+      .catch(() => {});
+  }, [eucId, selectedFinding?.finding_id]);
+
+  const suggestRemediation = async () => {
+    if (!selectedFinding) return;
+    setRemediationBusy(true);
+    try {
+      const proposed = await proposeFindingRemediation(eucId, selectedFinding.finding_id);
+      setRemediation(proposed);
+    } catch (error) { onError(error.message); }
+    finally { setRemediationBusy(false); }
+  };
+
+  const applyRemediation = async () => {
+    if (!selectedFinding || !remediation || remediation.status !== "PROPOSED") return;
+    setRemediationBusy(true);
+    try {
+      const prepared = await prepareFindingRemediationApply(eucId, selectedFinding.finding_id);
+      await confirmAIAction(prepared.action_id);
+      const [updatedFinding, remediations] = await Promise.all([
+        getEucFinding(eucId, selectedFinding.finding_id),
+        getFindingRemediations(eucId, selectedFinding.finding_id),
+      ]);
+      setSelectedFinding(updatedFinding);
+      setRemediation(remediations.remediations?.[0] || null);
+      await load();
+    } catch (error) { onError(error.message); }
+    finally { setRemediationBusy(false); }
+  };
+
   const applyFindingAction = async () => {
     if (!selectedFinding || !actionReason.trim()) return;
     setBusy(true);
@@ -285,6 +457,83 @@ function IntelligenceWorkspace({ eucId, onError }) {
       <div><p className="eyebrow">RISK & CONTROL INTELLIGENCE / {overview.engine_version}</p><h3>Decision assurance map</h3><p><b className={overview.freshness === "CURRENT" ? "current" : "stale"}>{overview.freshness}</b> source / rules {overview.ruleset_version} / manifest <code>{overview.result_manifest_hash?.slice(0, 12)}</code></p></div>
       <div><select value={profile} onChange={(event) => setProfile(event.target.value)}><option>DEFAULT</option><option>FINANCIAL_MODEL</option><option>REGULATORY_REPORTING</option><option>OPERATIONS</option><option>PLANNING</option><option>ANALYTICS</option></select><button onClick={build} disabled={busy}>{busy ? "Analyzing..." : "Re-run analysis"}</button></div>
     </header>
+
+    {attestation ? <section className={`attestation-card ${attestation.status.is_overdue ? "overdue" : "current"}`}>
+      <header>
+        <div>
+          <span className="ai-suggestion-badge attestation-badge">{attestation.status.is_overdue ? "ATTESTATION OVERDUE" : "ATTESTATION CURRENT"}</span>
+          <i>Periodic owner sign-off, recorded in the immutable audit ledger — the deliverable a SOX / model-risk audit asks for.</i>
+        </div>
+        {attestation.status.can_attest ? (
+          <div className="ai-assessment-toolbar">
+            <button className="secondary-button" onClick={() => setAttestationFormOpen((value) => !value)}>
+              {attestationFormOpen ? "Cancel" : "Submit attestation"}
+            </button>
+          </div>
+        ) : null}
+      </header>
+      {attestation.status.latest ? (
+        <p>
+          Last attested by <b>{attestation.status.latest.submitted_by}</b> on {new Date(attestation.status.latest.submitted_at).toLocaleDateString()}
+          {" "}&mdash; {attestation.status.latest.open_finding_count} open finding(s), {attestation.status.latest.open_critical_high_count} high/critical.
+          <br /><span className="attestation-statement">&ldquo;{attestation.status.latest.statement}&rdquo;</span>
+        </p>
+      ) : <p className="muted">No attestation has been submitted for this workbook yet.</p>}
+      <small className="attestation-due">
+        {attestation.status.is_overdue ? "Overdue since " : "Next due "}
+        {new Date(attestation.status.due_at).toLocaleDateString()} (review cycle: every {attestation.status.interval_days} days)
+      </small>
+      {attestationFormOpen ? (
+        <div className="attestation-form">
+          <textarea
+            value={attestationStatement} onChange={(event) => setAttestationStatement(event.target.value)}
+            placeholder="I have reviewed this EUC's current findings and residual risk. Open findings are being remediated or are an accepted risk for this cycle..."
+          />
+          <button className="primary-button compact" onClick={submitAttestation} disabled={attestationBusy || attestationStatement.trim().length < 10}>
+            {attestationBusy ? "Submitting..." : "Record attestation"}
+          </button>
+        </div>
+      ) : null}
+    </section> : null}
+
+    {tableId && radarBranches.length ? <section className={`ai-assessment-card risk-drift-radar ${radarComparison ? `risk-${radarComparison.risk_score_delta > 0 ? "high" : "low"}` : ""}`}>
+      <header>
+        <div><span className="ai-suggestion-badge">RISK DRIFT RADAR</span><i>Distinct from any Boardwalk capability — no competitor pairs EUC risk scoring with per-cell commit attribution.</i></div>
+        <div className="ai-assessment-toolbar">
+          <select value={radarBranchId} onChange={(event) => setRadarBranchId(event.target.value)}>
+            {radarBranches.map((branch) => <option key={branch.branch_id} value={branch.branch_id}>{branch.branch_name}</option>)}
+          </select>
+          <button className="secondary-button" onClick={runRadarComparison} disabled={radarBusy}>
+            {radarBusy ? "Comparing to main..." : radarComparison ? "Re-compare to main" : "Compare to main"}
+          </button>
+        </div>
+      </header>
+      {radarComparison ? <>
+        <p><b>Risk score delta vs main: {radarComparison.risk_score_delta > 0 ? "+" : ""}{radarComparison.risk_score_delta}</b></p>
+        <p>{radarComparison.summary}</p>
+        {(radarComparison.findings_introduced || []).length ? <div className="ai-field-explainability">
+          <p className="ai-field-explainability-title">Findings this branch introduces</p>
+          {radarComparison.findings_introduced.map((finding) => {
+            const attribution = (radarComparison.attribution || []).find((item) => item.finding_id === finding.finding_id);
+            return <article key={finding.finding_id} className="ai-field-explanation">
+              <header><strong>{finding.title}</strong><span className={`sev-${(finding.severity || "medium").toLowerCase()}`}>{finding.severity}</span></header>
+              <p>{finding.sheet_id || "workbook"}{finding.cell_address ? `!${finding.cell_address}` : ""}</p>
+              <small>{attribution
+                ? `Introduced by ${attribution.author_email || "unknown"} in commit ${attribution.commit_id} on ${new Date(attribution.occurred_at).toLocaleString()}`
+                : "Cannot be attributed to a single commit"}</small>
+            </article>;
+          })}
+        </div> : null}
+        {(radarComparison.findings_resolved || []).length ? <div className="ai-field-explainability">
+          <p className="ai-field-explainability-title">Findings this branch resolves</p>
+          {radarComparison.findings_resolved.map((finding) => <article key={finding.finding_id} className="ai-field-explanation">
+            <header><strong>{finding.title}</strong><span className={`sev-${(finding.severity || "medium").toLowerCase()}`}>{finding.severity}</span></header>
+            <p>{finding.sheet_id || "workbook"}{finding.cell_address ? `!${finding.cell_address}` : ""}</p>
+          </article>)}
+        </div> : null}
+      </> : <p className="muted">Run a comparison to see what risk this branch introduces or resolves relative to main, with commit-level attribution for every new finding.</p>}
+    </section> : null}
+
     <div className="assurance-scoreboard">
       {[['complexity', 'Complexity', scores.complexity, 'Structural burden'], ['inherent', 'Inherent risk', scores.inherent_risk, 'Before controls'], ['control', 'Control strength', scores.control_strength, 'Native + Git Walk'], ['residual', 'Residual risk', scores.residual_risk, 'After controls']].map(([tone, label, value, caption]) => <article key={tone} className={`score-${tone}`}><span>{label}</span><strong>{Math.round(value || 0)}</strong><div><i style={{ width: `${value || 0}%` }} /></div><small>{caption} / {(overview.classifications?.[tone === 'inherent' ? 'inherent_risk' : tone === 'control' ? 'control_strength' : tone === 'residual' ? 'residual_risk' : 'complexity'] || '').replaceAll('_', ' ')}</small></article>)}
     </div>
@@ -302,6 +551,29 @@ function IntelligenceWorkspace({ eucId, onError }) {
         <dl><div><dt>Where</dt><dd>{selectedFinding.sheet_id || "Workbook"}{selectedFinding.cell_address ? ` / ${selectedFinding.cell_address}` : ""}</dd></div><div><dt>Confidence</dt><dd>{Math.round(selectedFinding.confidence * 100)}%</dd></div><div><dt>Impact</dt><dd>{selectedFinding.dependency_impact?.downstream || 0} downstream / {selectedFinding.dependency_impact?.sheets || 0} sheets</dd></div><div><dt>Evidence hash</dt><dd><code>{selectedFinding.evidence_manifest_hash?.slice(0, 16)}</code></dd></div></dl>
         <div className="finding-proof"><span>Observed evidence</span><pre>{JSON.stringify(selectedFinding.evidence?.evidence || {}, null, 2)}</pre></div>
         <div className="finding-remediation"><span>Recommended control</span><strong>{selectedFinding.remediation_code?.replaceAll("_", " ")}</strong></div>
+        <div className={`ai-finding-remediation ${remediation ? `risk-${(remediation.risk_level || "").toLowerCase()}` : ""}`}>
+          <div className="ai-finding-remediation-head">
+            <span className="ai-suggestion-badge">AI REMEDIATION</span>
+            {!remediation ? (
+              <button className="secondary-button" onClick={suggestRemediation} disabled={remediationBusy}>
+                {remediationBusy ? "Investigating..." : "Suggest remediation"}
+              </button>
+            ) : null}
+          </div>
+          {remediation ? <>
+            <div className="ai-finding-remediation-status">
+              <span className={`pill sev-${(remediation.risk_level || "").toLowerCase()}`}>{remediation.risk_level} risk</span>
+              <strong>{remediation.recommended_status?.replaceAll("_", " ")}</strong>
+              <small>{Math.round((remediation.confidence || 0) * 100)}% confidence</small>
+            </div>
+            <p>{remediation.reason}</p>
+            {remediation.status === "PROPOSED" ? (
+              <button className="primary-button compact" onClick={applyRemediation} disabled={remediationBusy}>
+                {remediationBusy ? "Applying..." : `Apply: set to ${remediation.recommended_status?.replaceAll("_", " ")}`}
+              </button>
+            ) : <span className="ai-finding-remediation-applied">Applied</span>}
+          </> : <p className="muted">Let AI draft a lifecycle recommendation and reason from this finding's evidence &mdash; you review and confirm before anything changes.</p>}
+        </div>
         <div className="finding-action"><select value={actionStatus} onChange={(event) => setActionStatus(event.target.value)}><option>ACKNOWLEDGED</option><option>IN_REVIEW</option><option>REMEDIATION_PLANNED</option><option>ACCEPTED_RISK</option><option>RESOLVED</option><option>FALSE_POSITIVE</option><option>SUPPRESSED</option></select><textarea value={actionReason} onChange={(event) => setActionReason(event.target.value)} placeholder="Record the evidence-backed decision..." /><button onClick={applyFindingAction} disabled={busy || !actionReason.trim()}>Record decision</button></div>
       </> : <div className="finding-placeholder"><span>01</span><h3>Select a finding</h3><p>Inspect what happened, where it occurred, why it matters, the dependency blast radius, and the immutable evidence behind the rule.</p></div>}</aside>
     </div> : null}
@@ -407,7 +679,7 @@ function MigrationWorkspace({ eucId, onError }) {
 
     {view === "components" ? <div className="migration-component-layout"><section className="migration-components"><header><div><p className="eyebrow">MIGRATION UNIT MATRIX</p><h3>Engine recommendation and owner decision</h3></div><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="">All modes</option><option>AUTO_MIGRATABLE</option><option>ASSISTED_MIGRATION</option><option>MANUAL_REENGINEERING</option><option>RETAIN_IN_EXCEL</option><option>UNSUPPORTED</option><option>RETIRE</option></select></header><div className="migration-component-table"><div><span>Component</span><span>Type</span><span>Difficulty</span><span>Mode</span><span>Wave</span></div>{components.map((unit) => <button key={unit.unit_id} className={selectedUnit?.unit_id === unit.unit_id ? "active" : ""} onClick={() => { setSelectedUnit(unit); setOverrideMode(unit.effective_mode); }}><span><strong>{unit.source_name}</strong><small>{unit.target_component}</small></span><span>{unit.source_type.replaceAll("_", " ")}</span><span>{unit.difficulty}</span><span className={`mode-${unit.effective_mode.toLowerCase()}`}>{unit.effective_mode.replaceAll("_", " ")}{unit.manual_mode ? <small>overridden</small> : null}</span><span>W{unit.wave_number}</span></button>)}</div></section><aside className={selectedUnit ? "unit-decision open" : "unit-decision"}>{selectedUnit ? <><button onClick={() => setSelectedUnit(null)}>Close</button><p className="eyebrow">MANUAL DECISION / AUDITED</p><h3>{selectedUnit.source_name}</h3><dl><div><dt>Engine</dt><dd>{selectedUnit.engine_mode.replaceAll("_", " ")}</dd></div><div><dt>Target</dt><dd>{selectedUnit.target_type.replaceAll("_", " ")}</dd></div><div><dt>Weight</dt><dd>{selectedUnit.migration_weight}</dd></div><div><dt>Wave</dt><dd>{selectedUnit.wave_number}</dd></div></dl><p>{selectedUnit.rationale}</p><select value={overrideMode} onChange={(event) => setOverrideMode(event.target.value)}>{["AUTO_MIGRATABLE", "ASSISTED_MIGRATION", "MANUAL_REENGINEERING", "RETAIN_IN_EXCEL", "UNSUPPORTED", "RETIRE"].map((item) => <option key={item}>{item}</option>)}</select><textarea value={overrideReason} onChange={(event) => setOverrideReason(event.target.value)} placeholder="Explain the domain decision without overwriting the engine evidence..." /><button className="record-override" onClick={applyOverride} disabled={busy || !overrideReason.trim()}>Record override</button>{selectedUnit.override_reason ? <small>Current decision: {selectedUnit.override_reason}</small> : null}</> : <div><span>24</span><h3>Select a migration unit</h3><p>Inspect its engine recommendation, target mapping, weight, sequence, and any domain-owner override.</p></div>}</aside></div> : null}
 
-    {view === "target" ? <section className="target-architecture"><header><div><p className="eyebrow">TARGET OPERATING MODEL</p><h3>Decompose the workbook, not its problems</h3></div><span>{target.architecture?.strategy?.replaceAll("_", " ")}</span></header><div className="architecture-canvas">{(target.architecture?.components || []).map((item, index) => <article key={item.id} style={{ "--node-index": index }}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.name}</strong><small>{item.unit_count} units / {item.target_types.join(" + ")}</small></div></article>)}</div><div className="architecture-edges">{(target.architecture?.edges || []).map((edge) => <span key={`${edge.source}-${edge.target}`}><b>{edge.source.replaceAll("_", " ")}</b><i>→</i><b>{edge.target.replaceAll("_", " ")}</b></span>)}</div></section> : null}
+    {view === "target" ? <section className="target-architecture"><header><div><p className="eyebrow">TARGET OPERATING MODEL</p><h3>Decompose the workbook, not its problems</h3></div><span>{target.architecture?.strategy?.replaceAll("_", " ")}</span></header><ArchitectureDiagramView components={target.architecture?.components} edges={target.architecture?.edges} /></section> : null}
 
     {view === "waves" ? <section className="migration-waves"><header><p className="eyebrow">DEPENDENCY-ORDERED DELIVERY</p><h3>Foundation before presentation</h3></header><div>{waves.map((wave) => <article key={wave.wave_number}><div><span>WAVE</span><strong>{wave.wave_number}</strong></div><section><h4>{wave.wave_name}</h4><p>{wave.objective}</p><footer><span>{wave.unit_count} migration units</span><b>{wave.effort_class} effort</b></footer></section></article>)}</div></section> : null}
 
@@ -430,6 +702,13 @@ function NativeModelWorkspace({ eucId, onError }) {
   const [lineageQuery, setLineageQuery] = useState("");
   const [generationMode, setGenerationMode] = useState("MODEL_ONLY");
   const [busy, setBusy] = useState(false);
+  const [bulkType, setBulkType] = useState("");
+  const [bulkConfidence, setBulkConfidence] = useState(0);
+  const [bulkReason, setBulkReason] = useState("Bulk-confirmed after spot-checking a sample against the source workbook.");
+  const [previewFiles, setPreviewFiles] = useState([]);
+  const [previewPath, setPreviewPath] = useState("");
+  const [previewContent, setPreviewContent] = useState("");
+  const [previewBusy, setPreviewBusy] = useState(false);
 
   const load = async () => {
     const next = await getEucApplicationModel(eucId);
@@ -448,6 +727,7 @@ function NativeModelWorkspace({ eucId, onError }) {
 
   useEffect(() => {
     setOverview(null); setView("overview"); setSelected(null);
+    setPreviewFiles([]); setPreviewPath(""); setPreviewContent("");
     load().catch((error) => onError(error.message));
   }, [eucId]);
 
@@ -460,7 +740,10 @@ function NativeModelWorkspace({ eucId, onError }) {
 
   const build = () => run(() => buildEucApplicationModel(eucId));
   const approve = () => run(() => approveEucApplicationModel(eucId));
-  const generate = () => run(() => generateEucApplication(eucId, generationMode));
+  const generate = () => {
+    setPreviewFiles([]); setPreviewPath(""); setPreviewContent("");
+    return run(() => generateEucApplication(eucId, generationMode));
+  };
   const review = (decision) => {
     if (!selected || !reviewReason.trim()) return;
     run(() => reviewEucApplicationComponent(eucId, selected.component_id, decision, reviewReason.trim()))
@@ -475,9 +758,37 @@ function NativeModelWorkspace({ eucId, onError }) {
     try { setLineage((await getEucApplicationLineage(eucId, lineageQuery.trim())).items || []); }
     catch (error) { onError(error.message); }
   };
+  const bulkReview = (decision) => {
+    if (bulkReason.trim().length < 3) return;
+    run(() => bulkReviewEucApplicationComponents(eucId, decision, bulkReason.trim(), bulkType || null, Number(bulkConfidence) || 0))
+      .then(() => filterComponents(componentType));
+  };
+  const openGenerationPreview = async (generationRunId) => {
+    setPreviewBusy(true);
+    try {
+      const result = await getEucApplicationGenerationFiles(eucId, generationRunId);
+      setPreviewFiles(result.files || []);
+      const first = result.files?.[0]?.path || "";
+      setPreviewPath(first);
+      if (first) {
+        const file = await getEucApplicationGenerationFile(eucId, generationRunId, first);
+        setPreviewContent(file.content);
+      }
+    } catch (error) { onError(error.message); }
+    finally { setPreviewBusy(false); }
+  };
+  const openPreviewFile = async (generationRunId, path) => {
+    setPreviewPath(path);
+    setPreviewBusy(true);
+    try {
+      const file = await getEucApplicationGenerationFile(eucId, generationRunId, path);
+      setPreviewContent(file.content);
+    } catch (error) { setPreviewContent("(binary file — download the ZIP to view it)"); }
+    finally { setPreviewBusy(false); }
+  };
 
   if (!overview) return <div className="native-loading">Loading native application evidence...</div>;
-  if (overview.status === "NOT_BUILT") return <div className="native-onboarding"><div><span>STAGE 2.5 / EUC MODERNIZATION COMPILER</span><h3>Turn the governed workbook into a native application model.</h3><p>Build technology-neutral AIR for domains, data, calculations, APIs, screens, workflows, controls, and tests. Every inferred object retains source provenance and must pass review before scaffold generation.</p></div><div><b>2.1</b><i>Inventory</i><b>2.2</b><i>Graph</i><b>2.3</b><i>Risk</i><b>2.4</b><i>Plan</i><b className="active">2.5</b><i>Build</i><button onClick={build} disabled={busy}>{busy ? "Compiling AIR..." : "Build native model"}</button></div></div>;
+  if (overview.status === "NOT_BUILT") return <div className="native-onboarding"><div><span>NATIVE APPLICATION MODEL</span><h3>Turn the governed workbook into a native application model.</h3><p>Compiles a technology-neutral application model &mdash; domains, data, calculations, APIs, screens, workflows, controls, and tests &mdash; from the workbook's own structure. Every inferred object keeps source provenance and passes a human review gate before a real, downloadable application scaffold can be generated.</p></div><div><button onClick={build} disabled={busy}>{busy ? "Compiling application model..." : "Build native model"}</button></div></div>;
 
   const counts = overview.summary?.counts || {};
   const validation = manifest?.validation || { errors: [], warnings: [], checks: {} };
@@ -495,13 +806,35 @@ function NativeModelWorkspace({ eucId, onError }) {
       <div className="native-overview-grid"><section><p className="eyebrow">DOMAIN MAP</p><h3>From workbook zones to software boundaries</h3><div className="domain-map">{(manifest?.domains || []).map((domain, index) => <article key={domain.component_id}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{domain.name}</strong><small>{domain.generation_policy.replaceAll("_", " ")} / {Math.round(domain.confidence * 100)}%</small></div></article>)}</div></section><section className="screen-preview"><p className="eyebrow">GENERATED EXPERIENCE MODEL</p><h3>Purpose before pixels</h3>{(manifest?.screens || []).slice(0, 4).map((screen) => <article key={screen.component_id}><div><span>{screen.screen_type.replaceAll("_", " ")}</span><strong>{screen.name}</strong></div><small>{screen.components.join(" / ")}</small></article>)}</section></div>
     </> : null}
 
-    {view === "components" ? <div className="native-component-layout"><section className="native-components"><header><div><p className="eyebrow">CANONICAL AIR OBJECTS</p><h3>Review the compiler&apos;s semantic decisions</h3></div><select value={componentType} onChange={(event) => filterComponents(event.target.value)}><option value="">All components</option>{["DOMAIN", "ENTITY", "RELATIONSHIP", "CALCULATION", "BUSINESS_RULE", "SERVICE", "API", "SCREEN", "WORKFLOW", "INTEGRATION", "CONTROL", "ROLE", "TEST"].map((type) => <option key={type}>{type}</option>)}</select></header><div className="native-component-table"><div><span>Component</span><span>Type</span><span>Confidence</span><span>Generation</span><span>Review</span></div>{displayed.map((item) => <button key={item.component_id} className={selected?.component_id === item.component_id ? "active" : ""} onClick={() => setSelected(item)}><span><strong>{item.name}</strong><small>{item.component_id}</small></span><span>{item.component_type.replaceAll("_", " ")}</span><span><i style={{ width: `${item.confidence * 100}%` }} /><b>{Math.round(item.confidence * 100)}%</b></span><span>{item.generation_policy.replaceAll("_", " ")}</span><em className={`review-${item.review_state.toLowerCase()}`}>{item.review_state.replaceAll("_", " ")}</em></button>)}</div></section><aside className={selected ? "native-review open" : "native-review"}>{selected ? <><button onClick={() => setSelected(null)}>Close</button><p className="eyebrow">HUMAN SEMANTIC GATE</p><h3>{selected.name}</h3><dl><div><dt>Source</dt><dd>{selected.provenance?.source_type}</dd></div><div><dt>Location</dt><dd>{selected.provenance?.sheet || selected.provenance?.source_range || "Workbook"}</dd></div><div><dt>Confidence</dt><dd>{Math.round(selected.confidence * 100)}%</dd></div><div><dt>Policy</dt><dd>{selected.generation_policy}</dd></div></dl><p>Confirm only after this target meaning matches the workbook&apos;s intended business behavior. Rejected components remain in lineage but are excluded from generation.</p><textarea value={reviewReason} onChange={(event) => setReviewReason(event.target.value)} /><div><button onClick={() => review("REJECTED")} disabled={busy}>Reject mapping</button><button onClick={() => review("CONFIRMED")} disabled={busy}>Confirm mapping</button></div></> : <div><span>AIR</span><h3>Select a component</h3><p>Inspect confidence, provenance, generation policy, and the human review state.</p></div>}</aside></div> : null}
+    {view === "components" ? <div className="native-component-layout"><section className="native-components"><header><div><p className="eyebrow">CANONICAL AIR OBJECTS</p><h3>Review the compiler&apos;s semantic decisions</h3></div><select value={componentType} onChange={(event) => filterComponents(event.target.value)}><option value="">All components</option>{["DOMAIN", "ENTITY", "RELATIONSHIP", "CALCULATION", "BUSINESS_RULE", "SERVICE", "API", "SCREEN", "WORKFLOW", "INTEGRATION", "CONTROL", "ROLE", "TEST"].map((type) => <option key={type}>{type}</option>)}</select></header>
+      {overview.review_required_count ? <div className="native-bulk-review">
+        <span>{overview.review_required_count} component(s) still need review.</span>
+        <select value={bulkType} onChange={(event) => setBulkType(event.target.value)}>
+          <option value="">All types{componentType ? " (ignores the filter above)" : ""}</option>
+          {["DOMAIN", "ENTITY", "RELATIONSHIP", "CALCULATION", "BUSINESS_RULE", "SERVICE", "API", "SCREEN", "WORKFLOW", "INTEGRATION", "CONTROL", "ROLE", "TEST"].map((type) => <option key={type} value={type}>{type.replaceAll("_", " ")} only</option>)}
+        </select>
+        <select value={bulkConfidence} onChange={(event) => setBulkConfidence(event.target.value)}>
+          <option value="0">Any confidence</option>
+          <option value="0.7">70%+ confidence</option>
+          <option value="0.85">85%+ confidence</option>
+          <option value="0.95">95%+ confidence</option>
+        </select>
+        <input value={bulkReason} onChange={(event) => setBulkReason(event.target.value)} placeholder="Reason recorded for every reviewed component" />
+        <button className="secondary-button" onClick={() => bulkReview("REJECTED")} disabled={busy || bulkReason.trim().length < 3}>Reject matching</button>
+        <button className="primary-button compact" onClick={() => bulkReview("CONFIRMED")} disabled={busy || bulkReason.trim().length < 3}>Confirm matching</button>
+      </div> : null}
+      <div className="native-component-table"><div><span>Component</span><span>Type</span><span>Confidence</span><span>Generation</span><span>Review</span></div>{displayed.map((item) => <button key={item.component_id} className={selected?.component_id === item.component_id ? "active" : ""} onClick={() => setSelected(item)}><span><strong>{item.name}</strong><small>{item.component_id}</small></span><span>{item.component_type.replaceAll("_", " ")}</span><span><i style={{ width: `${item.confidence * 100}%` }} /><b>{Math.round(item.confidence * 100)}%</b></span><span>{item.generation_policy.replaceAll("_", " ")}</span><em className={`review-${item.review_state.toLowerCase()}`}>{item.review_state.replaceAll("_", " ")}</em></button>)}</div></section><aside className={selected ? "native-review open" : "native-review"}>{selected ? <><button onClick={() => setSelected(null)}>Close</button><p className="eyebrow">HUMAN SEMANTIC GATE</p><h3>{selected.name}</h3><dl><div><dt>Source</dt><dd>{selected.provenance?.source_type}</dd></div><div><dt>Location</dt><dd>{selected.provenance?.sheet || selected.provenance?.source_range || "Workbook"}</dd></div><div><dt>Confidence</dt><dd>{Math.round(selected.confidence * 100)}%</dd></div><div><dt>Policy</dt><dd>{selected.generation_policy}</dd></div></dl><p>Confirm only after this target meaning matches the workbook&apos;s intended business behavior. Rejected components remain in lineage but are excluded from generation.</p><textarea value={reviewReason} onChange={(event) => setReviewReason(event.target.value)} /><div><button onClick={() => review("REJECTED")} disabled={busy}>Reject mapping</button><button onClick={() => review("CONFIRMED")} disabled={busy}>Confirm mapping</button></div></> : <div><span>AIR</span><h3>Select a component</h3><p>Inspect confidence, provenance, generation policy, and the human review state.</p></div>}</aside></div> : null}
 
     {view === "lineage" ? <section className="native-lineage"><header><div><p className="eyebrow">SOURCE → TARGET DIGITAL THREAD</p><h3>Explain every generated decision</h3></div><div><input value={lineageQuery} onChange={(event) => setLineageQuery(event.target.value)} placeholder="Search sheet, formula, component, or API" /><button onClick={searchLineage}>Trace</button></div></header><div>{lineage.map((item) => <article key={item.lineage_id}><div><span>{item.source_type.replaceAll("_", " ")}</span><strong>{item.source_location || item.source_id}</strong><small>{item.source_id}</small></div><i>→</i><div><span>{item.target_type.replaceAll("_", " ")}</span><strong>{item.target_path || item.target_id}</strong><small>{item.target_id}</small></div><em>{Math.round(item.confidence * 100)}%</em></article>)}</div></section> : null}
 
     {view === "validation" ? <section className="native-validation"><header><div><p className="eyebrow">HARD GENERATION GATE</p><h3>{validation.valid ? "AIR structure is valid" : "Generation is blocked"}</h3></div><strong className={validation.valid ? "valid" : "invalid"}>{validation.valid ? "PASS" : "FAIL"}</strong></header><div className="native-checks">{Object.entries(validation.checks || {}).map(([key, passed]) => <article key={key}><span>{passed ? "OK" : "!"}</span><strong>{key.replaceAll("_", " ")}</strong></article>)}</div><div className="native-issues">{[...(validation.errors || []), ...(validation.warnings || [])].map((item, index) => <article key={`${item.code}-${index}`}><span>{(validation.errors || []).includes(item) ? "ERROR" : "REVIEW"}</span><div><strong>{item.code.replaceAll("_", " ")}</strong><p>{item.message}</p></div><code>{item.component_id || "MODEL"}</code></article>)}{!validation.errors?.length && !validation.warnings?.length ? <div className="empty-state">All deterministic AIR checks passed.</div> : null}</div></section> : null}
 
-    {view === "generation" ? <section className="native-generation"><div className="generation-console"><p className="eyebrow">TARGET COMPILER</p><h3>Emit a governed application artifact</h3><label>Target profile<select value="WEB_POSTGRES_FASTAPI_REACT" disabled><option>WEB_POSTGRES_FASTAPI_REACT</option></select></label><label>Generation mode<select value={generationMode} onChange={(event) => setGenerationMode(event.target.value)}><option>MODEL_ONLY</option><option>SCAFFOLD</option></select></label><div className="generation-gate"><span className={overview.validation_error_count ? "off" : "on"}>Validation clean</span><span className={overview.review_required_count ? "off" : "on"}>Human review complete</span><span className={["APPROVED", "CODE_GENERATED"].includes(overview.status) ? "on" : "off"}>Owner approved</span></div><button onClick={generate} disabled={busy || (generationMode === "SCAFFOLD" && !["APPROVED", "CODE_GENERATED"].includes(overview.status))}>{busy ? "Generating..." : generationMode === "MODEL_ONLY" ? "Export model package" : "Generate application scaffold"}</button>{overview.status === "GENERATED" && !overview.review_required_count ? <button className="approve-model" onClick={approve} disabled={busy}>Owner approve AIR</button> : null}</div><div className="generation-artifact"><p className="eyebrow">LATEST IMMUTABLE ARTIFACT</p>{generation?.status && generation.status !== "NOT_GENERATED" ? <><span className={`native-status ${generation.status === "COMPLETED" ? "ready" : "review"}`}>{generation.status}</span><h3>{generation.application_version || generation.generation_run_id}</h3><dl><div><dt>Mode</dt><dd>{generation.generation_mode}</dd></div><div><dt>Files</dt><dd>{generation.files_generated}</dd></div><div><dt>Tests</dt><dd>{generation.tests_generated}</dd></div><div><dt>Compiler</dt><dd>{generation.generator_version}</dd></div></dl>{generation.status === "COMPLETED" ? <button onClick={() => downloadEucApplicationGeneration(eucId, generation.generation_run_id)}>Download verified ZIP</button> : null}</> : <div className="empty-state">No native application artifact has been generated.</div>}</div></section> : null}
+    {view === "generation" ? <section className="native-generation"><div className="generation-console"><p className="eyebrow">TARGET COMPILER</p><h3>Emit a governed application artifact</h3><label>Target profile<select value="WEB_POSTGRES_FASTAPI_REACT" disabled><option>WEB_POSTGRES_FASTAPI_REACT</option></select></label><label>Generation mode<select value={generationMode} onChange={(event) => setGenerationMode(event.target.value)}><option>MODEL_ONLY</option><option>SCAFFOLD</option></select></label><div className="generation-gate"><span className={overview.validation_error_count ? "off" : "on"}>Validation clean</span><span className={overview.review_required_count ? "off" : "on"}>Human review complete</span><span className={["APPROVED", "CODE_GENERATED"].includes(overview.status) ? "on" : "off"}>Owner approved</span></div><button onClick={generate} disabled={busy || (generationMode === "SCAFFOLD" && !["APPROVED", "CODE_GENERATED"].includes(overview.status))}>{busy ? "Generating..." : generationMode === "MODEL_ONLY" ? "Export model package" : "Generate application scaffold"}</button>{overview.status === "GENERATED" && !overview.review_required_count ? <button className="approve-model" onClick={approve} disabled={busy}>Owner approve AIR</button> : null}</div><div className="generation-artifact"><p className="eyebrow">LATEST IMMUTABLE ARTIFACT</p>{generation?.status && generation.status !== "NOT_GENERATED" ? <><span className={`native-status ${generation.status === "COMPLETED" ? "ready" : "review"}`}>{generation.status}</span><h3>{generation.application_version || generation.generation_run_id}</h3><dl><div><dt>Mode</dt><dd>{generation.generation_mode}</dd></div><div><dt>Files</dt><dd>{generation.files_generated}</dd></div><div><dt>Tests</dt><dd>{generation.tests_generated}</dd></div><div><dt>Compiler</dt><dd>{generation.generator_version}</dd></div></dl>{generation.status === "COMPLETED" ? <div className="generation-artifact-actions"><button onClick={() => downloadEucApplicationGeneration(eucId, generation.generation_run_id)}>Download verified ZIP</button><button className="secondary-button" onClick={() => openGenerationPreview(generation.generation_run_id)} disabled={previewBusy}>{previewBusy && !previewFiles.length ? "Loading..." : "Preview files"}</button></div> : null}</> : <div className="empty-state">No native application artifact has been generated.</div>}
+      {previewFiles.length ? <div className="generation-preview">
+        <div className="generation-preview-files">{previewFiles.map((file) => <button key={file.path} className={previewPath === file.path ? "active" : ""} onClick={() => openPreviewFile(generation.generation_run_id, file.path)}><span>{file.path}</span><small>{file.size_bytes}B</small></button>)}</div>
+        <pre className="generation-preview-content">{previewBusy ? "Loading..." : previewContent}</pre>
+      </div> : null}
+      </div></section> : null}
   </div>;
 }
 
@@ -610,12 +943,18 @@ function LoginPage({ onAuthenticated }) {
   );
 }
 
-function KpiCard({ label, value, note, tone = "cyan" }) {
+function KpiCard({ label, value, note, tone = "cyan", bars }) {
+  const maxBar = bars && bars.length ? Math.max(1, ...bars.map((item) => item.value)) : 0;
   return (
     <article className={`kpi-card tone-${tone}`}>
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{note}</small>
+      {bars && bars.length ? <div className="kpi-card-bars">
+        {bars.map((bar) => <div key={bar.label} className="kpi-card-bar-row" title={`${bar.label}: ${bar.value}`}>
+          <i style={{ width: `${Math.max(4, (bar.value / maxBar) * 100)}%` }} />
+        </div>)}
+      </div> : null}
     </article>
   );
 }
@@ -711,12 +1050,15 @@ function SecurityAdministration({ repositoryId, onError }) {
   const [policy, setPolicy] = useState({ name: "", effect: "DENY", permission_key: "commit.create", subject_type: "USER", subject_id: "" });
   const [serviceAccount, setServiceAccount] = useState({ name: "", role_key: "VIEWER" });
   const [issuedCredential, setIssuedCredential] = useState("");
+  const [devices, setDevices] = useState([]);
+  const [roleTreeScope, setRoleTreeScope] = useState("ALL");
 
   const load = async () => {
     setBusy(true);
     try {
-      const result = await getSecurityAdminOverview();
+      const [result, deviceResult] = await Promise.all([getSecurityAdminOverview(), getOrganizationDevices()]);
       setOverview(result);
+      setDevices(deviceResult.devices || []);
       setAssignment((current) => ({ ...current, user_id: current.user_id || result.users?.[0]?.user_id || "" }));
       setPolicy((current) => ({ ...current, subject_id: current.subject_id || result.users?.[0]?.user_id || "" }));
     } catch (error) { onError(error.message); }
@@ -759,9 +1101,13 @@ function SecurityAdministration({ repositoryId, onError }) {
         <div className="security-card-list">{overview.groups?.map((group) => <article key={group.group_id}><div><strong>{group.name}</strong><small>{group.member_count} members / {group.status}</small></div><button disabled={!assignment.user_id} onClick={() => run(() => addSecurityGroupMember(group.group_id, assignment.user_id), "Group membership updated.")}>Add selected user</button></article>)}{!overview.groups?.length ? <p>No groups yet. Create one to manage access at team scale.</p> : null}</div>
       </section>
       <section className="security-admin-panel roles-panel">
-        <div className="panel-header"><div><p className="eyebrow">SCOPED RBAC</p><h3>Role assignments</h3></div><span className="pill">Explicit scope</span></div>
+        <div className="panel-header"><div><p className="eyebrow">SCOPED RBAC / GRANT</p><h3>Give access</h3></div><span className="pill">Explicit scope</span></div>
         <div className="security-role-form"><select value={assignment.user_id} onChange={(event) => { setAssignment({ ...assignment, user_id: event.target.value }); setPolicy({ ...policy, subject_id: event.target.value }); }}>{overview.users?.map((user) => <option key={user.user_id} value={user.user_id}>{user.email}</option>)}</select><select value={assignment.role_key} onChange={(event) => setAssignment({ ...assignment, role_key: event.target.value })}>{overview.roles?.map((role) => <option key={role.role_key} value={role.role_key}>{role.display_name}</option>)}</select><select value={assignment.scope_type} onChange={(event) => setAssignment({ ...assignment, scope_type: event.target.value })}><option value="REPOSITORY">This repository</option><option value="ORGANIZATION">Entire organization</option></select><button disabled={busy || !scopeId} onClick={() => run(() => createRoleAssignment({ ...assignment, scope_id: scopeId }), "Scoped role assigned.")}>Grant role</button></div>
-        <div className="assignment-table"><header><span>Identity</span><span>Role</span><span>Scope</span><span /></header>{overview.assignments?.slice(0, 30).map((item) => <article key={item.assignment_id}><span>{item.email || item.user_id}</span><strong>{item.role_key}</strong><code>{item.scope_type.toLowerCase()} / {item.scope_id.slice(0, 14)}</code><button onClick={() => run(() => revokeRoleAssignment(item.assignment_id), "Role assignment revoked.")}>Revoke</button></article>)}</div>
+      </section>
+      <section className="security-admin-panel role-view-panel">
+        <div className="panel-header"><div><p className="eyebrow">SCOPED RBAC / VIEW</p><h3>Role assignments</h3></div><span className="pill">{overview.assignments?.length || 0} total</span></div>
+        <div className="role-tree-filter"><label>Filter by repository<select value={roleTreeScope} onChange={(event) => setRoleTreeScope(event.target.value)}><option value="ALL">All scopes</option><option value="ORGANIZATION">Organization-wide only</option>{[...new Map((overview.assignments || []).filter((item) => item.scope_type === "REPOSITORY").map((item) => [item.scope_id, item.scope_name || item.scope_id])).entries()].map(([repoScopeId, name]) => <option key={repoScopeId} value={repoScopeId}>{name}</option>)}</select></label></div>
+        <RoleFamilyTree assignments={overview.assignments} organizationName={organization.name} busy={busy} scopeFilter={roleTreeScope} onRevoke={(assignmentId) => run(() => revokeRoleAssignment(assignmentId), "Role assignment revoked.")} />
       </section>
       <section className="security-admin-panel policy-panel">
         <div className="panel-header"><div><p className="eyebrow">POLICY GUARDRAILS</p><h3>Explicit allow and deny</h3></div><span className="pill alert">Deny wins</span></div>
@@ -776,20 +1122,143 @@ function SecurityAdministration({ repositoryId, onError }) {
       </section>
       <section className="security-admin-panel sessions-panel">
         <div className="panel-header"><div><p className="eyebrow">SESSION ASSURANCE</p><h3>Recent sessions</h3></div></div>
-        <div className="session-list">{overview.sessions?.slice(0, 12).map((session) => <article key={session.session_id}><i className={session.revoked_at ? "revoked" : "active"} /><div><strong>{session.email}</strong><small>{session.session_id} / {new Date(session.created_at).toLocaleString()}</small></div><span>{session.revoked_at ? "Revoked" : "Active"}</span></article>)}</div>
+        <div className="session-list">{overview.sessions?.slice(0, 12).map((session) => <article key={session.session_id}><i className={session.revoked_at ? "revoked" : "active"} /><div><strong>{session.email}</strong><small>{session.session_id} / {new Date(session.created_at).toLocaleString()}</small></div>{session.revoked_at ? <span>Revoked</span> : <button onClick={() => run(() => revokeOrganizationSession(session.session_id), `Session for ${session.email} revoked.`)} disabled={busy}>Revoke</button>}</article>)}</div>
+      </section>
+      <section className="security-admin-panel devices-panel">
+        <div className="panel-header"><div><p className="eyebrow">ORGANIZATION-WIDE / DATA PROTECTION</p><h3>Known devices</h3></div><span className="pill">{devices.length} device(s)</span></div>
+        <div className="security-card-list">{devices.map((device) => <article key={device.fingerprint_id}><div><strong>{device.display_name || device.email}</strong><small>{device.ip_address || "unknown IP"} / <code>{device.machine_id}</code></small></div><span className={`pill device-trust-${(device.trust_status || "unknown").toLowerCase()}`}>{device.trust_status}</span>{device.trust_status !== "BLOCKED" ? <button onClick={() => run(() => setOrganizationDeviceTrust(device.fingerprint_id, "BLOCKED"), `${device.email}'s device blocked.`)} disabled={busy}>Block</button> : <button onClick={() => run(() => setOrganizationDeviceTrust(device.fingerprint_id, "TRUSTED"), `${device.email}'s device trusted.`)} disabled={busy}>Trust</button>}</article>)}{!devices.length ? <p>No devices have connected across this organization yet.</p> : null}</div>
       </section>
     </div>
   </div>;
 }
 
+/**
+ * Portfolio Risk Command Center — every EUC asset the user can access,
+ * ranked by residual risk in one place. Rolls up Stage 2.3 scores that
+ * already exist per-asset; this is the aggregation layer, not a new
+ * scoring engine (GET /euc/portfolio/risk-overview).
+ */
+function PortfolioRiskCenter({ selectedEucId, onSelectAsset, refreshToken }) {
+  const [overview, setOverview] = useState(null);
+  const [attestationOverview, setAttestationOverview] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([getPortfolioRiskOverview(), getPortfolioAttestationOverview().catch(() => null)])
+      .then(([risk, attestations]) => { setOverview(risk); setAttestationOverview(attestations); })
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load, refreshToken]);
+
+  if (!overview) return <section className="panel portfolio-risk-center"><div className="empty-state compact">Loading portfolio risk overview...</div></section>;
+  const { summary, assets } = overview;
+  const overdueAttestations = (attestationOverview?.items || []).filter((item) => item.is_overdue);
+
+  return (
+    <section className="panel portfolio-risk-center">
+      <button type="button" className="panel-header collapsed-panel-trigger" onClick={() => setCollapsed((value) => !value)}>
+        <div><p className="eyebrow">PORTFOLIO / RISK COMMAND CENTER</p><h2>Every governed EUC, ranked by risk</h2><p className="muted">Rolls up the latest Stage 2.3 score for every asset you can access &mdash; no need to open each one individually.</p></div>
+        <span className="pill">{collapsed ? "Expand" : "Collapse"}</span>
+      </button>
+      {!collapsed ? <>
+        <div className="portfolio-risk-kpis">
+          <article><span>Total assets</span><strong>{summary.total_assets}</strong></article>
+          <article className={summary.high_risk_count ? "attention" : ""}><span>High / very high risk</span><strong>{summary.high_risk_count}</strong></article>
+          <article className={summary.critical_finding_total ? "attention" : ""}><span>Open critical findings</span><strong>{summary.critical_finding_total}</strong></article>
+          <article><span>Avg residual risk</span><strong>{summary.average_residual_risk}</strong></article>
+          <article className={summary.stale_count ? "attention" : ""}><span>Stale scores</span><strong>{summary.stale_count}</strong></article>
+          <article><span>Not yet scored</span><strong>{summary.not_scored_assets}</strong></article>
+          {attestationOverview ? (
+            <article className={overdueAttestations.length ? "attention" : ""}><span>Attestations overdue</span><strong>{overdueAttestations.length}</strong></article>
+          ) : null}
+        </div>
+        {overdueAttestations.length ? (
+          <div className="portfolio-attestation-strip">
+            <span>Overdue attestations:</span>
+            {overdueAttestations.slice(0, 6).map((item) => (
+              <b key={item.repository_id}>{item.repository_name}</b>
+            ))}
+            {overdueAttestations.length > 6 ? <em>+{overdueAttestations.length - 6} more</em> : null}
+          </div>
+        ) : null}
+        <div className="portfolio-risk-list">
+          {assets.map((asset) => (
+            <button
+              key={asset.euc_id} type="button"
+              className={`portfolio-risk-row ${selectedEucId === asset.euc_id ? "active" : ""}`}
+              onClick={() => onSelectAsset(asset)}
+            >
+              <div className="portfolio-risk-row-main">
+                <strong>{asset.filename}</strong>
+                <small>{asset.repository_name} &middot; {asset.owner_name || asset.owner_email || "unknown owner"}</small>
+              </div>
+              {asset.status === "SCORED" ? <>
+                <div className={`portfolio-risk-score risk-${(asset.residual_risk_classification || "").toLowerCase()}`}>
+                  <span>{Math.round(asset.residual_risk)}</span>
+                  <small>{asset.residual_risk_classification?.replaceAll("_", " ")}</small>
+                </div>
+                <div className="portfolio-risk-findings">
+                  {["CRITICAL", "HIGH", "MEDIUM", "LOW"].map((severity) => asset.finding_severities[severity]
+                    ? <em key={severity} className={`sev-${severity.toLowerCase()}`}>{asset.finding_severities[severity]} {severity.slice(0, 1)}</em>
+                    : null)}
+                  {!asset.finding_count ? <em className="sev-clean">Clean</em> : null}
+                </div>
+                {asset.freshness === "STALE" ? <span className="portfolio-risk-stale">Stale</span> : null}
+              </> : <span className="portfolio-risk-not-scored">Not scored yet</span>}
+            </button>
+          ))}
+          {!assets.length ? <div className="empty-state compact">No governed EUC assets yet.</div> : null}
+        </div>
+      </> : null}
+    </section>
+  );
+}
+
 export default function App() {
   const [auth, setAuth] = useState(getStoredAuth());
+  const [notifications, setNotifications] = useState([]);
+  const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [repoSwitcherOpen, setRepoSwitcherOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem("gitwalk:sidebarCollapsed") === "1"; } catch { return false; }
+  });
+
+  useEffect(() => {
+    try { localStorage.setItem("gitwalk:sidebarCollapsed", sidebarCollapsed ? "1" : "0"); } catch { /* ignore */ }
+  }, [sidebarCollapsed]);
   const [datasets, setDatasets] = useState([]);
   const [selectedTable, setSelectedTable] = useState("");
   const [data, setData] = useState(null);
   const [history, setHistory] = useState([]);
   const [kpis, setKpis] = useState({});
-  const [tab, setTab] = useState("home");
+  const [tab, setTabState] = useState("home");
+  const [tabFadeState, setTabFadeState] = useState("fade-in");
+  const tabTransitionTimerRef = useRef(null);
+
+  const setTab = useCallback((nextTab) => {
+    if (nextTab === tab) return;
+    if (tabTransitionTimerRef.current) {
+      clearTimeout(tabTransitionTimerRef.current);
+    }
+    setTabFadeState("fade-out");
+    tabTransitionTimerRef.current = setTimeout(() => {
+      setTabState(nextTab);
+      setTabFadeState("fade-in");
+      tabTransitionTimerRef.current = null;
+    }, 140);
+  }, [tab]);
+
+  useEffect(() => {
+    return () => {
+      if (tabTransitionTimerRef.current) {
+        clearTimeout(tabTransitionTimerRef.current);
+      }
+    };
+  }, []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [lastRefresh, setLastRefresh] = useState(null);
@@ -828,16 +1297,35 @@ export default function App() {
   const [selectedMergeRequestId, setSelectedMergeRequestId] = useState("");
   const [mergeRequestDetail, setMergeRequestDetail] = useState(null);
   const [mergeBusy, setMergeBusy] = useState(false);
+  const [aiConflictSuggestions, setAiConflictSuggestions] = useState([]);
+  const [aiAnalysisBusy, setAiAnalysisBusy] = useState(false);
+  const [aiAssessment, setAiAssessment] = useState(null);
+  const [aiAssessmentBusy, setAiAssessmentBusy] = useState(false);
   const [mergeTitle, setMergeTitle] = useState("");
   const [mergeDescription, setMergeDescription] = useState("");
   const [branchDivergence, setBranchDivergence] = useState(null);
   const [auditLedger, setAuditLedger] = useState({ events: [], integrity: {} });
+  const [auditView, setAuditView] = useState("list");
+  const [auditSince, setAuditSince] = useState("");
+  const [auditUntil, setAuditUntil] = useState("");
+  const [auditRepoTable, setAuditRepoTable] = useState("");
   const [operationalMetrics, setOperationalMetrics] = useState({ metrics: {}, security_events: {} });
+  const [metricsTrend, setMetricsTrend] = useState([]);
+  const [managerDigest, setManagerDigest] = useState("");
+  const [managerDigestBusy, setManagerDigestBusy] = useState(false);
   const [repositoryInsights, setRepositoryInsights] = useState(null);
   const [securityPosture, setSecurityPosture] = useState(null);
   const [selectedTrace, setSelectedTrace] = useState(null);
   const [selectedSheetId, setSelectedSheetId] = useState("");
   const [repoSearch, setRepoSearch] = useState("");
+  const [showOnlyAccessibleRepos, setShowOnlyAccessibleRepos] = useState(false);
+  // Signal filter: one shared timeline, one tuner pin per receiver panel.
+  // Linked (default) moves every pin together; unlinked lets each receiver
+  // be armed and tuned to its own beat independently — see SignalFilter.jsx.
+  const [signalLinked, setSignalLinked] = useState(true);
+  const [signalArmedReceiver, setSignalArmedReceiver] = useState("openRepositories");
+  const [signalMonthKeys, setSignalMonthKeys] = useState({ openRepositories: "", myWork: "" });
+  const [pulseCategoryId, setPulseCategoryId] = useState("");
   const [repositoryName, setRepositoryName] = useState("");
   const [repositoryDescription, setRepositoryDescription] = useState("");
   const [repositoryClassification, setRepositoryClassification] = useState("internal");
@@ -845,6 +1333,9 @@ export default function App() {
   const [repositoryOwnerEmail, setRepositoryOwnerEmail] = useState("");
   const [repositoryOwnerEmployeeId, setRepositoryOwnerEmployeeId] = useState("");
   const [selectedCommit, setSelectedCommit] = useState(null);
+  const [historyView, setHistoryView] = useState("list");
+  const [mutationLedgerOpen, setMutationLedgerOpen] = useState(false);
+  const [expandedAuditEventId, setExpandedAuditEventId] = useState(null);
   const [checkoutPrompt, setCheckoutPrompt] = useState(null);
   const [changeActivity, setChangeActivity] = useState({ events: [] });
   const [activitySort, setActivitySort] = useState("desc");
@@ -856,7 +1347,14 @@ export default function App() {
   const [selectedEucId, setSelectedEucId] = useState("");
   const [eucInventory, setEucInventory] = useState(null);
   const [eucFile, setEucFile] = useState(null);
+  const [eucBranches, setEucBranches] = useState([]);
+  const [eucBranchId, setEucBranchId] = useState("");
+  const [eucUploadExpanded, setEucUploadExpanded] = useState(false);
   const [eucSearch, setEucSearch] = useState("");
+  const [eucRepoFilter, setEucRepoFilter] = useState("");
+  const [eucRepoPickerOpen, setEucRepoPickerOpen] = useState(false);
+  const [eucSince, setEucSince] = useState("");
+  const [eucUntil, setEucUntil] = useState("");
   const [eucBusy, setEucBusy] = useState(false);
   const [eucSection, setEucSection] = useState("overview");
 
@@ -867,7 +1365,12 @@ export default function App() {
   const [folderModalInput, setFolderModalInput] = useState("");
   const [folderModalError, setFolderModalError] = useState("");
   const [folderSettingsInput, setFolderSettingsInput] = useState("");
+  const [branchProtection, setBranchProtection] = useState(null);
+  const [branchProtectionBusy, setBranchProtectionBusy] = useState(false);
+  const [notificationPrefs, setNotificationPrefs] = useState(null);
   const [folderSettingsMsg, setFolderSettingsMsg] = useState("");
+  const [exportSettingsMsg, setExportSettingsMsg] = useState("");
+  const [personalActivityOpen, setPersonalActivityOpen] = useState(false);
   const [folderSettingsBusy, setFolderSettingsBusy] = useState(false);
   const [notice, setNotice] = useState("");
 
@@ -962,6 +1465,21 @@ export default function App() {
     }).catch(() => {});
   }, [auth]);
 
+  const refreshNotifications = () => {
+    if (!auth) return;
+    getNotifications().then((result) => {
+      setNotifications(result.notifications || []);
+      setUnreadNotificationCount(result.unread_count || 0);
+    }).catch(() => {});
+  };
+
+  useEffect(() => {
+    if (!auth) return;
+    refreshNotifications();
+    const timer = setInterval(refreshNotifications, 30000);
+    return () => clearInterval(timer);
+  }, [auth]);
+
   useEffect(() => {
     if (!auth || !selectedTable || ["new", "inventory"].includes(tab)) return;
     refresh();
@@ -971,11 +1489,11 @@ export default function App() {
 
   useEffect(() => {
     if (!auth || tab !== "inventory") return;
-    getEucAssets("", eucSearch).then((result) => {
+    getEucAssets(eucRepoFilter, eucSearch, eucSince, eucUntil).then((result) => {
       setEucAssets(result.assets || []);
       setSelectedEucId((current) => current || result.assets?.[0]?.euc_id || "");
     }).catch((err) => setError(err.message));
-  }, [auth, tab, eucSearch]);
+  }, [auth, tab, eucRepoFilter, eucSearch, eucSince, eucUntil]);
 
   useEffect(() => {
     if (!auth || tab !== "inventory" || !selectedEucId) {
@@ -984,6 +1502,39 @@ export default function App() {
     }
     getEucInventory(selectedEucId).then(setEucInventory).catch((err) => setError(err.message));
   }, [auth, tab, selectedEucId]);
+
+  useEffect(() => {
+    if (!auth || tab !== "settings") return;
+    getNotificationPreferences().then((result) => setNotificationPrefs(result.preferences)).catch(() => {});
+    if (!selectedTable) { setBranchProtection(null); return; }
+    getBranchProtection(selectedTable).then(setBranchProtection).catch(() => setBranchProtection(null));
+  }, [auth, tab, selectedTable]);
+
+  const saveBranchProtection = async (patch) => {
+    if (!selectedTable || !branchProtection) return;
+    setBranchProtectionBusy(true);
+    try {
+      const next = { ...branchProtection.rule, ...patch };
+      const result = await updateBranchProtection(selectedTable, next);
+      setBranchProtection(result);
+    } catch (err) { setError(err.message); }
+    finally { setBranchProtectionBusy(false); }
+  };
+
+  const toggleNotificationPreference = async (type, enabled) => {
+    setNotificationPrefs((current) => ({ ...current, [type]: enabled }));
+    try { await updateNotificationPreference(type, enabled); }
+    catch (err) { setError(err.message); }
+  };
+
+  useEffect(() => {
+    if (!auth || tab !== "inventory" || !selectedTable) { setEucBranches([]); return; }
+    getRepositoryBranches(selectedTable).then((result) => {
+      const branches = result.branches || [];
+      setEucBranches(branches);
+      setEucBranchId((current) => (branches.some((branch) => branch.branch_id === current) ? current : branches[0]?.branch_id || ""));
+    }).catch(() => setEucBranches([]));
+  }, [auth, tab, selectedTable]);
 
   useEffect(() => {
     if (!auth || !selectedTable) return;
@@ -1013,6 +1564,26 @@ export default function App() {
       .then(setMergeRequestDetail)
       .catch((err) => setError(err.message));
   }, [auth, selectedMergeRequestId, selectedMergeSummary?.updated_at]);
+
+  useEffect(() => {
+    if (!auth || !selectedMergeRequestId) {
+      setAiConflictSuggestions([]);
+      return;
+    }
+    getMergeConflictAISuggestions(selectedMergeRequestId)
+      .then((result) => setAiConflictSuggestions(result.suggestions || []))
+      .catch(() => setAiConflictSuggestions([]));
+  }, [auth, selectedMergeRequestId, mergeRequestDetail?.conflicts?.length]);
+
+  useEffect(() => {
+    if (!auth || !selectedMergeRequestId) {
+      setAiAssessment(null);
+      return;
+    }
+    getMergeRequestAIAssessment(selectedMergeRequestId)
+      .then((result) => setAiAssessment(result.assessment || null))
+      .catch(() => setAiAssessment(null));
+  }, [auth, selectedMergeRequestId]);
 
   useEffect(() => {
     if (!auth || !selectedBranch?.branch_id || selectedBranch.branch_type !== "USER") {
@@ -1053,19 +1624,33 @@ export default function App() {
   }, [auth, selectedBranch?.branch_id, data?.version]);
 
   useEffect(() => {
+    if (!selectedTable) return;
+    setAuditRepoTable((current) => current || selectedTable);
+  }, [selectedTable]);
+
+  useEffect(() => {
     if (!auth || !selectedTable) return;
     Promise.all([
-      getAuditEvents(selectedTable),
       getOperationalMetrics(24),
+      getOperationalMetricsTrend(24 * 14),
       getRepositoryInsights(selectedTable),
       getSecurityPosture(),
-    ]).then(([audit, operations, insights, posture]) => {
-      setAuditLedger(audit);
+    ]).then(([operations, trend, insights, posture]) => {
       setOperationalMetrics(operations);
+      setMetricsTrend(trend.trend || []);
       setRepositoryInsights(insights);
       setSecurityPosture(posture);
     }).catch((err) => setError(err.message));
   }, [auth, selectedTable, data?.version, selectedMergeSummary?.updated_at]);
+
+  useEffect(() => {
+    const targetTable = auditRepoTable || selectedTable;
+    if (!auth || !targetTable) return;
+    getAuditEvents(targetTable, {
+      since: auditSince ? `${auditSince}T00:00:00` : undefined,
+      until: auditUntil ? `${auditUntil}T23:59:59` : undefined,
+    }).then(setAuditLedger).catch((err) => setError(err.message));
+  }, [auth, auditRepoTable, selectedTable, auditSince, auditUntil, data?.version, selectedMergeSummary?.updated_at]);
 
   useEffect(() => {
     if (!auth || !selectedTable || tab !== "storage") return;
@@ -1161,12 +1746,84 @@ export default function App() {
 
   const selectedDataset = datasets.find((item) => item.table_id === selectedTable);
 
+  // Signal filter: a horizontal activity-heat timeline (not a dropdown),
+  // one shared rail with one tuner pin per receiver panel. Linked (default)
+  // moves every pin together — the common "same filter everywhere" case.
+  // Unlinked lets Open Repositories and My Work each land on a different
+  // beat at once (e.g. Sept for one, Aug for the other), still reading off
+  // the same shared timeline. The Business Areas cards double as a
+  // (shared, non-split) domain axis on top of this.
+  const monthKeyOf = (iso) => (iso ? iso.slice(0, 7) : null);
+  const monthBuckets = (() => {
+    const counts = new Map();
+    for (const dataset of datasets) {
+      const key = monthKeyOf(dataset.updated_at || dataset.created_at);
+      if (key) counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const keys = [...counts.keys()].sort((a, b) => (a < b ? 1 : -1));
+    const maxCount = Math.max(1, ...counts.values());
+    return keys.slice(0, 14).map((key) => {
+      const [year, month] = key.split("-");
+      const label = new Date(Number(year), Number(month) - 1, 1).toLocaleDateString(undefined, { month: "short" });
+      return { key, label, year, count: counts.get(key), intensity: counts.get(key) / maxCount };
+    });
+  })();
+  const categoryById = new Map(categories.map((category) => [category.category_id, category]));
+  const setSignalMonthKey = (receiverId, key) => setSignalMonthKeys((current) => ({ ...current, [receiverId]: key }));
+  const toggleSignalLinked = () => setSignalLinked((current) => {
+    const next = !current;
+    if (next) {
+      // Re-linking: the receiver you had armed becomes the canonical beat
+      // both pins snap back to, rather than silently picking one.
+      const canonical = signalMonthKeys[signalArmedReceiver] || "";
+      setSignalMonthKeys({ openRepositories: canonical, myWork: canonical });
+    }
+    return next;
+  });
+  const openReposMonthKey = signalLinked ? (signalMonthKeys.openRepositories || signalMonthKeys.myWork) : signalMonthKeys.openRepositories;
+  const myWorkMonthKey = signalLinked ? (signalMonthKeys.openRepositories || signalMonthKeys.myWork) : signalMonthKeys.myWork;
+  const datasetCategoryFilter = (dataset) => !pulseCategoryId || dataset.category_id === pulseCategoryId;
+  const datasetMonthFilter = (dataset) => !openReposMonthKey || monthKeyOf(dataset.updated_at || dataset.created_at) === openReposMonthKey;
+  const pulseFilteredDatasets = datasets.filter((dataset) => datasetCategoryFilter(dataset) && datasetMonthFilter(dataset));
+  const accessibleFilteredDatasets = showOnlyAccessibleRepos ? pulseFilteredDatasets.filter((dataset) => dataset.can_view) : pulseFilteredDatasets;
+  const datasetsById = new Map(datasets.map((dataset) => [dataset.repository_id, dataset]));
+  const pulseFilteredWorkingCopies = workingCopies.filter((copy) => {
+    const owningDataset = datasetsById.get(copy.repository_id);
+    if (pulseCategoryId && owningDataset?.category_id !== pulseCategoryId) return false;
+    if (myWorkMonthKey && monthKeyOf(copy.last_seen_at || copy.generated_at) !== myWorkMonthKey) return false;
+    return true;
+  });
+  const pulseFilterActiveFor = (receiverId) => Boolean(signalMonthKeys[receiverId] || pulseCategoryId);
+
+  const ingestFromBranch = async () => {
+    if (!selectedTable || !eucBranchId) return;
+    setEucBusy(true);
+    setError("");
+    try {
+      const asset = await ingestEucFromBranch(selectedTable, eucBranchId);
+      setSelectedEucId(asset.euc_id);
+      await analyzeEuc(asset.euc_id);
+      await reloadEucPortfolio(asset.euc_id);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setEucBusy(false);
+    }
+  };
+
   const reloadEucPortfolio = async (preferredId = selectedEucId) => {
-    const result = await getEucAssets("", eucSearch);
+    const result = await getEucAssets(eucRepoFilter, eucSearch, eucSince, eucUntil);
     setEucAssets(result.assets || []);
     const nextId = preferredId || result.assets?.[0]?.euc_id || "";
     setSelectedEucId(nextId);
     if (nextId) setEucInventory(await getEucInventory(nextId));
+  };
+
+  const selectPortfolioAsset = (asset) => {
+    const dataset = datasets.find((item) => item.repository_id === asset.repository_id);
+    if (dataset) setSelectedTable(dataset.table_id);
+    setEucRepoFilter(asset.repository_id);
+    setSelectedEucId(asset.euc_id);
   };
 
   const ingestAndAnalyzeEuc = async () => {
@@ -1239,6 +1896,14 @@ export default function App() {
     } finally {
       setUploading(false);
     }
+  };
+
+  const downloadJson = (filename, data) => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = filename;
+    link.click(); URL.revokeObjectURL(url);
   };
 
   const handleBranchDownload = async () => {
@@ -1436,6 +2101,43 @@ export default function App() {
     } catch (err) { setError(err.message); } finally { setMergeBusy(false); }
   };
 
+  const handleRunAIAnalysis = async () => {
+    if (!mergeRequestDetail) return;
+    setAiAnalysisBusy(true); setError("");
+    try {
+      await runMergeConflictAIAnalysis(mergeRequestDetail.merge_request_id);
+      const refreshed = await getMergeConflictAISuggestions(mergeRequestDetail.merge_request_id);
+      setAiConflictSuggestions(refreshed.suggestions || []);
+      setNotice("AI conflict analysis complete.");
+    } catch (err) { setError(err.message); } finally { setAiAnalysisBusy(false); }
+  };
+
+  const handleApplyAISuggestion = async (conflict, suggestion) => {
+    if (!window.confirm(
+      `Apply the AI-suggested resolution (${suggestion.resolution_type}) for this conflict? This still requires confirmation and is fully auditable.`
+    )) return;
+    setMergeBusy(true); setError("");
+    try {
+      const prepared = await prepareAIConflictApply(mergeRequestDetail.merge_request_id, conflict.conflict_id);
+      await confirmAIAction(prepared.action_id);
+      const result = await getMergeRequest(mergeRequestDetail.merge_request_id);
+      setMergeRequestDetail(result);
+      const refreshed = await getMergeConflictAISuggestions(mergeRequestDetail.merge_request_id);
+      setAiConflictSuggestions(refreshed.suggestions || []);
+      await loadMergeRequests();
+    } catch (err) { setError(err.message); } finally { setMergeBusy(false); }
+  };
+
+  const handleRunAIAssessment = async () => {
+    if (!mergeRequestDetail) return;
+    setAiAssessmentBusy(true); setError("");
+    try {
+      const result = await runMergeRequestAIAssessment(mergeRequestDetail.merge_request_id);
+      setAiAssessment(result);
+      setNotice("AI risk assessment ready.");
+    } catch (err) { setError(err.message); } finally { setAiAssessmentBusy(false); }
+  };
+
   const handleReviewMergeRequest = async (decision) => {
     const comment = window.prompt(
       decision === "APPROVED" ? "Approval note:" : "Reason for rejection:", ""
@@ -1527,6 +2229,31 @@ export default function App() {
       setError(err.message);
     } finally {
       setAiBusy(false);
+    }
+  };
+
+  const generateManagerDigest = async () => {
+    setManagerDigestBusy(true);
+    setManagerDigest("");
+    try {
+      const facts = [
+        `Commits: ${repositoryInsights?.version_control?.commits || 0}, semantic changes: ${repositoryInsights?.version_control?.changes || 0}, cell changes: ${repositoryInsights?.version_control?.cell_changes || 0}, formula changes: ${repositoryInsights?.version_control?.formula_changes || 0}`,
+        `Merge success rate: ${repositoryInsights?.workflow?.merge_success_rate ?? 100}%, conflict rate: ${repositoryInsights?.workflow?.conflict_rate || 0}%, active branches: ${repositoryInsights?.workflow?.active_branches || 0}, average review time: ${repositoryInsights?.workflow?.average_review_hours || 0}h`,
+        `Data quality: ${repositoryInsights?.data_quality?.failed_runs || 0} failed validation runs, ${repositoryInsights?.data_quality?.errors || 0} errors, ${repositoryInsights?.data_quality?.warnings || 0} warnings`,
+        `Security events (24h): ${Object.entries(operationalMetrics.security_events || {}).map(([sev, count]) => `${count} ${sev}`).join(", ") || "none"}`,
+        `Team: ${kpis.contributors || 0} contributors, avg risk score ${kpis.avg_risk || 0}, ${kpis.successes || 0} clean commits, ${kpis.no_changes || 0} no-op commits`,
+      ].join("\n");
+      const result = await generateAIInsight({
+        table_id: selectedTable,
+        branch_id: selectedBranch?.branch_id || null,
+        model: aiModel,
+        question: `You are writing a weekly manager digest for this repository. Using ONLY the real numbers below (do not invent numbers), write a short, plain-language read of commit velocity, merge health, data quality, security posture, and team activity, plus one recommended focus area for next week.\n\nReal numbers:\n${facts}`,
+      });
+      setManagerDigest(result.insight);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setManagerDigestBusy(false);
     }
   };
 
@@ -1626,6 +2353,53 @@ export default function App() {
     }
   };
 
+  const openNotification = async (notification) => {
+    try { await markNotificationRead(notification.notification_id); } catch { /* non-blocking */ }
+    refreshNotifications();
+    setNotificationsOpen(false);
+    if (notification.resource_type === "MERGE_REQUEST") {
+      setTab("merges");
+      setSelectedMergeRequestId(notification.resource_id);
+    } else if (notification.resource_type === "EUC_BRANCH_COMPARISON") {
+      setTab("inventory");
+    } else if (notification.resource_type === "DEVICE") {
+      setTab("team");
+    }
+  };
+
+  const auditEventGlyph = (eventType) => {
+    const upper = String(eventType || "").toUpperCase();
+    if (upper.includes("COMMIT") || upper.includes("REVERT")) return { icon: "●", family: "commit" };
+    if (upper.includes("MERGE")) return { icon: "⎇", family: "merge" };
+    if (upper.includes("DEVICE") || upper.includes("SESSION")) return { icon: "■", family: "device" };
+    if (upper.includes("AI_") || upper.includes("AGENT")) return { icon: "✦", family: "ai" };
+    if (upper.includes("SECURITY") || upper.includes("ROLE") || upper.includes("POLICY") || upper.includes("USER_STATUS")) return { icon: "▲", family: "security" };
+    return { icon: "◆", family: "general" };
+  };
+
+  const groupAuditEventsByDay = (events) => {
+    const groups = [];
+    let currentDay = null;
+    (events || []).forEach((event) => {
+      const day = new Date(event.created_at).toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+      if (day !== currentDay) { groups.push({ day, events: [] }); currentDay = day; }
+      groups[groups.length - 1].events.push(event);
+    });
+    return groups;
+  };
+
+  const notificationTone = (type) => {
+    if (type === "MERGE_RISK_FLAGGED" || type === "EUC_RISK_DRIFT") return "high";
+    if (type === "DEVICE_BLOCKED") return "blocked";
+    return "unknown";
+  };
+
+  const TAB_GLYPHS = {
+    home: "⌂", new: "+", inventory: "▤", fabric: "⬡", ai: "✦",
+    data: "▦", branches: "Y", merges: "⇄", history: "◷", team: "◎",
+    storage: "▣", analytics: "△", audit: "≣", admin: "◆", settings: "⚙",
+  };
+
   const mergeReviewTimeline = (
     mergeRequestDetail?.timeline?.length
       ? mergeRequestDetail.timeline
@@ -1633,28 +2407,56 @@ export default function App() {
   ).filter(isMeaningfulReviewChange).slice(0, 250);
 
   return (
-    <div className="product-shell">
+    <div className={`product-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
-        <div className="brand-lockup"><div className="brand-mark small">GW</div><div><strong>Git Walk</strong><span>Spreadsheet version control</span></div></div>
+        <div className="brand-lockup">
+          <div className="brand-mark small">GW</div>
+          {!sidebarCollapsed ? <div><strong>Git Walk</strong><span>Spreadsheet version control</span></div> : null}
+        </div>
+        <button className="sidebar-toggle" title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={() => setSidebarCollapsed((value) => !value)}>{sidebarCollapsed ? "»" : "«"}</button>
         <nav>
-          {[["home", "Repositories"], ["new", "New repository"], ["inventory", "EUC inventory"], ["fabric", "Information Fabric"], ["ai", "AI Command Center"], ["data", "Repository data"], ["branches", "Branches"], ["merges", "Merge requests"], ["history", "History & lineage"], ["storage", "Semantic storage"], ["analytics", "Insights"], ["audit", "Audit ledger"], ["admin", "Security Center"], ["settings", "Settings"]].map(([id, label]) => (
-            <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>{label}</button>
+          {[["home", "Repositories"], ["new", "New repository"], ["inventory", "EUC inventory"], ["fabric", "Information Fabric"], ["ai", "AI Command Center"], ["data", "Repository data"], ["branches", "Branches"], ["merges", "Merge requests"], ["history", "History & lineage"], ["team", "Team activity"], ["storage", "Semantic storage"], ["analytics", "Insights"], ["audit", "Audit ledger"], ["admin", "Security Center"], ["settings", "Settings"]].map(([id, label], index) => (
+            <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)} title={sidebarCollapsed ? label : undefined} style={{ "--nav-index": index }}>
+              {sidebarCollapsed ? <i className="nav-glyph">{TAB_GLYPHS[id]}</i> : label}
+            </button>
           ))}
         </nav>
+        <div className="notification-bell-wrap">
+          <button className="notification-bell" onClick={() => setNotificationsOpen((open) => !open)} title="Notifications">
+            <span aria-hidden="true">&#128276;</span>
+            {unreadNotificationCount ? <i className="notification-badge">{unreadNotificationCount > 99 ? "99+" : unreadNotificationCount}</i> : null}
+          </button>
+          {notificationsOpen ? <>
+            <div className="notification-scrim" onClick={() => setNotificationsOpen(false)} />
+            <div className="notification-dropdown">
+              <header><strong>Notifications</strong>{unreadNotificationCount ? <button onClick={async () => { await markAllNotificationsRead().catch(() => {}); refreshNotifications(); }}>Mark all read</button> : null}</header>
+              <div className="notification-list">
+                {notifications.map((item) => (
+                  <button key={item.notification_id} className={`notification-row tone-${notificationTone(item.type)} ${item.read_at ? "read" : "unread"}`} onClick={() => openNotification(item)}>
+                    <strong>{item.title}</strong>
+                    {item.body ? <p>{item.body}</p> : null}
+                    <small>{new Date(item.created_at).toLocaleString()}</small>
+                  </button>
+                ))}
+                {!notifications.length ? <div className="empty-state compact">You're all caught up.</div> : null}
+              </div>
+            </div>
+          </> : null}
+        </div>
         <div className="sidebar-bottom">
           <span className="user-avatar">{auth.user.email.slice(0, 2).toUpperCase()}</span>
-          <div><strong>{auth.user.email}</strong><small>{auth.user.user_id}</small></div>
-          <button className="logout" title="Sign out" onClick={async () => { await logout().catch(() => clearAuth()); setAuth(null); }}>Exit</button>
+          {!sidebarCollapsed ? <><div><strong>{auth.user.email}</strong><small>{auth.user.user_id}</small></div>
+          <button className="logout" title="Sign out" onClick={async () => { await logout().catch(() => clearAuth()); setAuth(null); }}>Exit</button></> : <button className="logout" title="Sign out" onClick={async () => { await logout().catch(() => clearAuth()); setAuth(null); }}>&#9211;</button>}
         </div>
       </aside>
 
       <main className="workspace">
         <header className="topbar">
-          <div>
+          <div className={`topbar-heading ${tabFadeState}`}>
             <p className="eyebrow">{tab === "home" ? "GIT WALK / COMMAND CENTER" : tab === "new" ? "GIT WALK / CREATE" : tab === "inventory" ? "GIT WALK / EUC INTELLIGENCE" : tab === "fabric" ? "GIT WALK / DIGITAL THREAD" : tab === "ai" ? "GIT WALK / AI CONTROL PLANE" : tab === "admin" ? "GIT WALK / ENTERPRISE SECURITY" : "GIT WALK / REPOSITORY"}</p>
             <h1>{tab === "home" ? "Repository workspaces" : tab === "new" ? "Create a repository" : tab === "inventory" ? "EUC inventory" : tab === "fabric" ? "Enterprise information fabric" : tab === "ai" ? "AI Command Center" : tab === "admin" ? "Identity and access" : repository?.repository_name || selectedDataset?.original_filename || "Repository workspace"}</h1>
           </div>
-          {!['new', 'inventory', 'fabric', 'ai', 'admin'].includes(tab) ? <div className="topbar-actions">
+          {!['home', 'new', 'inventory', 'fabric', 'ai', 'admin'].includes(tab) ? <div className="topbar-actions">
             <div className="active-users" title={activeUsers.map((user) => user.email).join("\n") || "No active users"}>
               <div className="avatar-stack">
                 {activeUsers.slice(0, 4).map((user, index) => (
@@ -1665,24 +2467,78 @@ export default function App() {
               </div>
               <div><strong>{activeUsers.length} active</strong><small>{activeUsers.some((user) => user.surfaces.includes("excel")) ? "Excel connected" : "Viewing repository"}</small></div>
             </div>
-            <input className="repo-search" list="repository-options" value={repoSearch} onChange={(event) => {
-              const value = event.target.value;
-              setRepoSearch(value);
-              const match = datasets.find((item) => item.table_id === value || item.repository_name === value);
-              if (match?.can_view) {
-                setSelectedTable(match.table_id);
-                setRepoSearch("");
-              }
-            }} placeholder="Search repositories" />
-            <datalist id="repository-options">{datasets.map((dataset) => <option key={dataset.table_id} value={dataset.repository_name}>{dataset.access_level} / {dataset.table_id}</option>)}</datalist>
-            <select value={selectedTable} onChange={(event) => { setSelectedTable(event.target.value); setRepoSearch(""); }}>
-              {datasets.map((dataset) => <option key={dataset.table_id} value={dataset.table_id} disabled={!dataset.can_view}>[{dataset.can_edit ? "EDIT" : dataset.can_view ? "VIEW" : "LOCKED"}] {dataset.repository_name} / {dataset.table_id}</option>)}
-            </select>
-            {selectedTable ? <select className="branch-selector" value={viewTableId} onChange={(event) => setSelectedBranchTable(event.target.value === selectedTable ? "" : event.target.value)}>
-              {branches.map((branch) => <option key={branch.branch_id} value={branch.data_table_id}>{branch.branch_name}</option>)}
-            </select> : null}
+            <div className="repo-switcher">
+              <button type="button" className="repo-switcher-trigger" onClick={() => setRepoSwitcherOpen((value) => !value)}>
+                <span className={`repo-switcher-dot ${selectedDataset?.can_edit ? "edit" : selectedDataset?.can_view ? "view" : "locked"}`} />
+                <span className="repo-switcher-label">
+                  {selectedDataset ? (
+                    <>
+                      <strong>{datasetDisplayName(selectedDataset)}</strong>
+                      {datasetMetaLine(selectedDataset) ? <small>{datasetMetaLine(selectedDataset)}</small> : null}
+                    </>
+                  ) : "Select repository"}
+                </span>
+                <i className="repo-switcher-chevron">&#9662;</i>
+              </button>
+              {repoSwitcherOpen ? <>
+                <div className="repo-switcher-scrim" onClick={() => { setRepoSwitcherOpen(false); setRepoSearch(""); }} />
+                <div className="repo-switcher-dropdown">
+                  <input
+                    className="repo-switcher-search" type="text" placeholder="Search repositories" value={repoSearch}
+                    autoFocus onChange={(event) => setRepoSearch(event.target.value)}
+                  />
+                  <div className="repo-switcher-list">
+                    {datasets.filter((dataset) => datasetDisplayName(dataset).toLowerCase().includes(repoSearch.trim().toLowerCase())).map((dataset) => (
+                      <button
+                        key={dataset.table_id} type="button" disabled={!dataset.can_view}
+                        className={dataset.table_id === selectedTable ? "active" : ""}
+                        onClick={() => { setSelectedTable(dataset.table_id); setRepoSearch(""); setRepoSwitcherOpen(false); }}
+                      >
+                        <span className={`repo-switcher-dot ${dataset.can_edit ? "edit" : dataset.can_view ? "view" : "locked"}`} />
+                        <div><strong>{datasetDisplayName(dataset)}</strong><small>{datasetMetaLine(dataset) || dataset.access_level}</small></div>
+                      </button>
+                    ))}
+                    {!datasets.length ? <div className="empty-state compact">No repositories yet.</div> : null}
+                    {datasets.length && !datasets.filter((dataset) => datasetDisplayName(dataset).toLowerCase().includes(repoSearch.trim().toLowerCase())).length
+                      ? <div className="empty-state compact">No repositories match "{repoSearch}".</div> : null}
+                  </div>
+                </div>
+              </> : null}
+            </div>
+            {selectedTable ? (
+              <select className="branch-selector" value={viewTableId} onChange={(event) => setSelectedBranchTable(event.target.value === selectedTable ? "" : event.target.value)}>
+                {branches.map((branch) => {
+                  const isMain = branch.branch_type === "MAIN" || branch.branch_name === "main";
+                  return (
+                    <option key={branch.branch_id} value={branch.data_table_id}>
+                      {isMain ? `🔒 ${branch.branch_name} (locked)` : branch.branch_name}
+                    </option>
+                  );
+                })}
+              </select>
+            ) : null}
             <button className="primary-button compact" onClick={handleWorkOnWorkbook} disabled={!selectedTable || !selectedDataset?.can_edit || workingCopyBusy}>{workingCopyBusy ? "Preparing branch..." : selectedDataset?.can_edit ? "Open branch in Excel" : "Viewer access"}</button>
-            <button className="secondary-button" onClick={() => refresh()} disabled={!selectedTable}>Refresh</button>
+            <button
+              className={`secondary-button refresh-button ${loading ? "is-refreshing" : ""}`}
+              onClick={() => refresh()}
+              disabled={!selectedTable || loading}
+              title="Refresh workspace"
+              aria-label="Refresh workspace"
+            >
+              <svg
+                className={`refresh-icon ${loading ? "spinning" : ""}`}
+                viewBox="0 0 24 24"
+                width="15"
+                height="15"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" />
+              </svg>
+            </button>
           </div> : null}
         </header>
 
@@ -1730,40 +2586,129 @@ export default function App() {
 
         {checkoutPrompt ? <div className="checkout-backdrop" role="presentation"><section className="checkout-dialog" role="dialog" aria-modal="true" aria-labelledby="checkout-title"><button className="checkout-close" onClick={() => setCheckoutPrompt(null)}>Close</button><p className="eyebrow">SIGNED WORKING COPY</p><h2 id="checkout-title">Resume a branch or start clean?</h2><p className="muted">A fresh Excel file will be generated either way. Resume keeps the selected branch history; new branch clones protected main.</p><div className="checkout-branch-list">{checkoutPrompt.branches.map((branch) => <button key={branch.branch_id} onClick={() => issueWorkingCopy("continue", branch.branch_id)} disabled={workingCopyBusy}><span><strong>{branch.branch_name}</strong><small>Last opened {branch.last_opened_at ? new Date(branch.last_opened_at).toLocaleString() : "not recorded"}</small></span><b>Resume</b></button>)}</div><button className="primary-button checkout-new" onClick={() => issueWorkingCopy("new")} disabled={workingCopyBusy}>{workingCopyBusy ? "Preparing workbook..." : "Create a new personal branch"}</button></section></div> : null}
 
-        {!['new', 'fabric', 'ai'].includes(tab) ? <><section className="status-rail">
-          <span><i className="live-dot" /> {branches.find((branch) => branch.data_table_id === viewTableId)?.branch_name || "main"}</span>
-          <span>HEAD <strong>v{data?.version || 0}</strong></span>
-          <span>{data?.total || 0} records</span>
-          <span>{activeUsers.length} collaborator{activeUsers.length === 1 ? "" : "s"} online</span>
-          <span>{lastRefresh ? `Updated ${lastRefresh.toLocaleTimeString()}` : "Waiting for data"}</span>
-        </section>
+        <div className={`workspace-screen-container ${tabFadeState}`}>
+        {(() => {
+          const genericKpiCards = [
+            { label: "Commits", value: semanticMetrics.commits ?? kpis.commits ?? 0, note: `On ${selectedBranch?.branch_name || "main"}` },
+            { label: "Semantic changes", value: semanticMetrics.changes ?? kpis.successes ?? 0, note: `${semanticMetrics.changed_sheets || 0} sheets touched`, tone: "green" },
+            { label: "Active branches", value: branches.filter((branch) => branch.status === "ACTIVE").length, note: `${workingCopies.length} signed working copies`, tone: "amber" },
+            { label: "Review queue", value: mergeRequests.filter((request) => !["MERGED", "CLOSED"].includes(request.status)).length, note: `${members.length} repository members`, tone: "ink" },
+          ];
+          const tabKpiCards = {
+            home: [
+              { label: "Repositories", value: datasets.length, note: `${datasets.filter((item) => item.can_edit).length} editable` },
+              { label: "Working copies", value: workingCopies.length, note: "Signed Excel checkouts", tone: "green" },
+              { label: "Recent commits", value: commits.length, note: "Across your repositories", tone: "amber" },
+              { label: "Repository members", value: members.length, note: `${invitations.length} pending invite(s)`, tone: "ink" },
+            ],
+            data: [
+              { label: "Repository members", value: members.length, note: `${invitations.length} pending invitation(s)` },
+              { label: "Rows in view", value: data?.total || 0, note: `${data?.columns?.length || 0} column(s)`, tone: "green" },
+              { label: "Active branches", value: branches.filter((branch) => branch.status === "ACTIVE").length, note: `${workingCopies.length} signed working copies`, tone: "amber" },
+              { label: "Collaborators online", value: activeUsers.length, note: "Viewing this repository now", tone: "ink" },
+            ],
+            merges: (() => {
+              const open = mergeRequests.filter((request) => !["MERGED", "CLOSED"].includes(request.status));
+              const conflicted = mergeRequests.filter((request) => request.status === "CONFLICTED" || request.open_conflicts > 0);
+              const merged = mergeRequests.filter((request) => request.status === "MERGED");
+              return [
+                { label: "Open requests", value: open.length, note: `${mergeRequests.length} total` },
+                { label: "Conflicted", value: conflicted.length, note: "Need resolution before merge", tone: "red" },
+                { label: "Merged", value: merged.length, note: "Landed on protected main", tone: "green" },
+                {
+                  label: "Request mix", value: mergeRequests.length, note: "Open / conflicted / merged", tone: "ink",
+                  bars: [{ label: "Open", value: open.length || 0.01 }, { label: "Conflicted", value: conflicted.length || 0.01 }, { label: "Merged", value: merged.length || 0.01 }],
+                },
+              ];
+            })(),
+            history: [
+              { label: "Semantic commits", value: semanticCommits.length, note: `On ${selectedBranch?.branch_name || "main"}` },
+              { label: "Cells changed", value: semanticCommits.reduce((sum, item) => sum + (item.cell_changes || 0), 0), note: "Across this commit graph", tone: "green" },
+              { label: "Formula changes", value: semanticCommits.reduce((sum, item) => sum + (item.formula_changes || 0), 0), note: "Formula rewrites tracked", tone: "amber" },
+              { label: "Mutation events", value: changeActivity.events?.length || 0, note: "Cell/row/column/sheet events", tone: "ink" },
+            ],
+            audit: [
+              { label: "Sealed events", value: auditLedger.integrity?.event_count || 0, note: "From GENESIS to head" },
+              { label: "Ledger integrity", value: auditLedger.integrity?.valid ? "VERIFIED" : "CHECK", note: "Hash-chain verification", tone: auditLedger.integrity?.valid ? "green" : "red" },
+              { label: "Recent events", value: auditLedger.events?.length || 0, note: "Currently loaded window", tone: "amber" },
+              { label: "Ledger head", value: String(auditLedger.integrity?.head_hash || "GENESIS").slice(0, 8), note: "Short hash", tone: "ink" },
+            ],
+            inventory: [
+              { label: "Registered assets", value: eucAssets.length, note: "Governed EUC workbooks" },
+              { label: "Analyzed", value: eucAssets.filter((item) => item.status === "COMPLETED").length, note: "Inventory complete", tone: "green" },
+              { label: "Sheets discovered", value: eucAssets.reduce((sum, item) => sum + (item.summary?.sheet_count || 0), 0), note: "Across every asset", tone: "amber" },
+              { label: "Formulas discovered", value: eucAssets.reduce((sum, item) => sum + (item.summary?.total_formulas || 0), 0), note: "Across every asset", tone: "ink" },
+            ],
+          }[tab];
+          const excludedTabs = ["new", "fabric", "ai", "team", "branches", "storage", "analytics"];
+          if (excludedTabs.includes(tab)) return null;
+          return <>
+            <section className="status-rail">
+              <span><i className="live-dot" /> {branches.find((branch) => branch.data_table_id === viewTableId)?.branch_name || "main"}</span>
+              <span>HEAD <strong>v{data?.version || 0}</strong></span>
+              <span>{data?.total || 0} records</span>
+              <span>{activeUsers.length} collaborator{activeUsers.length === 1 ? "" : "s"} online</span>
+              <span>{lastRefresh ? `Updated ${lastRefresh.toLocaleTimeString()}` : "Waiting for data"}</span>
+            </section>
 
-        <section className="kpi-grid">
-          <KpiCard label="Commits" value={semanticMetrics.commits ?? kpis.commits ?? 0} note={`On ${selectedBranch?.branch_name || "main"}`} />
-          <KpiCard label="Semantic changes" value={semanticMetrics.changes ?? kpis.successes ?? 0} note={`${semanticMetrics.changed_sheets || 0} sheets touched`} tone="green" />
-          <KpiCard label="Active branches" value={branches.filter((branch) => branch.status === "ACTIVE").length} note={`${workingCopies.length} signed working copies`} tone="amber" />
-          <KpiCard label="Review queue" value={mergeRequests.filter((request) => !["MERGED", "CLOSED"].includes(request.status)).length} note={`${members.length} repository members`} tone="ink" />
-        </section></> : null}
+            <section className="kpi-grid">
+              {(tabKpiCards || genericKpiCards).map((card) => <KpiCard key={card.label} {...card} />)}
+            </section>
+          </>;
+        })()}
 
         {tab === "home" ? (
           <div className="home-grid">
+            <SignalFilter
+              tagline="Scan the timeline"
+              buckets={monthBuckets.map((bucket) => ({ key: bucket.key, label: bucket.label, sublabel: bucket.year, count: bucket.count, intensity: bucket.intensity }))}
+              linked={signalLinked}
+              onToggleLinked={toggleSignalLinked}
+              activeReceiverId={signalArmedReceiver}
+              onArmReceiver={setSignalArmedReceiver}
+              onSelectBucket={setSignalMonthKey}
+              activeDomainLabel={pulseCategoryId ? categoryById.get(pulseCategoryId)?.name : ""}
+              receivers={[
+                { id: "openRepositories", label: "Open repositories", count: accessibleFilteredDatasets.length, color: "#58a6ff", selectedBucketKey: signalMonthKeys.openRepositories },
+                { id: "myWork", label: "My work", count: pulseFilteredWorkingCopies.length, color: "#3fb950", selectedBucketKey: signalMonthKeys.myWork },
+              ]}
+              onClear={() => { setSignalMonthKeys({ openRepositories: "", myWork: "" }); setPulseCategoryId(""); setSignalLinked(true); }}
+            />
+
             <section className="panel home-hero">
-              <div><p className="eyebrow">MY WORKSPACES</p><h2>Business areas</h2><p className="muted">Navigate workbook repositories by the business context they belong to.</p></div>
+              <div><p className="eyebrow">MY WORKSPACES</p><h2>Business areas</h2><p className="muted">Click an area to tune the signal — click again to clear.</p></div>
               <div className="category-grid">
                 {categories.filter((item) => item.category_id !== "CAT_HOME").map((category) => (
-                  <article key={category.category_id}>
+                  <button
+                    type="button" key={category.category_id}
+                    className={`category-card ${pulseCategoryId === category.category_id ? "active" : ""}`}
+                    onClick={() => setPulseCategoryId((current) => (current === category.category_id ? "" : category.category_id))}
+                  >
                     <span className="category-path">{category.parent_category_id === "CAT_HOME" ? "ROOT" : "NESTED"}</span>
                     <strong>{category.name}</strong>
                     <small>{category.repository_count} repositories / {category.child_count} subareas</small>
-                  </article>
+                  </button>
                 ))}
               </div>
             </section>
 
             <section className="panel repository-launchpad">
-              <div className="panel-header"><div><p className="eyebrow">OPEN REPOSITORIES</p><h2>Continue your work</h2></div><span className="pill">{datasets.length} repositories</span></div>
+              <div className="panel-header">
+                <div><p className="eyebrow">OPEN REPOSITORIES</p><h2>Continue your work<span className={`tuned-dot ${pulseFilterActiveFor("openRepositories") ? "live" : ""}`} style={{ "--pin-color": "#58a6ff" }} title={pulseFilterActiveFor("openRepositories") ? "Tuned to the signal filter" : ""} /></h2></div>
+                <div className="repository-launchpad-controls">
+                  <button
+                    type="button"
+                    className={`access-toggle ${showOnlyAccessibleRepos ? "active" : ""}`}
+                    onClick={() => setShowOnlyAccessibleRepos((value) => !value)}
+                    aria-pressed={showOnlyAccessibleRepos}
+                  >
+                    <i />My access only
+                  </button>
+                  <span className="pill">{accessibleFilteredDatasets.length} repositories</span>
+                </div>
+              </div>
               <div className="repository-card-grid">
-                {datasets.map((dataset) => (
+                {accessibleFilteredDatasets.map((dataset) => (
                   <button key={dataset.table_id} className={!dataset.can_view ? "repository-locked" : ""} disabled={!dataset.can_view} onClick={() => { setSelectedTable(dataset.table_id); setTab("data"); }}>
                     <span className="repo-icon">XL</span>
                     <span><strong>{dataset.repository_name || dataset.original_filename}</strong><small>{dataset.category_name} / {dataset.row_count} rows</small></span>
@@ -1771,14 +2716,16 @@ export default function App() {
                   </button>
                 ))}
                 {!datasets.length ? <div className="empty-state">Upload an Excel workbook to create your first repository.</div> : null}
+                {datasets.length && !accessibleFilteredDatasets.length ? <div className="empty-state">Nothing matches the current filter.</div> : null}
               </div>
             </section>
 
             <section className="panel my-work-panel">
-              <div className="panel-header"><div><p className="eyebrow">MY WORK</p><h2>Active working copies</h2></div><span className="pill ready">{workingCopies.length} active</span></div>
+              <div className="panel-header"><div><p className="eyebrow">MY WORK</p><h2>Active working copies<span className={`tuned-dot ${pulseFilterActiveFor("myWork") ? "live" : ""}`} style={{ "--pin-color": "#3fb950" }} title={pulseFilterActiveFor("myWork") ? "Tuned to the signal filter" : ""} /></h2></div><span className="pill ready">{pulseFilteredWorkingCopies.length} active</span></div>
               <div className="working-copy-list">
-                {workingCopies.slice(0, 6).map((copy) => <article key={copy.working_copy_id}><i /><div><strong>{copy.repository_name}</strong><small>{copy.branch_name}</small></div><span>HEAD {String(copy.head_commit_id || "").slice(0, 12)}</span></article>)}
+                {pulseFilteredWorkingCopies.slice(0, 6).map((copy) => <article key={copy.working_copy_id}><i /><div><strong>{copy.repository_name}</strong><small>{copy.branch_name}</small></div><span>HEAD {String(copy.head_commit_id || "").slice(0, 12)}</span></article>)}
                 {!workingCopies.length ? <div className="empty-state">Choose Work on Workbook to create a signed personal branch.</div> : null}
+                {workingCopies.length && !pulseFilteredWorkingCopies.length ? <div className="empty-state">Nothing matches the current filter.</div> : null}
               </div>
             </section>
 
@@ -1815,15 +2762,59 @@ export default function App() {
               <div className="euc-ingest-card">
                 <span className="euc-safe-mark">READ ONLY</span>
                 <label>Target repository<select value={selectedTable} onChange={(event) => setSelectedTable(event.target.value)}>{datasets.filter((item) => item.can_edit).map((dataset) => <option key={dataset.table_id} value={dataset.table_id}>{dataset.repository_name}</option>)}</select></label>
-                <label className="euc-file-drop"><input type="file" accept=".xlsx,.xlsm,.csv" onChange={(event) => setEucFile(event.target.files[0] || null)} /><strong>{eucFile?.name || "Drop an EUC or choose a file"}</strong><small>.xlsx, .xlsm, or .csv / source stored once</small></label>
-                <button onClick={ingestAndAnalyzeEuc} disabled={!eucFile || !repository?.repository_id || eucBusy}>{eucBusy ? "Fingerprinting + analyzing..." : "Register and analyze"}</button>
+                <label>Branch to analyze<select value={eucBranchId} onChange={(event) => setEucBranchId(event.target.value)} disabled={!eucBranches.length}>{eucBranches.map((branch) => <option key={branch.branch_id} value={branch.branch_id}>{branch.branch_name}{branch.branch_type === "MAIN" ? " (main)" : ""}</option>)}</select></label>
+                <button onClick={ingestFromBranch} disabled={!eucBranchId || eucBusy}>{eucBusy ? "Fingerprinting + analyzing..." : "Analyze this branch"}</button>
+                <button type="button" className="euc-upload-toggle" onClick={() => setEucUploadExpanded((value) => !value)}>{eucUploadExpanded ? "Hide" : "Upload an external file instead"}</button>
+                {eucUploadExpanded ? <div className="euc-upload-disclosure">
+                  <label className="euc-file-drop"><input type="file" accept=".xlsx,.xlsm,.csv" onChange={(event) => setEucFile(event.target.files[0] || null)} /><strong>{eucFile?.name || "Drop an EUC or choose a file"}</strong><small>.xlsx, .xlsm, or .csv / source stored once</small></label>
+                  <button onClick={ingestAndAnalyzeEuc} disabled={!eucFile || !repository?.repository_id || eucBusy}>{eucBusy ? "Fingerprinting + analyzing..." : "Register and analyze"}</button>
+                </div> : null}
               </div>
             </section>
+
+            <PortfolioRiskCenter selectedEucId={selectedEucId} onSelectAsset={selectPortfolioAsset} refreshToken={eucInventory?.result_manifest_hash} />
 
             <section className="euc-portfolio-bar">
               <div><strong>{eucAssets.length}</strong><span>governed EUC assets</span></div>
               <div><i />Immutable originals / versioned analysis / no macro execution</div>
-              <input value={eucSearch} onChange={(event) => setEucSearch(event.target.value)} placeholder="Search file or repository" />
+              <div className="euc-filter-row">
+                <div className={`euc-unified-search ${eucRepoPickerOpen ? "open" : ""}`}>
+                  {eucRepoFilter ? (
+                    <span className="euc-repo-chip">
+                      {datasetDisplayName(datasets.find((dataset) => dataset.repository_id === eucRepoFilter)) || "Repository"}
+                      <button type="button" onClick={() => setEucRepoFilter("")} aria-label="Clear repository filter">&times;</button>
+                    </span>
+                  ) : null}
+                  <input
+                    className="euc-search-input" value={eucSearch} onChange={(event) => setEucSearch(event.target.value)}
+                    placeholder={eucRepoFilter ? "Search within repository" : "Search files or pick a repository"}
+                  />
+                  <button type="button" className="euc-repo-picker-toggle" onClick={() => setEucRepoPickerOpen((value) => !value)} aria-label="Pick a repository">
+                    <i />
+                  </button>
+                  {eucRepoPickerOpen ? <>
+                    <div className="euc-repo-picker-scrim" onClick={() => setEucRepoPickerOpen(false)} />
+                    <div className="euc-repo-picker-dropdown">
+                      <button type="button" className={!eucRepoFilter ? "active" : ""} onClick={() => { setEucRepoFilter(""); setEucRepoPickerOpen(false); }}>
+                        <span className="euc-repo-picker-dot all" />All repositories
+                      </button>
+                      {datasets.filter((dataset) => dataset.can_view).map((dataset) => (
+                        <button
+                          key={dataset.repository_id} type="button" className={eucRepoFilter === dataset.repository_id ? "active" : ""}
+                          onClick={() => { setEucRepoFilter(dataset.repository_id); setEucRepoPickerOpen(false); }}
+                        >
+                          <span className="euc-repo-picker-dot" />{datasetDisplayName(dataset)}
+                        </button>
+                      ))}
+                    </div>
+                  </> : null}
+                </div>
+                <div className="euc-date-filter">
+                  <label>From<input type="date" value={eucSince ? eucSince.slice(0, 10) : ""} onChange={(event) => setEucSince(event.target.value ? `${event.target.value}T00:00:00` : "")} /></label>
+                  <label>To<input type="date" value={eucUntil ? eucUntil.slice(0, 10) : ""} onChange={(event) => setEucUntil(event.target.value ? `${event.target.value}T23:59:59` : "")} /></label>
+                  {eucSince || eucUntil ? <button type="button" className="text-button inline" onClick={() => { setEucSince(""); setEucUntil(""); }}>Clear</button> : null}
+                </div>
+              </div>
             </section>
 
             <div className="euc-layout">
@@ -1845,11 +2836,30 @@ export default function App() {
                     <article><span>Dependencies</span><strong>{(eucInventory.overview?.external_links || 0) + (eucInventory.overview?.connections || 0)}</strong><small>{eucInventory.overview?.connections || 0} connections</small></article>
                   </div>
                   <div className="euc-tabs">{[["overview", "Workbook map"], ["formulas", "Formula patterns"], ["objects", "Objects"], ["dependencies", "Dependency intelligence"], ["intelligence", "Risk & controls"], ["migration", "Migration blueprint"], ["native", "Native model"]].map(([id, label]) => <button key={id} className={eucSection === id ? "active" : ""} onClick={() => setEucSection(id)}>{label}</button>)}</div>
-                  {eucSection === "overview" ? <div className="euc-sheet-tree">{(eucInventory.sheets || []).map((sheet) => <article key={sheet.sheet_inventory_id}><header><span>{sheet.sheet_position + 1}</span><div><strong>{sheet.sheet_name}</strong><small>{sheet.visibility} / {sheet.used_range}</small></div><em>{Number(sheet.used_cell_count).toLocaleString()} cells</em></header><div><span>fx {Number(sheet.formula_cell_count).toLocaleString()}</span><span>{sheet.table_count} tables</span><span>{sheet.chart_count} charts</span><span>{sheet.validation_count} rules</span><span>{sheet.hidden_row_count + sheet.hidden_column_count} hidden axes</span></div></article>)}</div> : null}
+                  {eucSection === "overview" ? <div className="euc-sheet-grid">{(() => {
+                    const sheets = eucInventory.sheets || [];
+                    const maxCells = Math.max(1, ...sheets.map((sheet) => sheet.used_cell_count || 0));
+                    return sheets.map((sheet) => {
+                      const density = sheet.used_cell_count ? Math.round((sheet.formula_cell_count / sheet.used_cell_count) * 100) : 0;
+                      const magnitude = (sheet.used_cell_count || 0) / maxCells;
+                      return <article key={sheet.sheet_inventory_id} className="euc-sheet-card" style={{ "--magnitude": magnitude }}>
+                        <header><span className="euc-sheet-index">{sheet.sheet_position + 1}</span><div><strong>{sheet.sheet_name}</strong><small>{sheet.visibility} / {sheet.used_range}</small></div></header>
+                        <div className="euc-sheet-density"><div className="euc-sheet-density-track"><i style={{ width: `${density}%` }} /></div><small>{density}% formula density</small></div>
+                        <div className="euc-sheet-pills">
+                          <span className="euc-sheet-pill"><b>{Number(sheet.used_cell_count).toLocaleString()}</b>cells</span>
+                          <span className="euc-sheet-pill"><b>{Number(sheet.formula_cell_count).toLocaleString()}</b>formulas</span>
+                          <span className="euc-sheet-pill"><b>{sheet.table_count}</b>tables</span>
+                          <span className="euc-sheet-pill"><b>{sheet.chart_count}</b>charts</span>
+                          <span className="euc-sheet-pill"><b>{sheet.validation_count}</b>rules</span>
+                          <span className="euc-sheet-pill"><b>{sheet.hidden_row_count + sheet.hidden_column_count}</b>hidden axes</span>
+                        </div>
+                      </article>;
+                    });
+                  })()}</div> : null}
                   {eucSection === "formulas" ? <div className="euc-patterns"><header><span>Normalized business logic</span><span>Functions</span><span>Occurrences</span><span>Signals</span></header>{(eucInventory.formulas || []).map((pattern) => <article key={pattern.pattern_id}><code>{pattern.normalized_formula}</code><span>{pattern.functions.join(", ") || "operators"}</span><strong>{Number(pattern.occurrence_count).toLocaleString()}</strong><em>{[pattern.cross_sheet_reference ? "cross-sheet" : "", pattern.external_reference ? "external" : "", pattern.volatile ? "volatile" : ""].filter(Boolean).join(" / ") || "local"}</em></article>)}</div> : null}
                   {eucSection === "objects" ? <div className="euc-object-grid">{Object.entries((eucInventory.objects || []).reduce((groups, item) => ({...groups, [item.object_type]: [...(groups[item.object_type] || []), item]}), {})).map(([type, items]) => <article key={type}><span>{type.replaceAll("_", " ")}</span><strong>{items.length}</strong><small>{items.slice(0, 3).map((item) => item.object_name || item.cell_or_range).filter(Boolean).join(" / ")}</small></article>)}</div> : null}
                   {eucSection === "dependencies" ? <><DependencyWorkspace eucId={selectedEucId} inventory={eucInventory} onError={setError} /><div className="euc-dependencies dependency-sources"><div><p className="eyebrow">EXTERNAL WORKBOOKS</p>{(eucInventory.external_links || []).map((link) => <article key={link.link_id}><strong>{link.source_euc_reference}</strong><span>{link.relationship_type}</span><em>{link.resolution_status}</em></article>)}{!eucInventory.external_links?.length ? <div className="empty-state compact">No external workbook links discovered.</div> : null}</div><div><p className="eyebrow">DATA CONNECTIONS</p>{(eucInventory.connections || []).map((connection) => <article key={connection.connection_id}><strong>{connection.connection_name || "Unnamed connection"}</strong><span>{connection.connection_type || "Unknown type"}</span><em>{connection.credential_present ? "credentials redacted" : "metadata only"}</em></article>)}{!eucInventory.connections?.length ? <div className="empty-state compact">No packaged data connections discovered.</div> : null}</div></div></> : null}
-                  {eucSection === "intelligence" ? <IntelligenceWorkspace eucId={selectedEucId} onError={setError} /> : null}
+                  {eucSection === "intelligence" ? <IntelligenceWorkspace eucId={selectedEucId} tableId={eucAssets.find((item) => item.euc_id === selectedEucId)?.table_id} onError={setError} /> : null}
                   {eucSection === "migration" ? <MigrationWorkspace eucId={selectedEucId} onError={setError} /> : null}
                   {eucSection === "native" ? <NativeModelWorkspace eucId={selectedEucId} onError={setError} /> : null}
                   {(eucAssets.find((item) => item.euc_id === selectedEucId)?.warning_count || 0) > 0 ? <div className="euc-warning-ribbon"><strong>{eucAssets.find((item) => item.euc_id === selectedEucId)?.warning_count} inventory warning(s)</strong><span>Analysis completed without executing macros or external connections.</span></div> : null}
@@ -1965,11 +2975,62 @@ export default function App() {
 
                 {mergeRequestDetail.conflicts?.length ? <section className="review-block conflict-block">
                   <div className="review-block-title"><div><p className="eyebrow">EXCEL-NATIVE RESOLUTION</p><h3>Merge conflicts</h3></div><span>{mergeRequestDetail.conflicts.filter((item) => item.status === "OPEN").length} unresolved</span></div>
-                  <div className="conflict-list">{mergeRequestDetail.conflicts.map((conflict, index) => <article key={conflict.conflict_id} className={conflict.status === "RESOLVED" ? "resolved" : ""}><header><span>Conflict {index + 1}</span><strong>{conflict.conflict_type.replaceAll("_", " ")}</strong><code>{conflict.row_id || conflict.column_id || conflict.sheet_id}</code></header><div className="conflict-choices"><div><span>BASE</span><pre>{JSON.stringify(conflict.base_state?.value, null, 2)}</pre></div><div className="main-choice"><span>MAIN</span><pre>{JSON.stringify(conflict.main_state?.value, null, 2)}</pre></div><div className="branch-choice"><span>BRANCH</span><pre>{JSON.stringify(conflict.branch_state?.value, null, 2)}</pre></div></div>{conflict.status === "OPEN" ? <footer><button onClick={() => handleResolveConflict(conflict, "KEEP_MAIN")} disabled={mergeBusy}>Keep main</button><button onClick={() => handleResolveConflict(conflict, "ACCEPT_BRANCH")} disabled={mergeBusy}>Accept branch</button><button onClick={() => handleResolveConflict(conflict, "CUSTOM")} disabled={mergeBusy}>Custom value</button></footer> : <footer className="resolution-note">Resolved as {conflict.resolution_type} by {conflict.resolved_by}</footer>}</article>)}</div>
+                  <div className="ai-conflict-toolbar">
+                    <button className="secondary-button" onClick={handleRunAIAnalysis} disabled={aiAnalysisBusy || mergeBusy}>
+                      {aiAnalysisBusy ? "Running AI conflict analysis..." : "Run AI conflict analysis"}
+                    </button>
+                    <span className="ai-conflict-toolbar-hint">Agentic AI investigates each conflict against resolution precedents; every suggestion still requires your confirmation.</span>
+                  </div>
+                  <div className="conflict-list">{mergeRequestDetail.conflicts.map((conflict, index) => {
+                    const suggestion = aiConflictSuggestions.find(
+                      (item) => item.conflict_id === conflict.conflict_id && item.status === "PROPOSED"
+                    );
+                    return <article key={conflict.conflict_id} className={conflict.status === "RESOLVED" ? "resolved" : ""}>
+                      <header><span>Conflict {index + 1}</span><strong>{conflict.conflict_type.replaceAll("_", " ")}</strong><code>{conflict.row_id || conflict.column_id || conflict.sheet_id}</code></header>
+                      <div className="conflict-choices"><div><span>BASE</span><pre>{JSON.stringify(conflict.base_state?.value, null, 2)}</pre></div><div className="main-choice"><span>MAIN</span><pre>{JSON.stringify(conflict.main_state?.value, null, 2)}</pre></div><div className="branch-choice"><span>BRANCH</span><pre>{JSON.stringify(conflict.branch_state?.value, null, 2)}</pre></div></div>
+                      {conflict.status === "OPEN" && suggestion ? <div className={`ai-suggestion-card risk-${(suggestion.risk_level || "medium").toLowerCase()}`}>
+                        <header><span className="ai-suggestion-badge">{suggestion.resolution_type.replaceAll("_", " ")}</span><b>{Math.round((suggestion.confidence || 0) * 100)}% confidence</b><i>{suggestion.risk_level} risk</i></header>
+                        <p>{suggestion.rationale}</p>
+                        {suggestion.custom_value != null ? <code>Proposed value: {String(suggestion.custom_value)}</code> : null}
+                        {(suggestion.precedents || []).length ? <small>{suggestion.precedents.length} resolution precedent(s) cited</small> : null}
+                        {suggestion.resolution_type !== "MANUAL_REVIEW" ? <button className="ai-apply-button" onClick={() => handleApplyAISuggestion(conflict, suggestion)} disabled={mergeBusy}>Apply AI suggestion</button> : <small className="ai-manual-review-note">AI recommends manual review for this conflict.</small>}
+                      </div> : null}
+                      {conflict.status === "OPEN" ? <footer><button onClick={() => handleResolveConflict(conflict, "KEEP_MAIN")} disabled={mergeBusy}>Keep main</button><button onClick={() => handleResolveConflict(conflict, "ACCEPT_BRANCH")} disabled={mergeBusy}>Accept branch</button><button onClick={() => handleResolveConflict(conflict, "CUSTOM")} disabled={mergeBusy}>Custom value</button></footer> : <footer className="resolution-note">Resolved as {conflict.resolution_type} by {conflict.resolved_by}</footer>}
+                    </article>;
+                  })}</div>
                 </section> : null}
 
                 <section className="review-block approval-block">
                   <div className="review-block-title"><div><p className="eyebrow">OWNER CONTROL</p><h3>Protected-main decision</h3></div><span>{mergeRequestDetail.reviews?.filter((item) => item.decision === "APPROVED").length || 0} owner approvals</span></div>
+                  {mergeRequestDetail.status !== "MERGED" ? <div className="ai-assessment-toolbar">
+                    <button className="secondary-button" onClick={handleRunAIAssessment} disabled={aiAssessmentBusy || mergeBusy}>
+                      {aiAssessmentBusy ? "Assessing merge risk..." : aiAssessment ? "Re-run AI risk assessment" : "Run AI risk assessment"}
+                    </button>
+                    <span className="ai-conflict-toolbar-hint">AI assistant for the owner's decision — advisory only, never approves or merges on its own.</span>
+                  </div> : null}
+                  {aiAssessment ? <div className={`ai-assessment-card risk-${(aiAssessment.risk_level || "medium").toLowerCase()}`}>
+                    <header><span className="ai-suggestion-badge">{aiAssessment.recommendation.replaceAll("_", " ")}</span><b>{Math.round((aiAssessment.confidence || 0) * 100)}% confidence</b><i>{aiAssessment.risk_level} risk · {Math.round(aiAssessment.risk_score ?? 0)}/100</i></header>
+                    {aiAssessment.ai_recommendation && aiAssessment.ai_recommendation !== aiAssessment.recommendation ? <p className="ai-guardrail-note">Deterministic risk engine escalated this from the AI's {aiAssessment.ai_recommendation.replaceAll("_", " ")} recommendation — risk level is computed by hard rules, not left to the model.</p> : null}
+                    <p>{aiAssessment.summary}</p>
+                    {(aiAssessment.risk_breakdown || []).length ? <div className="ai-risk-breakdown">
+                      <p className="ai-field-explainability-title">Risk breakdown</p>
+                      {aiAssessment.risk_breakdown.map((component) => <div key={component.dimension} className="ai-risk-bar-row">
+                        <span className="ai-risk-bar-label">{component.dimension.replaceAll("_", " ")}</span>
+                        <div className="ai-risk-bar-track"><div className={`ai-risk-bar-fill risk-${component.classification?.toLowerCase()}`} style={{ width: `${Math.min(100, component.score)}%` }} /></div>
+                        <span className="ai-risk-bar-score">{Math.round(component.score)}</span>
+                      </div>)}
+                    </div> : null}
+                    {(aiAssessment.field_investigations || []).length ? <div className="ai-field-explainability">
+                      <p className="ai-field-explainability-title">Why these fields changed</p>
+                      {aiAssessment.field_investigations.map((field, index) => <article key={index} className="ai-field-explanation">
+                        <header><strong>{field.column_name}</strong><span>row {field.row_id}</span></header>
+                        <p><i>Previously:</i> {field.previous_value == null || field.previous_value === "" ? "(empty)" : String(field.previous_value)} <i>→ now empty</i></p>
+                        <p className="ai-field-explanation-text">{field.explanation}</p>
+                        <small>Last touched by {field.changed_by || "unknown"}{field.changed_at ? ` on ${new Date(field.changed_at).toLocaleString()}` : ""} · {field.prior_edit_count} prior edit(s)</small>
+                      </article>)}
+                    </div> : null}
+                    {(aiAssessment.warnings || []).length ? <ul>{aiAssessment.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul> : null}
+                  </div> : null}
                   <div className="review-ledger">{(mergeRequestDetail.reviews || []).map((review) => <article key={review.review_id}><span>{review.reviewer_email?.slice(0,2).toUpperCase()}</span><div><strong>{review.reviewer_email}</strong><p>{review.comment_text || "No comment"}</p></div><b className={review.decision.toLowerCase()}>{review.decision}</b></article>)}</div>
                   {mergeRequestDetail.status !== "MERGED" ? repository?.capabilities?.review ? <div className="review-actions"><button className="reject" disabled={mergeBusy} onClick={() => handleReviewMergeRequest("REJECTED")}>Reject</button><button className="approve" disabled={mergeBusy || mergeRequestDetail.validation_status !== "PASSED" || mergeRequestDetail.conflicts?.some((item) => item.status === "OPEN")} onClick={() => handleReviewMergeRequest("APPROVED")}>Approve as owner</button><button className="merge" disabled={mergeBusy || mergeRequestDetail.status !== "APPROVED" || !mergeRequestDetail.heads_current} onClick={handleMergeRequest}>Merge into main</button></div> : <div className="shared-notice">Waiting for the repository owner to review and merge this request.</div> : <div className="merged-banner"><strong>Merged safely into main</strong><span>Commit {mergeRequestDetail.merge_commit_id}; the source working copy is revoked.</span></div>}
                 </section>
@@ -1988,14 +3049,54 @@ export default function App() {
 
         {tab === "settings" ? (
           <div className="settings-grid">
-            <section className="panel">
+            <section className="panel settings-identity-hero">
               <p className="eyebrow">REPOSITORY IDENTITY</p><h2>Foundation metadata</h2>
-              <dl className="metadata-list"><div><dt>Repository</dt><dd>{repository?.repository_id}</dd></div><div><dt>Main branch</dt><dd>{repository?.default_branch_id}</dd></div><div><dt>Main protection</dt><dd>{repository?.main_protected ? "Enforced" : "Pending first checkout"}</dd></div><div><dt>Stable sheets</dt><dd>{repository?.sheets?.length || 0}</dd></div></dl>
+              {repository?.description ? <p className="muted settings-identity-description">{repository.description}</p> : null}
+              <dl className="metadata-list">
+                <div><dt>Repository</dt><dd>{repository?.repository_id}</dd></div>
+                <div><dt>Main branch</dt><dd>{repository?.default_branch_id}</dd></div>
+                <div><dt>Main protection</dt><dd>{repository?.main_protected ? "Enforced" : "Pending first checkout"}</dd></div>
+                <div><dt>Stable sheets</dt><dd>{repository?.sheets?.length || 0}</dd></div>
+                <div><dt>Business owner</dt><dd>{repository?.business_owner || "Unassigned"}</dd></div>
+                <div><dt>Data classification</dt><dd className="settings-classification-pill"><span className={`pill classification-${(repository?.data_classification || "internal").toLowerCase()}`}>{repository?.data_classification || "internal"}</span></dd></div>
+                <div><dt>Retention policy</dt><dd>{repository?.retention_policy || "Not specified"}</dd></div>
+                <div><dt>Visibility</dt><dd>{repository?.visibility || "private"}</dd></div>
+                <div><dt>Created</dt><dd>{repository?.created_at ? new Date(repository.created_at).toLocaleString() : "Unknown"}</dd></div>
+              </dl>
             </section>
             <section className="panel">
               <p className="eyebrow">BUSINESS NAVIGATION</p><h2>Repository category</h2>
-              <label>Business area<select value={repository?.category_id || "CAT_UNSORTED"} onChange={(event) => changeBusinessArea(event.target.value)}>{categories.filter((category) => category.category_id !== "CAT_HOME").map((category) => <option key={category.category_id} value={category.category_id}>{category.name}</option>)}</select></label>
-              <form className="category-form" onSubmit={addBusinessArea}><select value={categoryParent} onChange={(event) => setCategoryParent(event.target.value)}>{categories.map((category) => <option key={category.category_id} value={category.category_id}>Under {category.name}</option>)}</select><input value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder="New business area" required /><button className="secondary-button">Create area</button></form>
+              <label className="field-label">Business area
+                <span className="field-hint">Where this repository appears when browsing by business context.</span>
+                <select value={repository?.category_id || "CAT_UNSORTED"} onChange={(event) => changeBusinessArea(event.target.value)}>{categories.filter((category) => category.category_id !== "CAT_HOME").map((category) => <option key={category.category_id} value={category.category_id}>{category.name}</option>)}</select>
+              </label>
+              <div className="category-form-divider">Create a new business area</div>
+              <form className="category-form" onSubmit={addBusinessArea}>
+                <label className="field-label compact">Parent
+                  <select value={categoryParent} onChange={(event) => setCategoryParent(event.target.value)}>{categories.map((category) => <option key={category.category_id} value={category.category_id}>{category.name}</option>)}</select>
+                </label>
+                <label className="field-label compact">Name
+                  <input value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder="e.g. Finance" required />
+                </label>
+                <button className="secondary-button" type="submit">Create area</button>
+              </form>
+              {(() => {
+                const activeCategory = categories.find((category) => category.category_id === (repository?.category_id || "CAT_UNSORTED"));
+                if (!activeCategory) return null;
+                const parentCategory = categories.find((category) => category.category_id === activeCategory.parent_category_id);
+                return (
+                  <div className="category-snapshot">
+                    <div className="category-form-divider">This business area</div>
+                    <div className="category-snapshot-grid">
+                      <div><strong>{activeCategory.repository_count ?? 0}</strong><span>repositories</span></div>
+                      <div><strong>{activeCategory.child_count ?? 0}</strong><span>subareas</span></div>
+                      <div><strong className="category-snapshot-text">{parentCategory?.name || "Home"}</strong><span>parent area</span></div>
+                      <div><strong className="category-snapshot-text">{activeCategory.created_at ? new Date(activeCategory.created_at).toLocaleDateString() : "Unknown"}</strong><span>created</span></div>
+                    </div>
+                    <button type="button" className="secondary-button" onClick={() => { setPulseCategoryId(activeCategory.category_id); setTab("home"); }}>Browse {activeCategory.name} on the home signal filter</button>
+                  </div>
+                );
+              })()}
             </section>
             <section className="panel wide euc-storage-settings">
               <div className="panel-header">
@@ -2030,15 +3131,51 @@ export default function App() {
             </section>
             <section className="panel wide settings-sheets"><p className="eyebrow">STABLE SHEET IDs</p><h2>Repository worksheets</h2><div>{(repository?.sheets || []).map((sheet) => <article key={sheet.sheet_id}><span>{sheet.sheet_order + 1}</span><strong>{sheet.sheet_name}</strong><code>{sheet.sheet_id}</code></article>)}</div></section>
             <section className="panel wide security-posture"><div className="panel-header"><div><p className="eyebrow">SECURITY POSTURE / {securityPosture?.environment || "LOADING"}</p><h2>Production controls</h2></div><span className="pill ready">{Object.values(securityPosture?.controls || {}).filter(Boolean).length} enforced</span></div><div className="control-grid">{Object.entries(securityPosture?.controls || {}).map(([name, enabled]) => <article key={name} className={enabled ? "enabled" : "disabled"}><i>{enabled ? "ON" : "OFF"}</i><strong>{name.replaceAll("_", " ")}</strong></article>)}</div><div className="limit-strip"><span>Upload {Math.round((securityPosture?.upload_limits?.bytes || 0) / 1048576)} MB</span><span>{securityPosture?.upload_limits?.rows || 0} rows</span><span>{securityPosture?.upload_limits?.columns || 0} columns</span><span>{securityPosture?.upload_limits?.sheets || 0} sheets</span><span>{securityPosture?.upload_limits?.timeout_seconds || 0}s processing budget</span></div></section>
+
+            <section className="panel branch-protection-settings">
+              <div className="panel-header"><div><p className="eyebrow">ENTERPRISE / GOVERNANCE</p><h2>Branch protection</h2><p className="muted">Applies to {repository?.default_branch_id || "the protected main branch"}.</p></div></div>
+              {branchProtection ? <div className="settings-toggle-list">
+                <label><span><strong>Allow direct commits</strong><small>When off, all changes to main must go through an approved merge request.</small></span><input type="checkbox" checked={Boolean(branchProtection.rule.allow_direct_commits)} disabled={branchProtectionBusy} onChange={(event) => saveBranchProtection({ allow_direct_commits: event.target.checked })} /></label>
+                <label><span><strong>Required approvals</strong><small>Owner approvals needed before a merge request can land on main.</small></span><input type="number" min="0" max="10" value={branchProtection.rule.required_approvals} disabled={branchProtectionBusy} onChange={(event) => saveBranchProtection({ required_approvals: Number(event.target.value) })} /></label>
+                <label><span><strong>Require validation</strong><small>Merge requests must pass automated validation before they can merge.</small></span><input type="checkbox" checked={Boolean(branchProtection.rule.require_validation)} disabled={branchProtectionBusy} onChange={(event) => saveBranchProtection({ require_validation: event.target.checked })} /></label>
+              </div> : <div className="empty-state compact">Select a repository to configure branch protection.</div>}
+            </section>
+
+            <section className="panel notification-preferences-settings">
+              <div className="panel-header"><div><p className="eyebrow">ENTERPRISE / ALERTING</p><h2>Notification preferences</h2><p className="muted">Choose which events raise a notification for your account.</p></div></div>
+              {notificationPrefs ? <div className="settings-toggle-list">
+                {[["MERGE_REQUEST_CONFLICTED", "Merge request has conflicts"], ["MERGE_RISK_FLAGGED", "AI flags a merge as HIGH/CRITICAL risk"], ["DEVICE_BLOCKED", "A device is blocked"], ["EUC_RISK_DRIFT", "Risk Drift Radar finds a new high-severity finding"]].map(([type, label]) => (
+                  <label key={type}><span><strong>{label}</strong></span><input type="checkbox" checked={Boolean(notificationPrefs[type])} onChange={(event) => toggleNotificationPreference(type, event.target.checked)} /></label>
+                ))}
+              </div> : null}
+            </section>
+
+            <section className="panel wide data-export-settings">
+              <div className="panel-header"><div><p className="eyebrow">ENTERPRISE / COMPLIANCE</p><h2>Data export</h2><p className="muted">Download this repository's governed evidence for offline review or backup.</p></div></div>
+              <div className="data-export-actions">
+                <button className="secondary-button" onClick={async () => {
+                  try {
+                    const result = await getAuditEvents(selectedTable);
+                    downloadJson(`${repository?.repository_name || "repository"}-audit-trail.json`, result);
+                  } catch (err) { setError(err.message); }
+                }}>Export audit trail (JSON)</button>
+                <button className="secondary-button" onClick={() => downloadJson(`${repository?.repository_name || "repository"}-sheet-map.json`, repository?.sheets || [])}>Export sheet map (JSON)</button>
+                <button className="secondary-button" onClick={() => downloadJson(`${repository?.repository_name || "repository"}-security-posture.json`, securityPosture || {})}>Export security posture (JSON)</button>
+                <button className="secondary-button" onClick={() => { navigator.clipboard?.writeText(repository?.repository_id || ""); setExportSettingsMsg("Repository ID copied."); setTimeout(() => setExportSettingsMsg(""), 2500); }}>Copy repository ID</button>
+                {exportSettingsMsg ? <span className="settings-feedback">{exportSettingsMsg}</span> : null}
+                <small>EUC inventory exports are available from the EUC Inventory tab's "Export JSON" button on each analyzed asset.</small>
+              </div>
+            </section>
+
             {repository?.capabilities?.delete_repository ? <section className="panel wide danger-zone"><div><p className="eyebrow">OWNER / DANGER ZONE</p><h2>Delete repository</h2><p className="muted">Removes the repository from active work and revokes every signed branch checkout. Immutable audit evidence is retained.</p></div><button className="danger-button" onClick={handleDeleteRepository}>Delete {repository.repository_name}</button></section> : null}
           </div>
         ) : null}
 
         {tab === "history" ? (
-          <div className="history-stage">
+          <div className={`history-stage ${historyView === "graph" ? "history-stage-graph-mode" : ""}`}>
             <section className="panel semantic-history">
-              <div className="panel-header"><div><p className="eyebrow">{selectedBranch?.branch_name?.toUpperCase() || "MAIN"} / COMMIT DAG</p><h2>Semantic commit graph</h2><p className="muted">Immutable deltas from the selected branch, newest first.</p></div><span className="pill">{semanticCommits.length} commits</span></div>
-              <div className="commit-list">
+              <div className="panel-header"><div><p className="eyebrow">{selectedBranch?.branch_name?.toUpperCase() || "MAIN"} / COMMIT DAG</p><h2>Semantic commit graph</h2><p className="muted">{historyView === "list" ? "Immutable deltas from the selected branch, newest first." : "Every branch of this repository, lanes and merge points shown."}</p></div><div className="history-view-toggle"><button className={historyView === "list" ? "active" : ""} onClick={() => setHistoryView("list")}>List</button><button className={historyView === "graph" ? "active" : ""} onClick={() => setHistoryView("graph")}>Graph</button></div><span className="pill">{semanticCommits.length} commits</span></div>
+              {historyView === "list" ? <div className="commit-list">
                 {semanticCommits.map((commit) => (
                   <article className="commit-card semantic" key={commit.commit_id}>
                     <div className="commit-node" />
@@ -2052,7 +3189,7 @@ export default function App() {
                   </article>
                 ))}
                 {!semanticCommits.length ? <div className="empty-state">No semantic commits yet. Commit from the Excel taskpane to begin this graph.</div> : null}
-              </div>
+              </div> : <CommitGraphView tableId={selectedTable} onSelectCommit={inspectCommit} onError={setError} />}
             </section>
             {selectedCommit ? <section className="panel commit-diff-panel"><div className="panel-header"><div><p className="eyebrow">COMMIT / {selectedCommit.commit_id}</p><h2>{selectedCommit.message}</h2><p className="muted">{selectedCommit.author_email} / {new Date(selectedCommit.created_at).toLocaleString()}</p></div><button className="secondary-button" onClick={() => setSelectedCommit(null)}>Close diff</button></div><div className="commit-file-list">{(selectedCommit.changes || []).map((change) => <article key={change.change_id}><header><strong>{change.operation_type.replaceAll("_", " ")}</strong><span>{change.previous_cell_reference || change.new_cell_reference || change.row_id || change.column_id || change.sheet_id}</span></header><div className="value-diff"><pre className="removed">- {JSON.stringify(change.old_value ?? change.old_formula ?? null)}</pre><pre className="added">+ {JSON.stringify(change.new_value ?? change.new_formula ?? null)}</pre></div><footer><code>{change.sheet_id}</code><span>{change.row_id || "sheet"}</span><span>{change.column_id || "structure"}</span></footer></article>)}</div></section> : null}
             <section className="panel lineage-panel">
@@ -2068,18 +3205,58 @@ export default function App() {
                 {!cellLineage.length ? <div className="empty-state compact">No history for this stable cell yet.</div> : null}
               </div>
             </section>
-            <section className="panel workbook-blame-panel">
-              <div className="panel-header"><div><p className="eyebrow">CHANGE TRACEABILITY / COMMITTED EVENTS</p><h2>Workbook mutation ledger</h2><p className="muted">Only cells, rows, columns, and sheets that were created, updated, moved, or deleted are listed. Unchanged imported data is intentionally excluded.</p></div><span className="pill ready">{changeActivity.events?.length || 0} events</span></div>
-              <div className="activity-controls"><label>Operation<select value={activityOperation} onChange={(event) => setActivityOperation(event.target.value)}><option value="">All activity</option><option value="CELL_READ">Cell reads</option><option value="CELL_VALUE_UPDATE">Cell value updates</option><option value="CELL_FORMULA_UPDATE">Formula updates</option><option value="ROW_INSERT">Rows created</option><option value="ROW_DELETE">Rows deleted</option><option value="COLUMN_INSERT">Columns created</option><option value="COLUMN_DELETE">Columns deleted</option><option value="SHEET_CREATE">Sheets created</option><option value="SHEET_DELETE">Sheets deleted</option></select></label><label>Order<select value={activitySort} onChange={(event) => setActivitySort(event.target.value)}><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label></div>
-              <div className="blame-table-wrap">
-                <table className="blame-table activity-table"><thead><tr><th>Action</th><th>Excel coordinate</th><th>Before / after</th><th>Author</th><th>Commit / time</th><th /></tr></thead><tbody>
-                  {(changeActivity.events || []).map((event) => <tr key={event.change_id}><td><b className={`event-action action-${event.action}`}>{event.action}</b><small>{event.operation_type.replaceAll("_", " ")}</small></td><td><strong>{event.column_name || event.sheet_name || "Workbook structure"}</strong><small>{event.sheet_name || event.sheet_id} / row {event.row_position == null ? "-" : event.row_position + 1} / col {event.column_position == null ? "-" : event.column_position + 1}</small><code>{event.previous_cell_reference || event.new_cell_reference || event.row_id || event.column_id || event.sheet_id}</code></td><td><div className="compact-value-diff"><del>{JSON.stringify(event.old_formula ?? event.old_value ?? null)}</del><ins>{JSON.stringify(event.new_formula ?? event.new_value ?? null)}</ins></div></td><td>{event.author_email || event.author_user_id}</td><td><span className="trace-commit">{String(event.commit_id).slice(0, 14)}</span><small>{new Date(event.occurred_at).toLocaleString()}</small></td><td>{event.row_id && event.column_id && event.action !== "deleted" ? <button className="trace-button" onClick={() => inspectBlameCell(event)}>Trace</button> : null}</td></tr>)}
-                </tbody></table>
-              </div>
-              {!changeActivity.events?.length ? <div className="empty-state compact">No committed mutations match this sheet and filter.</div> : null}
+            <section className="panel workbook-blame-panel collapsed-panel">
+              <button className="panel-header collapsed-panel-trigger" onClick={() => setMutationLedgerOpen(true)}><div><p className="eyebrow">CHANGE TRACEABILITY / COMMITTED EVENTS</p><h2>Workbook mutation ledger</h2><p className="muted">Only cells, rows, columns, and sheets that were created, updated, moved, or deleted are listed. Click to expand.</p></div><span className="pill ready">{changeActivity.events?.length || 0} events</span></button>
             </section>
+            {mutationLedgerOpen ? <div className="checkout-backdrop" role="presentation" onClick={() => setMutationLedgerOpen(false)}>
+              <section className="checkout-dialog mutation-ledger-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+                <button className="checkout-close" onClick={() => setMutationLedgerOpen(false)}>Close</button>
+                <div className="panel-header"><div><p className="eyebrow">CHANGE TRACEABILITY / COMMITTED EVENTS</p><h2>Workbook mutation ledger</h2><p className="muted">Only cells, rows, columns, and sheets that were created, updated, moved, or deleted are listed. Unchanged imported data is intentionally excluded.</p></div><span className="pill ready">{changeActivity.events?.length || 0} events</span></div>
+                <div className="activity-controls"><label>Operation<select value={activityOperation} onChange={(event) => setActivityOperation(event.target.value)}><option value="">All activity</option><option value="CELL_READ">Cell reads</option><option value="CELL_VALUE_UPDATE">Cell value updates</option><option value="CELL_FORMULA_UPDATE">Formula updates</option><option value="ROW_INSERT">Rows created</option><option value="ROW_DELETE">Rows deleted</option><option value="COLUMN_INSERT">Columns created</option><option value="COLUMN_DELETE">Columns deleted</option><option value="SHEET_CREATE">Sheets created</option><option value="SHEET_DELETE">Sheets deleted</option></select></label><label>Order<select value={activitySort} onChange={(event) => setActivitySort(event.target.value)}><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label></div>
+                {changeActivity.events?.length ? (
+                  <div className="mutation-ledger-list">
+                    {changeActivity.events.map((event) => (
+                      <article key={event.change_id} className="mutation-ledger-card">
+                        <div className="mutation-ledger-card-head">
+                          <b className={`event-action action-${event.action}`}>{event.action}</b>
+                          <span className="mutation-ledger-op">{event.operation_type.replaceAll("_", " ")}</span>
+                          <span className="mutation-ledger-time">{new Date(event.occurred_at).toLocaleString()}</span>
+                        </div>
+                        <div className="mutation-ledger-card-body">
+                          <div className="mutation-ledger-coord">
+                            <strong>{event.column_name || event.sheet_name || "Workbook structure"}</strong>
+                            <small>{event.sheet_name || event.sheet_id} &middot; row {event.row_position == null ? "-" : event.row_position + 1} &middot; col {event.column_position == null ? "-" : event.column_position + 1}</small>
+                            <code>{event.previous_cell_reference || event.new_cell_reference || event.row_id || event.column_id || event.sheet_id}</code>
+                          </div>
+                          <div className="compact-value-diff mutation-ledger-diff">
+                            <del>{JSON.stringify(event.old_formula ?? event.old_value ?? null)}</del>
+                            <ins>{JSON.stringify(event.new_formula ?? event.new_value ?? null)}</ins>
+                          </div>
+                        </div>
+                        <div className="mutation-ledger-card-foot">
+                          <span className="mutation-ledger-author">{event.author_email || event.author_user_id}</span>
+                          <span className="trace-commit">{String(event.commit_id).slice(0, 14)}</span>
+                          {event.row_id && event.column_id && event.action !== "deleted" ? <button className="trace-button" onClick={() => inspectBlameCell(event)}>Trace</button> : null}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state compact mutation-ledger-empty">No committed mutations match this sheet and filter.</div>
+                )}
+              </section>
+            </div> : null}
             {selectedTrace ? <section className="panel traceability-card"><button className="trace-close" onClick={() => setSelectedTrace(null)}>Close</button><p className="eyebrow">VALUE PROVENANCE</p><h2>{selectedTrace.column_name} / {selectedTrace.row_id}</h2><div className="trace-current"><span>Current</span><strong>{selectedTrace.formula || JSON.stringify(selectedTrace.value)}</strong></div><div className="trace-facts"><div><span>Author</span><strong>{selectedTrace.last_author_email || selectedTrace.last_author_user_id}</strong></div><div><span>Commit</span><strong>{selectedTrace.last_commit_id}</strong></div><div><span>Merge request</span><strong>{selectedTrace.merge_request_id || "Not merged through an MR"}</strong></div><div><span>Modified</span><strong>{new Date(selectedTrace.last_modified_at).toLocaleString()}</strong></div></div><div className="trace-history">{(selectedTrace.history || []).map((event) => <article key={event.change_id}><i /><div><strong>{event.operation_type.replaceAll("_", " ")}</strong><span>{event.author_email} / {event.message}</span><code>{JSON.stringify(event.old_value)} to {JSON.stringify(event.new_value)}</code></div></article>)}</div></section> : null}
           </div>
+        ) : null}
+
+        {tab === "team" ? (
+          <TeamActivityPanel
+            tableId={selectedTable}
+            repositoryName={repository?.repository_name || selectedDataset?.original_filename}
+            isOwner={repository?.repository_role === "owner" || selectedDataset?.repository_role === "owner"}
+            onError={setError}
+          />
         ) : null}
 
         {tab === "storage" ? (
@@ -2132,14 +3309,57 @@ export default function App() {
 
         {tab === "analytics" ? (
           <div className="stage4-insights">
-            <section className="insight-hero"><div><p className="eyebrow">GOVERNANCE INTELLIGENCE / 24 HOURS</p><h2>Repository pulse</h2><p>Version activity, workflow control, data quality, and platform reliability in one decision surface.</p></div><div className="pulse-score"><span>Merge success</span><strong>{repositoryInsights?.workflow?.merge_success_rate ?? 100}%</strong><small>{repositoryInsights?.workflow?.merged || 0} controlled merges</small></div></section>
+            <section className="insight-hero">
+              <div><p className="eyebrow">GOVERNANCE INTELLIGENCE / 24 HOURS</p><h2>Repository pulse</h2><p>Version activity, workflow control, data quality, security, AI usage, and team velocity — every operation this product runs, in one decision surface.</p><button type="button" className="secondary-button personal-activity-trigger" onClick={() => setPersonalActivityOpen(true)}>Personal Activity</button></div>
+              <div className="pulse-score"><span>Merge success</span><strong>{repositoryInsights?.workflow?.merge_success_rate ?? 100}%</strong><small>{repositoryInsights?.workflow?.merged || 0} controlled merges</small></div>
+            </section>
+            {personalActivityOpen ? <PersonalActivityModal onClose={() => setPersonalActivityOpen(false)} /> : null}
+
+            <section className="panel manager-digest-panel">
+              <div className="panel-header"><div><p className="eyebrow">MANAGER DIGEST / AI-GENERATED</p><h2>Weekly read, grounded in real numbers</h2><p className="muted">One click composes a plain-language summary of the KPIs on this page — commit velocity, merge health, risk posture, and AI usage.</p></div>
+                <button className="primary-button compact" onClick={generateManagerDigest} disabled={managerDigestBusy}>{managerDigestBusy ? "Composing..." : "Generate digest"}</button>
+              </div>
+              {managerDigest ? <AIAnswerView text={managerDigest} /> : null}
+            </section>
+
             <div className="insight-domain-grid">
-              <section className="panel insight-domain version"><p className="eyebrow">VERSION CONTROL</p><h3>{repositoryInsights?.version_control?.commits || 0} commits</h3><div><span>Semantic changes<strong>{repositoryInsights?.version_control?.changes || 0}</strong></span><span>Formula changes<strong>{repositoryInsights?.version_control?.formula_changes || 0}</strong></span><span>Reverts<strong>{repositoryInsights?.version_control?.reverts || 0}</strong></span><span>Most changed<strong>{repositoryInsights?.version_control?.most_changed_sheet || "No changes"}</strong></span></div></section>
-              <section className="panel insight-domain workflow"><p className="eyebrow">WORKFLOW</p><h3>{repositoryInsights?.workflow?.active_branches || 0} active branches</h3><div><span>Conflict rate<strong>{repositoryInsights?.workflow?.conflict_rate || 0}%</strong></span><span>Review time<strong>{repositoryInsights?.workflow?.average_review_hours || 0}h</strong></span><span>Branch lifetime<strong>{repositoryInsights?.workflow?.average_branch_lifetime_days || 0}d</strong></span><span>Open copies<strong>{repositoryInsights?.workflow?.active_working_copies || 0}</strong></span><span>Merge requests<strong>{repositoryInsights?.workflow?.merge_requests || 0}</strong></span></div></section>
+              <section className="panel insight-domain version"><p className="eyebrow">VERSION CONTROL</p><h3>{repositoryInsights?.version_control?.commits || 0} commits</h3><div><span>Semantic changes<strong>{repositoryInsights?.version_control?.changes || 0}</strong></span><span>Cell changes<strong>{repositoryInsights?.version_control?.cell_changes || 0}</strong></span><span>Formula changes<strong>{repositoryInsights?.version_control?.formula_changes || 0}</strong></span><span>Reverts<strong>{repositoryInsights?.version_control?.reverts || 0}</strong></span><span>Most changed<strong>{repositoryInsights?.version_control?.most_changed_sheet || "No changes"}</strong></span><span>Sheets<strong>{repositoryInsights?.workbook?.sheets || 0}</strong></span><span>Columns<strong>{repositoryInsights?.workbook?.columns || 0}</strong></span></div></section>
+              <section className="panel insight-domain workflow"><p className="eyebrow">WORKFLOW & MERGES</p><h3>{repositoryInsights?.workflow?.active_branches || 0} active branches</h3><div><span>Conflict rate<strong>{repositoryInsights?.workflow?.conflict_rate || 0}%</strong></span><span>Review time<strong>{repositoryInsights?.workflow?.average_review_hours || 0}h</strong></span><span>Branch lifetime<strong>{repositoryInsights?.workflow?.average_branch_lifetime_days || 0}d</strong></span><span>Open copies<strong>{repositoryInsights?.workflow?.active_working_copies || 0}</strong></span><span>Merge requests<strong>{repositoryInsights?.workflow?.merge_requests || 0}</strong></span></div></section>
               <section className="panel insight-domain quality"><p className="eyebrow">DATA QUALITY</p><h3>{repositoryInsights?.data_quality?.failed_runs || 0} failed runs</h3><div><span>Validation runs<strong>{repositoryInsights?.data_quality?.validation_runs || 0}</strong></span><span>Errors<strong>{repositoryInsights?.data_quality?.errors || 0}</strong></span><span>Warnings<strong>{repositoryInsights?.data_quality?.warnings || 0}</strong></span><span>Workbook size<strong>{repositoryInsights?.workbook?.rows || 0} rows</strong></span></div></section>
+              <section className="panel insight-domain ai-domain"><p className="eyebrow">AI & AUTOMATION</p><h3>{aiModels.configured ? "Connected" : "Not connected"}</h3><div><span>Full token ledger<strong>&rarr;</strong></span></div><button className="text-button inline" onClick={() => setTab("ai")}>Open AI Command Center Token Ledger</button></section>
             </div>
-            <section className="panel slo-panel"><div className="panel-header"><div><p className="eyebrow">PLATFORM OBSERVABILITY</p><h2>Service-level signals</h2></div><span className="pill">{operationalMetrics.samples || 0} samples</span></div><div className="slo-grid">{Object.entries(operationalMetrics.metrics || {}).map(([name, metric]) => <article key={name}><span>{name.replaceAll("_", " ")}</span><strong>{metric.average}{name.includes("latency") || name.includes("time") ? " ms" : ""}</strong><small>p95 {metric.p95} / {metric.failures} failed</small><i style={{ "--health": `${Math.max(8, 100 - metric.failures * 10)}%` }} /></article>)}{!Object.keys(operationalMetrics.metrics || {}).length ? <div className="empty-state">Operational samples appear as requests, uploads, commits, validations, and merges run.</div> : null}</div></section>
-            <section className="panel wide"><p className="eyebrow">TEAM VELOCITY</p><h2>Top contributors</h2><div className="contributors">{(kpis.top_contributors || []).map((user) => <div key={user.user_id}><span>{user.email}</span><div><i style={{ width: `${Math.min(100, user.commits * 12)}%` }} /></div><strong>{user.commits}</strong></div>)}</div></section>
+
+            <section className="panel security-ops-panel">
+              <div className="panel-header"><div><p className="eyebrow">SECURITY & OPERATIONS</p><h2>Security events &amp; platform reliability</h2></div><span className="pill">{operationalMetrics.samples || 0} samples / 24h</span></div>
+              <div className="security-events-row">
+                {["critical", "high", "medium", "low"].map((severity) => (
+                  <article key={severity} className={`kpi-card tone-${severity === "critical" || severity === "high" ? "red" : severity === "medium" ? "amber" : "green"}`}>
+                    <span>{severity}</span><strong>{operationalMetrics.security_events?.[severity] || 0}</strong><small>events / 24h</small>
+                  </article>
+                ))}
+              </div>
+              <div className="slo-grid">{Object.entries(operationalMetrics.metrics || {}).map(([name, metric]) => <article key={name}><span>{name.replaceAll("_", " ")}</span><strong>{metric.average}{name.includes("latency") || name.includes("time") ? " ms" : ""}</strong><small>p95 {metric.p95} / {metric.failures} failed</small><i style={{ "--health": `${Math.max(8, 100 - metric.failures * 10)}%` }} /></article>)}{!Object.keys(operationalMetrics.metrics || {}).length ? <div className="empty-state">Operational samples appear as requests, uploads, commits, validations, and merges run.</div> : null}</div>
+              {metricsTrend.length ? (
+                <div className="metrics-trend-chart">
+                  {metricsTrend.map((day) => {
+                    const maxSamples = Math.max(1, ...metricsTrend.map((d) => d.samples));
+                    return <div key={day.day} className="metrics-trend-bar-wrap" title={`${day.day}: ${day.samples} samples, ${day.failures} failed`}>
+                      <div className="metrics-trend-bar" style={{ height: `${Math.max(4, (day.samples / maxSamples) * 100)}%` }} />
+                      <small>{day.day.slice(5)}</small>
+                    </div>;
+                  })}
+                </div>
+              ) : null}
+            </section>
+
+            <section className="panel wide"><p className="eyebrow">TEAM & CONTRIBUTORS</p><h2>Top contributors</h2>
+              <div className="team-velocity-stats">
+                <span>Avg risk score<strong>{kpis.avg_risk || 0}</strong></span>
+                <span>Clean commits<strong>{kpis.successes || 0}</strong></span>
+                <span>No-op commits<strong>{kpis.no_changes || 0}</strong></span>
+              </div>
+              <div className="contributors">{(kpis.top_contributors || []).map((user) => <div key={user.user_id}><span>{user.email}</span><div><i style={{ width: `${Math.min(100, user.commits * 12)}%` }} /></div><strong>{user.commits}</strong></div>)}</div>
+            </section>
           </div>
         ) : null}
 
@@ -2148,7 +3368,63 @@ export default function App() {
         {tab === "audit" ? (
           <div className="audit-stage">
             <section className="audit-seal"><div className={auditLedger.integrity?.valid ? "seal valid" : "seal broken"}>{auditLedger.integrity?.valid ? "VERIFIED" : "CHECK"}</div><div><p className="eyebrow">IMMUTABLE EVIDENCE CHAIN</p><h2>{auditLedger.integrity?.event_count || 0} sealed events</h2><p>{auditLedger.integrity?.valid ? "Every event hash and predecessor link verifies from GENESIS to the current ledger head." : "The ledger integrity check requires attention."}</p></div><code>{String(auditLedger.integrity?.head_hash || auditLedger.integrity?.event_id || "GENESIS").slice(0, 36)}</code></section>
-            <section className="panel audit-stream-panel"><div className="panel-header"><div><p className="eyebrow">REPOSITORY ACTIVITY</p><h2>Audit ledger</h2></div><span className="pill ready">Append only</span></div><div className="audit-stream">{(auditLedger.events || []).map((event) => <article key={event.event_id} className={`audit-${event.status.toLowerCase()}`}><div className="audit-glyph"><i /></div><div className="audit-copy"><header><strong>{event.event_type.replaceAll("_", " ")}</strong><span>{event.actor_type}</span><time>{new Date(event.created_at).toLocaleString()}</time></header><p>{event.failure_reason || Object.entries(event.event_payload || {}).slice(0, 4).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`).join(" / ") || "Recorded without additional payload"}</p><footer><code>{event.event_id}</code><span>request {event.request_id}</span><span>trace {event.trace_id}</span>{event.commit_id ? <b>{event.commit_id}</b> : null}{event.merge_request_id ? <b>{event.merge_request_id}</b> : null}</footer></div></article>)}{!auditLedger.events?.length ? <div className="empty-state">Stage 4 events will appear as users work with this repository.</div> : null}</div></section>
+            <section className="panel audit-stream-panel">
+              <div className="panel-header">
+                <div><p className="eyebrow">REPOSITORY ACTIVITY / HASH CHAIN</p><h2>Audit ledger</h2><p className="muted">Each event carries its own hash and a verified link to the event before it.</p></div>
+                <span className="pill ready">Append only</span>
+              </div>
+              <div className="audit-filters">
+                <label>Repository
+                  <select value={auditRepoTable || selectedTable || ""} onChange={(e) => setAuditRepoTable(e.target.value)}>
+                    {datasets.map((dataset) => (
+                      <option key={dataset.table_id} value={dataset.table_id}>{formatDatasetOption(dataset, datasets)}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>From
+                  <input type="date" value={auditSince} onChange={(e) => setAuditSince(e.target.value)} />
+                </label>
+                <label>To
+                  <input type="date" value={auditUntil} onChange={(e) => setAuditUntil(e.target.value)} />
+                </label>
+                {(auditSince || auditUntil) ? (
+                  <button type="button" className="link-btn" onClick={() => { setAuditSince(""); setAuditUntil(""); }}>Clear dates</button>
+                ) : null}
+                <div className="history-view-toggle">
+                  <button type="button" className={auditView === "list" ? "active" : ""} onClick={() => setAuditView("list")}>List</button>
+                  <button type="button" className={auditView === "graph" ? "active" : ""} onClick={() => setAuditView("graph")}>Graph</button>
+                </div>
+              </div>
+              {auditView === "graph" ? (
+                <AuditGraphView events={auditLedger.events} />
+              ) : (
+              <div className="audit-chain">
+                {groupAuditEventsByDay(auditLedger.events).map((group) => <div key={group.day} className="audit-day-group">
+                  <div className="audit-day-separator"><span>{group.day}</span></div>
+                  {group.events.map((event) => {
+                    const glyph = auditEventGlyph(event.event_type);
+                    const expanded = expandedAuditEventId === event.event_id;
+                    return <article key={event.event_id} className={`audit-block audit-${event.status.toLowerCase()} family-${glyph.family}`}>
+                      <div className="audit-block-glyph"><i>{glyph.icon}</i></div>
+                      <button className="audit-block-body" onClick={() => setExpandedAuditEventId(expanded ? null : event.event_id)}>
+                        <header><strong>{event.event_type.replaceAll("_", " ")}</strong><span>{event.actor_type}</span><time>{new Date(event.created_at).toLocaleTimeString()}</time></header>
+                        <div className="audit-hash-link">
+                          <code className="audit-hash-self" title="This event's hash">{String(event.event_hash || "").slice(0, 12) || "—"}</code>
+                          <span className="audit-hash-arrow">&larr; links to</span>
+                          <code className="audit-hash-prev" title="Predecessor event hash">{String(event.previous_event_hash || "GENESIS").slice(0, 12)}</code>
+                        </div>
+                        {expanded ? <div className="audit-block-detail">
+                          <p>{event.failure_reason || Object.entries(event.event_payload || {}).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`).join(" / ") || "Recorded without additional payload"}</p>
+                          <footer><code>{event.event_id}</code><span>request {event.request_id}</span><span>trace {event.trace_id}</span>{event.commit_id ? <b>{event.commit_id}</b> : null}{event.merge_request_id ? <b>{event.merge_request_id}</b> : null}</footer>
+                        </div> : null}
+                      </button>
+                    </article>;
+                  })}
+                </div>)}
+                {!auditLedger.events?.length ? <div className="empty-state">Stage 4 events will appear as users work with this repository.</div> : null}
+              </div>
+              )}
+            </section>
           </div>
         ) : null}
 
@@ -2156,7 +3432,7 @@ export default function App() {
           <section className="panel ai-panel">
             <div className="ai-heading"><div><p className="eyebrow">SEMANTIC INTELLIGENCE / OPENROUTER</p><h2>Repository copilot</h2></div><span className={`pill ${aiModels.configured ? "ready" : ""}`}>{aiModels.configured ? `Connected ${aiModels.masked_key || ""}` : "Connect OpenRouter"}</span></div>
             <p className="muted">Reason over stable cell lineage, formulas, commit history, validation results, and merge conflicts to explain change blast radius before main is updated.</p>
-            <div className="ai-prompt-chips"><button onClick={() => setAiQuestion("Prepare an owner review brief for open merge requests. Highlight old and new values, formula impact, anomalies, and a merge recommendation.")}>Owner review brief</button><button onClick={() => setAiQuestion("Detect unusual value, formula, row, and sheet changes in recent commits. Explain likely business impact with evidence.")}>Detect anomalies</button><button onClick={() => setAiQuestion("Create a manager-ready release note for the selected branch, grouped by worksheet and contributor.")}>Release narrative</button></div>
+            <div className="ai-prompt-chips"><button onClick={() => setAiQuestion("Prepare an owner review brief for open merge requests. Highlight old and new values, formula impact, anomalies, and a merge recommendation.")}>Owner review brief</button><button onClick={() => setAiQuestion("Detect unusual value, formula, row, and sheet changes in recent commits. Explain likely business impact with evidence.")}>Detect anomalies</button><button onClick={() => setAiQuestion("Create a manager-ready release note for the selected branch, grouped by worksheet and contributor.")}>Release narrative</button><button onClick={() => setAiQuestion("Explain this week's merge conflict spike, if any, and what's driving it.")}>Explain conflict spike</button><button onClick={() => setAiQuestion("Summarize AI token burn and agent success rate for this repository, and flag anything unusual.")}>Summarize AI token burn</button><button onClick={() => setAiQuestion("Which sheets or branches in this repository carry the most EUC risk, and why?")}>Where's the EUC risk?</button></div>
             {showAISetup ? (
               <form className="ai-setup" onSubmit={configureAI}>
                 <div className="secret-heading"><div><strong>Connect your OpenRouter account</strong><span>Your key is encrypted before it is stored.</span></div><span className="security-chip">User scoped</span></div>
@@ -2171,9 +3447,10 @@ export default function App() {
                 <div className="ai-controls"><select value={aiModel} onChange={(event) => setAiModel(event.target.value)}>{aiModels.models.map((model) => <option key={model}>{model}</option>)}</select><textarea value={aiQuestion} onChange={(event) => setAiQuestion(event.target.value)} /><button className="primary-button" onClick={askAI} disabled={aiBusy}>{aiBusy ? "Analyzing repository..." : "Generate insight"}</button></div>
               </>
             )}
-            {aiInsight ? <div className="ai-response">{aiInsight}</div> : null}
+            {aiInsight ? <AIAnswerView text={aiInsight} /> : null}
           </section>
         ) : null}
+        </div>
       </main>
     </div>
   );

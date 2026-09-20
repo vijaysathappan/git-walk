@@ -316,7 +316,10 @@ def _persist_inventory(conn, analysis_id: str, results, warnings: list[AnalysisW
     )
 
 
-def list_assets(user_id: str, repository_id: str | None = None, search: str = "") -> list[dict[str, Any]]:
+def list_assets(
+    user_id: str, repository_id: str | None = None, search: str = "",
+    since: str | None = None, until: str | None = None,
+) -> list[dict[str, Any]]:
     conn = database._get_connection()
     try:
         params: list[Any] = [user_id, user_id]
@@ -327,6 +330,12 @@ def list_assets(user_id: str, repository_id: str | None = None, search: str = ""
         if search:
             filters.append("(A.ORIGINAL_FILENAME LIKE ? OR R.REPOSITORY_NAME LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
+        if since:
+            filters.append("A.CREATED_AT>=?")
+            params.append(since)
+        if until:
+            filters.append("A.CREATED_AT<=?")
+            params.append(until)
         rows = conn.execute(
             f"""SELECT A.*,R.REPOSITORY_NAME,R.TABLE_ID,X.SUMMARY_JSON,X.ANALYZER_VERSION,X.WARNING_COUNT,X.COMPLETED_AT
                 FROM EUC_ASSETS A JOIN WORKBOOK_REPOSITORIES R ON R.REPOSITORY_ID=A.REPOSITORY_ID

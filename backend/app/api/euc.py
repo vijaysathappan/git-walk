@@ -4,7 +4,24 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from ..access_control.service import primary_organization
+from ..ai.euc_narrative import compare_branch_inventory, get_latest_comparison
+from ..ai.finding_remediation import (
+    list_remediations as list_finding_remediations,
+    prepare_apply_action as prepare_finding_remediation_apply,
+    propose_remediation as propose_finding_remediation,
+)
+from ..euc.attestation import (
+    get_attestation_status,
+    list_attestations,
+    portfolio_attestation_overview,
+    submit_attestation,
+)
+from ..euc.branch_comparison import ingest_branch_snapshot
+from ..ai.gateway import AIProviderError
 from ..config import settings
+from ..database import get_repository
+from ..euc.portfolio import portfolio_risk_overview
 from ..euc.service import (
     analyze_euc,
     export_manifest,
@@ -18,6 +35,7 @@ from ..euc.dependency.services import DependencyService
 from ..euc.intelligence import IntelligenceService
 from ..euc.migration import MigrationService
 from ..euc.application_model import ApplicationModelService
+from ..repositories.merge_store import branch_context
 from ..security import Principal, current_principal
 
 
@@ -45,6 +63,10 @@ class FindingStatusRequest(BaseModel):
     expires_at: str | None = Field(default=None, max_length=80)
 
 
+class AttestationRequest(BaseModel):
+    statement: str = Field(min_length=10, max_length=4000)
+
+
 class MigrationOverrideRequest(BaseModel):
     manual_mode: str = Field(min_length=3, max_length=40)
     reason: str = Field(min_length=3, max_length=2000)
@@ -57,6 +79,13 @@ class ApplicationModelRequest(BaseModel):
 class ApplicationReviewRequest(BaseModel):
     decision: str = Field(min_length=3, max_length=20)
     reason: str = Field(min_length=3, max_length=2000)
+
+
+class ApplicationBulkReviewRequest(BaseModel):
+    decision: str = Field(min_length=3, max_length=20)
+    reason: str = Field(min_length=3, max_length=2000)
+    component_type: str | None = Field(default=None, max_length=40)
+    min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class ApplicationGenerationRequest(BaseModel):
@@ -91,13 +120,44 @@ async def upload_euc(
         await file.close()
 
 
+@router.get("/portfolio/risk-overview")
+async def portfolio_risk_overview_route(principal: Principal = Depends(current_principal)):
+    return portfolio_risk_overview(principal.user_id)
+
+
+@router.get("/portfolio/attestation-overview")
+async def portfolio_attestation_overview_route(principal: Principal = Depends(current_principal)):
+    return portfolio_attestation_overview(principal.user_id)
+
+
+@router.get("/{euc_id}/attestation")
+async def attestation_status_route(euc_id: str, principal: Principal = Depends(current_principal)):
+    try:
+        return {"status": get_attestation_status(euc_id, principal.user_id),
+                "history": list_attestations(euc_id, principal.user_id)}
+    except Exception as exc:
+        raise _error(exc) from exc
+
+
+@router.post("/{euc_id}/attestation", status_code=201)
+async def submit_attestation_route(
+    euc_id: str, request: AttestationRequest, principal: Principal = Depends(current_principal),
+):
+    try:
+        return submit_attestation(euc_id, principal.user_id, request.statement)
+    except Exception as exc:
+        raise _error(exc) from exc
+
+
 @router.get("")
 async def portfolio(
     repository_id: str | None = Query(default=None),
     search: str = Query(default="", max_length=200),
+    since: str | None = Query(default=None, max_length=40),
+    until: str | None = Query(default=None, max_length=40),
     principal: Principal = Depends(current_principal),
 ):
-    return {"assets": list_assets(principal.user_id, repository_id, search.strip())}
+    return {"assets": list_assets(principal.user_id, repository_id, search.strip(), since, until)}
 
 
 @router.post("/{euc_id}/analysis")
@@ -360,6 +420,48 @@ async def update_finding_status(
         raise _error(exc) from exc
 
 
+@router.post("/{euc_id}/findings/{finding_id}/remediation")
+async def propose_finding_remediation_route(
+    euc_id: str,
+    finding_id: str,
+    organization_id: str | None = Query(default=None),
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return await propose_finding_remediation(
+            _organization(organization_id, principal), principal.user_id, euc_id, finding_id,
+        )
+    except (PermissionError, ValueError, KeyError, AIProviderError) as exc:
+        _raise_ai(exc)
+
+
+@router.get("/{euc_id}/findings/{finding_id}/remediation")
+async def list_finding_remediations_route(
+    euc_id: str, finding_id: str, principal: Principal = Depends(current_principal),
+):
+    try:
+        # Access-checked read: raises if the caller cannot see this finding.
+        intelligence_service.finding_detail(euc_id, principal.user_id, finding_id)
+    except Exception as exc:
+        raise _error(exc) from exc
+    return {"remediations": list_finding_remediations(euc_id, finding_id)}
+
+
+@router.post("/{euc_id}/findings/{finding_id}/remediation/apply")
+async def prepare_finding_remediation_apply_route(
+    euc_id: str,
+    finding_id: str,
+    organization_id: str | None = Query(default=None),
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return prepare_finding_remediation_apply(
+            _organization(organization_id, principal), principal.user_id, euc_id, finding_id,
+        )
+    except (PermissionError, ValueError, KeyError) as exc:
+        _raise_ai(exc)
+
+
 @router.post("/{euc_id}/migration/analyze")
 async def analyze_migration(euc_id: str, principal: Principal = Depends(current_principal)):
     try:
@@ -520,6 +622,21 @@ async def review_application_component(
         raise _error(exc) from exc
 
 
+@router.post("/{euc_id}/application-model/components/bulk-review")
+async def bulk_review_application_components(
+    euc_id: str,
+    request: ApplicationBulkReviewRequest,
+    principal: Principal = Depends(current_principal),
+):
+    try:
+        return application_model_service.bulk_review(
+            euc_id, principal.user_id, request.decision, request.reason,
+            request.component_type, request.min_confidence,
+        )
+    except Exception as exc:
+        raise _error(exc) from exc
+
+
 @router.post("/{euc_id}/application-model/approve")
 async def approve_application_model(euc_id: str, principal: Principal = Depends(current_principal)):
     try:
@@ -550,6 +667,26 @@ async def application_generation(euc_id: str, principal: Principal = Depends(cur
         raise _error(exc) from exc
 
 
+@router.get("/{euc_id}/application-model/generation/{generation_run_id}/files")
+async def application_generation_files(
+    euc_id: str, generation_run_id: str, principal: Principal = Depends(current_principal),
+):
+    try:
+        return {"files": application_model_service.generation_files(euc_id, principal.user_id, generation_run_id)}
+    except Exception as exc:
+        raise _error(exc) from exc
+
+
+@router.get("/{euc_id}/application-model/generation/{generation_run_id}/files/{path:path}")
+async def application_generation_file(
+    euc_id: str, generation_run_id: str, path: str, principal: Principal = Depends(current_principal),
+):
+    try:
+        return {"path": path, "content": application_model_service.generation_file(euc_id, principal.user_id, generation_run_id, path)}
+    except Exception as exc:
+        raise _error(exc) from exc
+
+
 @router.get("/{euc_id}/application-model/generation/{generation_run_id}/download")
 async def download_application_generation(
     euc_id: str,
@@ -563,6 +700,82 @@ async def download_application_generation(
         })
     except Exception as exc:
         raise _error(exc) from exc
+
+
+def _organization(requested: str | None, principal: Principal) -> str:
+    organization_id = requested or primary_organization(principal.user_id)
+    if not organization_id:
+        raise HTTPException(status_code=404, detail="No organization is available for this account")
+    return organization_id
+
+
+def _raise_ai(exc: Exception) -> None:
+    if isinstance(exc, PermissionError):
+        raise HTTPException(status_code=403, detail={"code": "AI_POLICY_DENIED", "message": str(exc)}) from exc
+    if isinstance(exc, KeyError):
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    if isinstance(exc, AIProviderError):
+        status = 503 if exc.transient or exc.code in {"AI_PROVIDER_NOT_CONFIGURED", "AI_PROVIDER_UNAVAILABLE"} else 422
+        raise HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc), "transient": exc.transient}) from exc
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _repository_and_branch(table_id: str, branch_id: str, principal: Principal) -> str:
+    repository = get_repository(table_id, principal.user_id)
+    if not repository:
+        raise HTTPException(status_code=404, detail="Repository does not exist or is not accessible")
+    branch = branch_context(branch_id)
+    if not branch or branch["repository_id"] != repository["repository_id"]:
+        raise HTTPException(status_code=404, detail="Branch does not exist or is not accessible")
+    return repository["repository_id"]
+
+
+@router.post("/repositories/{table_id}/branches/{branch_id}/ingest")
+async def ingest_euc_from_branch(
+    table_id: str,
+    branch_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    """Ingest and analyze a branch's current state directly -- the
+    branch-picker alternative to manually exporting/uploading a file."""
+    repository_id = _repository_and_branch(table_id, branch_id, principal)
+    branch = branch_context(branch_id)
+    try:
+        return ingest_branch_snapshot(
+            repository_id, branch_id, branch["branch_name"], branch["data_table_id"], principal.user_id,
+        )
+    except Exception as exc:
+        raise _error(exc)
+
+
+@router.post("/repositories/{table_id}/branches/{branch_id}/ai-comparison")
+async def run_euc_branch_comparison(
+    table_id: str,
+    branch_id: str,
+    organization_id: str | None = Query(default=None),
+    principal: Principal = Depends(current_principal),
+):
+    """Trigger the agentic "Risk Drift Radar" comparison: runs the full EUC
+    pipeline against main and this branch, diffs the findings, attributes
+    each newly-introduced one to a commit/author, and has the AI narrate the
+    result. See ``ai.euc_narrative.compare_branch_inventory``."""
+    repository_id = _repository_and_branch(table_id, branch_id, principal)
+    try:
+        return await compare_branch_inventory(
+            _organization(organization_id, principal), principal.user_id, repository_id, branch_id,
+        )
+    except (PermissionError, ValueError, KeyError, AIProviderError) as exc:
+        _raise_ai(exc)
+
+
+@router.get("/repositories/{table_id}/branches/{branch_id}/ai-comparison")
+async def euc_branch_comparison(
+    table_id: str,
+    branch_id: str,
+    principal: Principal = Depends(current_principal),
+):
+    _repository_and_branch(table_id, branch_id, principal)
+    return {"comparison": get_latest_comparison(branch_id)}
 
 
 @router.get("/{euc_id}/lineage/{node_id:path}")

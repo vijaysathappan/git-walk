@@ -38,6 +38,7 @@ WORKBOOK_METADATA_NAMES = {
     "signature": "_GITWALK_SIGNATURE",
     "local_file_path": "_GITWALK_LOCAL_FILE_PATH",
     "required_role": "_GITWALK_REQUIRED_ROLE",
+    "assigned_email": "_GITWALK_ASSIGNED_EMAIL",
 }
 
 # Register all namespaces so ET doesn't mangle prefixes
